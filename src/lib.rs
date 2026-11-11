@@ -9,11 +9,18 @@
 //! * [`stats`]: integer unit stats and modifiers.
 //! * [`effect`]: the data model for abilities and passives.
 //! * [`combat`]: the tick-based fight simulation.
-//! * [`content`]: units, traits and items loaded from data files.
+//! * [`content`]: units, traits, items, augments and the round schedule,
+//!   loaded from data files.
+//! * [`game`]: the lobby: players, shop, economy and the round loop.
+//! * [`round`]: pluggable round types.
+//! * [`bot`]: simple computer players.
 
+pub mod bot;
 pub mod combat;
 pub mod content;
 pub mod effect;
+pub mod game;
 pub mod hex;
 pub mod rng;
+pub mod round;
 pub mod stats;

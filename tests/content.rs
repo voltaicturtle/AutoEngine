@@ -35,7 +35,7 @@ fn expect_invalid(result: Result<ContentSet, ContentError>, needle: &str) {
 #[test]
 fn sample_content_loads_and_is_indexed() {
     let c = sample();
-    assert_eq!(c.units().count(), 8);
+    assert_eq!(c.units().count(), 9);
     assert_eq!(c.traits().count(), 5);
     assert_eq!(c.items().count(), 6);
     assert_eq!(c.board().len(), 56);

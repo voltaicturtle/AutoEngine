@@ -13,6 +13,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::effect::{
     Amount, Anchor, DamageKind, Effect, EffectSpec, ScaleBy, Selector, StatusKind, Trigger,
     UnitTemplate, Who,
@@ -22,11 +24,11 @@ use crate::rng::Rng;
 use crate::stats::{Stat, StatMod, Stats};
 
 /// Identifies a unit within one combat. Ids are assigned in spawn order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct UnitId(pub u32);
 
 /// Identifies a side. Units on different teams are enemies.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Team(pub u8);
 
 /// Progress needed for one attack or one step: speeds are in thousandths per
@@ -151,7 +153,7 @@ impl CombatUnit {
 }
 
 /// Something that happened during combat.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
     Spawned { unit: UnitId, team: Team, pos: Hex },
     Moved { unit: UnitId, from: Hex, to: Hex },
@@ -178,14 +180,14 @@ pub enum EventKind {
 }
 
 /// An [`EventKind`] stamped with the tick it happened on.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub tick: u32,
     pub kind: EventKind,
 }
 
 /// How a combat finished.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Outcome {
     /// The last team standing, or `None` for a draw.
     pub winner: Option<Team>,

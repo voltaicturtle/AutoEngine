@@ -211,4 +211,10 @@
         traits: ["hollow"],
         stats: { MaxHealth: 200, AttackDamage: 30, AttackSpeed: 900 },
     ),
+    (
+        id: "moss_golem",
+        name: "Moss Golem",
+        in_shop: false,
+        stats: { MaxHealth: 450, AttackDamage: 35, Armor: 10, MagicResist: 10, AttackSpeed: 550 },
+    ),
 ]

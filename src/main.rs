@@ -1,15 +1,26 @@
-//! Runs a fight described in data files, headlessly, and prints the event log.
+//! Headless command-line runner.
 //!
-//! Usage: `autoengine [seed] [--quiet] [--content DIR] [--match FILE]`
+//! * `autoengine fight [seed] [--quiet] [--content DIR] [--match FILE]` runs
+//!   one fight described in data files and prints its event log.
+//! * `autoengine lobby [seed] [--players N] [--quiet] [--content DIR]` plays
+//!   a whole game between bots and prints what happens each round.
+//!
+//! With no subcommand, `fight` is assumed.
 
 use std::process::ExitCode;
 
-use autoengine::combat::{Combat, EventKind, UnitId};
+use autoengine::bot;
+use autoengine::combat::{Combat, EventKind, Team, UnitId};
+use autoengine::game::{Game, GameEvent, Opponent, PlayerId};
+use autoengine::rng::Rng;
 use autoengine::content::{ContentSet, MatchSetup, parse_ron};
 use autoengine::effect::StatusKind;
 use autoengine::stats::Stat;
 
-const USAGE: &str = "usage: autoengine [seed] [--quiet] [--content DIR] [--match FILE]";
+const USAGE: &str = "usage: autoengine fight [seed] [--quiet] [--content DIR] [--match FILE]
+       autoengine lobby [seed] [--players N] [--quiet] [--content DIR]";
+
+const BOT_NAMES: [&str; 8] = ["Aldra", "Brask", "Cyrene", "Dovik", "Elowen", "Fenn", "Garrick", "Hesper"];
 
 fn main() -> ExitCode {
     match run() {
@@ -26,18 +37,35 @@ fn run() -> Result<(), String> {
     let mut quiet = false;
     let mut content_dir = "content".to_string();
     let mut match_file: Option<String> = None;
-    let mut args = std::env::args().skip(1);
+    let mut players = 8usize;
+    let mut lobby = false;
+    let mut args = std::env::args().skip(1).peekable();
+    match args.peek().map(String::as_str) {
+        Some("lobby") => {
+            lobby = true;
+            args.next();
+        }
+        Some("fight") => {
+            args.next();
+        }
+        _ => {}
+    }
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--quiet" => quiet = true,
+            "--players" => {
+                players = args.next().and_then(|n| n.parse().ok()).filter(|n| (2..=8).contains(n)).ok_or(USAGE)?
+            }
             "--content" => content_dir = args.next().ok_or(USAGE)?,
             "--match" => match_file = Some(args.next().ok_or(USAGE)?),
             other => seed = other.parse().map_err(|_| USAGE.to_string())?,
         }
     }
-    let match_file = match_file.unwrap_or_else(|| format!("{content_dir}/sample_match.ron"));
-
     let content = ContentSet::load_dir(&content_dir).map_err(|e| e.to_string())?;
+    if lobby {
+        return run_lobby(content, seed, players, quiet);
+    }
+    let match_file = match_file.unwrap_or_else(|| format!("{content_dir}/sample_match.ron"));
     let text = std::fs::read_to_string(&match_file).map_err(|e| format!("cannot read {match_file}: {e}"))?;
     let setup: MatchSetup = parse_ron(&match_file, &text).map_err(|e| e.to_string())?;
 
@@ -77,6 +105,73 @@ fn run() -> Result<(), String> {
     for id in &outcome.survivors {
         let u = combat.unit(*id);
         println!("  survivor: {} with {}/{} health", label(*id), u.health(), u.stat(Stat::MaxHealth));
+    }
+    Ok(())
+}
+
+/// Plays a full game between bots, printing a summary of every round.
+fn run_lobby(content: ContentSet, seed: u64, players: usize, quiet: bool) -> Result<(), String> {
+    let mut game = Game::new(content, seed, &BOT_NAMES[..players]);
+    let mut bot_rng = Rng::new(seed ^ 0xB07);
+    let name = |game: &Game, id: PlayerId| game.player(id).name.clone();
+
+    while !game.is_over() {
+        if game.round_index() >= 500 {
+            return Err("the game did not finish within 500 rounds".into());
+        }
+        bot::play_round(&mut game, &mut bot_rng).map_err(|e| e.to_string())?;
+        for event in game.drain_events() {
+            let line = match event {
+                GameEvent::RoundStarted { index, name, kind, stage } => {
+                    format!("\nRound {} ({name}, {kind}, stage {stage})", index + 1)
+                }
+                GameEvent::ChoiceMade { player, choice, .. } => {
+                    format!("  {} picks {choice}", name(&game, player))
+                }
+                GameEvent::UnitUpgraded { player, unit, star, .. } => {
+                    format!("  {} upgrades {unit} to {star} stars", name(&game, player))
+                }
+                GameEvent::CombatFinished { combat, home, away, winner } => {
+                    let record = &game.combats()[combat];
+                    let away = match away {
+                        Opponent::Player(p) => name(&game, p),
+                        Opponent::Ghost(p) => format!("a copy of {}", name(&game, p)),
+                        Opponent::Neutral => "the neutral camp".to_string(),
+                    };
+                    let verb = match winner {
+                        Some(Team(0)) => "beats",
+                        Some(_) => "loses to",
+                        None => "draws with",
+                    };
+                    format!("  {} {verb} {away} in {:.1}s", name(&game, home), record.duration_ms as f64 / 1000.0)
+                }
+                GameEvent::PlayerDamaged { player, amount, health } => {
+                    format!("    {} takes {amount} damage ({health} left)", name(&game, player))
+                }
+                GameEvent::PlayerEliminated { player, placement } => {
+                    format!("  {} is eliminated in place {placement}", name(&game, player))
+                }
+                GameEvent::GameOver { winner } => format!("\n{} wins the game", name(&game, winner)),
+                _ => continue,
+            };
+            if !quiet {
+                println!("{line}");
+            }
+        }
+    }
+
+    println!("\nFinal standings after {} rounds (seed {seed}):", game.round_index() + 1);
+    let mut standings: Vec<&autoengine::game::Player> = game.players().iter().collect();
+    standings.sort_by_key(|p| p.placement);
+    for p in standings {
+        println!(
+            "  {}. {:<8} level {}  health {:>3}  augments: {}",
+            p.placement.unwrap_or(0),
+            p.name,
+            p.level,
+            p.health,
+            if p.augments.is_empty() { "none".to_string() } else { p.augments.join(", ") },
+        );
     }
     Ok(())
 }
