@@ -155,7 +155,7 @@ impl CombatUnit {
 /// Something that happened during combat.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
-    Spawned { unit: UnitId, team: Team, pos: Hex },
+    Spawned { unit: UnitId, team: Team, pos: Hex, name: String, max_health: i64 },
     Moved { unit: UnitId, from: Hex, to: Hex },
     Attacked { source: UnitId, target: UnitId },
     Damaged {
@@ -336,7 +336,8 @@ impl Combat {
             passive_state,
         });
         self.occupancy[idx] = Some(id);
-        self.emit(EventKind::Spawned { unit: id, team, pos });
+        let name = self.u(id).template.name.clone();
+        self.emit(EventKind::Spawned { unit: id, team, pos, name, max_health: health });
         if self.started {
             self.fire(id, None, |t| matches!(t, Trigger::CombatStart));
         }

@@ -53,7 +53,8 @@ pub fn play_turn(game: &mut Game, id: PlayerId, rng: &mut Rng) {
     let _ = game.apply(id, Command::Ready);
 }
 
-fn make_pick(game: &mut Game, id: PlayerId, rng: &mut Rng) {
+/// Picks a random open option if the current round is waiting on this player.
+pub fn make_pick(game: &mut Game, id: PlayerId, rng: &mut Rng) {
     if !game.awaiting().contains(&id) {
         return;
     }

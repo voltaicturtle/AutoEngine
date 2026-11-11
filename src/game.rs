@@ -132,6 +132,8 @@ pub struct Player {
     pub level: u32,
     pub xp: u32,
     pub bench: Vec<Option<OwnedUnit>>,
+    /// Fielded units by `(column, row)`.
+    #[serde(with = "board_serde")]
     pub board: BTreeMap<(i32, i32), OwnedUnit>,
     /// Items not yet given to a unit.
     pub items: Vec<String>,
@@ -144,6 +146,24 @@ pub struct Player {
     /// Final place, once eliminated or victorious (1 is the winner).
     pub placement: Option<u32>,
     pub ready: bool,
+}
+
+/// Serializes the board as a list of entries, since formats such as JSON
+/// cannot use a pair as a map key.
+mod board_serde {
+    use super::OwnedUnit;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    type Board = BTreeMap<(i32, i32), OwnedUnit>;
+
+    pub fn serialize<S: Serializer>(board: &Board, s: S) -> Result<S::Ok, S::Error> {
+        board.iter().collect::<Vec<_>>().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Board, D::Error> {
+        Ok(Vec::<((i32, i32), OwnedUnit)>::deserialize(d)?.into_iter().collect())
+    }
 }
 
 impl Player {
@@ -210,6 +230,8 @@ pub struct CombatRecord {
     pub home: PlayerId,
     pub away: Opponent,
     pub seed: u64,
+    /// Length of one simulation tick; event ticks are multiples of this.
+    pub tick_ms: u32,
     /// `Team(0)` is the home player.
     pub winner: Option<Team>,
     pub duration_ms: u32,
@@ -268,6 +290,8 @@ pub struct Game {
     players: Vec<Player>,
     pool: BTreeMap<String, u32>,
     round_index: usize,
+    round_name: String,
+    round_kind: String,
     stage: u32,
     phase: Phase,
     current: Option<Box<dyn RoundType>>,
@@ -319,6 +343,8 @@ impl Game {
             players,
             pool,
             round_index: 0,
+            round_name: String::new(),
+            round_kind: String::new(),
             stage: 1,
             phase: Phase::BetweenRounds,
             current: None,
@@ -353,6 +379,14 @@ impl Game {
     /// Zero-based index of the current (or next) round.
     pub fn round_index(&self) -> usize {
         self.round_index
+    }
+    /// Name of the current round from the schedule.
+    pub fn round_name(&self) -> &str {
+        &self.round_name
+    }
+    /// Kind of the current round, as reported by its round type.
+    pub fn round_kind(&self) -> &str {
+        &self.round_kind
     }
     /// Stage of the current round, which scales damage.
     pub fn stage(&self) -> u32 {
@@ -421,6 +455,8 @@ impl Game {
             builtin => round::builtin(builtin),
         };
         self.stage = stage;
+        self.round_name = def.name.clone();
+        self.round_kind = round.kind().to_string();
         self.combats.clear();
         self.emit(GameEvent::RoundStarted {
             index: self.round_index,
@@ -924,6 +960,7 @@ impl Game {
             home,
             away: away.clone(),
             seed,
+            tick_ms: combat.config().tick_ms,
             winner: outcome.winner,
             duration_ms: outcome.duration_ms,
             survivors,

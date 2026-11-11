@@ -14,13 +14,24 @@
 //! * [`game`]: the lobby: players, shop, economy and the round loop.
 //! * [`round`]: pluggable round types.
 //! * [`bot`]: simple computer players.
+//! * [`protocol`]: the messages between a client and the server.
+//! * [`session`]: a hosted game with seats, bots and timers, independent of
+//!   any transport.
+//! * [`net`]: the TCP transport for both ends.
+//! * [`client`] and [`playback`]: the display-side model a client builds
+//!   from server messages, with no rendering in it.
 
 pub mod bot;
+pub mod client;
 pub mod combat;
 pub mod content;
 pub mod effect;
 pub mod game;
 pub mod hex;
+pub mod net;
+pub mod playback;
+pub mod protocol;
 pub mod rng;
 pub mod round;
+pub mod session;
 pub mod stats;
