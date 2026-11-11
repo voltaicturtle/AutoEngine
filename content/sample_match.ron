@@ -1,0 +1,26 @@
+// A sample fight. Positions are (column, row) from each player's own point
+// of view: rows 4 to 7 are a player's half, with row 4 the front line.
+(
+    teams: [
+        (
+            units: [
+                (unit: "ironbark_warden", star: 2, items: ["barkplate"], pos: (3, 4)),
+                (unit: "emberlash_duelist", items: ["cinder_blade"], pos: (2, 4)),
+                (unit: "tidewater_stormcaller", pos: (1, 7)),
+                (unit: "dawnpetal_mender", pos: (4, 6)),
+                (unit: "reed_stalker", pos: (5, 7)),
+            ],
+        ),
+        (
+            units: [
+                (unit: "hollow_lantern_keeper", star: 2, pos: (3, 4)),
+                (unit: "emberlash_duelist", pos: (4, 4)),
+                (unit: "ashen_hound", star: 2, items: ["whetstone", "ember_core"], pos: (1, 4)),
+                (unit: "tidewater_stormcaller", items: ["grove_sigil"], pos: (5, 7)),
+                (unit: "ironbark_warden", pos: (2, 5)),
+            ],
+            // An augment-style modifier: the whole team heals from damage dealt.
+            bonuses: [(scope: Team, mods: [(stat: Lifesteal, flat: 80)])],
+        ),
+    ],
+)

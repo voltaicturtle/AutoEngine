@@ -1,0 +1,98 @@
+// Sample traits. A breakpoint is active when at least `count` different
+// units with the trait are on the board; only the highest one reached applies.
+[
+    (
+        id: "grove",
+        name: "Grove",
+        description: "Grove units are tougher.",
+        breakpoints: [
+            (count: 2, bonuses: [(mods: [(stat: Armor, flat: 15), (stat: MagicResist, flat: 15)])]),
+            (count: 3, bonuses: [(mods: [(stat: Armor, flat: 35), (stat: MagicResist, flat: 35)])]),
+        ],
+    ),
+    (
+        id: "cinder",
+        name: "Cinder",
+        description: "Cinder units attack faster.",
+        breakpoints: [
+            (count: 2, bonuses: [(mods: [(stat: AttackSpeed, permille: 200)])]),
+            (count: 4, bonuses: [(mods: [(stat: AttackSpeed, permille: 450)])]),
+        ],
+    ),
+    (
+        id: "tide",
+        name: "Tide",
+        description: "Tide units steadily restore mana to themselves.",
+        breakpoints: [
+            (
+                count: 2,
+                bonuses: [
+                    (
+                        passives: [
+                            (
+                                name: "Rising Tide",
+                                trigger: Every(interval_ms: 2000),
+                                effects: [(target: Source, effect: GainMana(amount: 10))],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    ),
+    (
+        id: "hollow",
+        name: "Hollow",
+        description: "When a Hollow unit dies, the whole team hits harder.",
+        breakpoints: [
+            (
+                count: 2,
+                bonuses: [
+                    (
+                        passives: [
+                            (
+                                name: "Hollow Vengeance",
+                                trigger: OnDeath,
+                                effects: [
+                                    (target: AllAllies, effect: ModifyStats(mods: [(stat: DamageAmp, flat: 80)])),
+                                ],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    ),
+    (
+        id: "bulwark",
+        name: "Bulwark",
+        description: "The whole team starts combat with a shield; Bulwark units get a bigger one.",
+        breakpoints: [
+            (
+                count: 1,
+                bonuses: [
+                    (
+                        scope: Team,
+                        passives: [
+                            (
+                                name: "Bulwark's Cover",
+                                trigger: CombatStart,
+                                effects: [(target: Source, effect: Shield(amount: (flat: 60), duration_ms: 8000))],
+                            ),
+                        ],
+                    ),
+                    (
+                        scope: Members,
+                        passives: [
+                            (
+                                name: "Bulwark's Stand",
+                                trigger: CombatStart,
+                                effects: [(target: Source, effect: Shield(amount: (flat: 140), duration_ms: 8000))],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    ),
+]

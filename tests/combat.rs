@@ -235,15 +235,15 @@ fn shields_absorb_before_health_and_buffs_revert() {
 
 #[test]
 fn death_trigger_summons_units_that_keep_fighting() {
-    let minion = Arc::new(grunt("Minion"));
     let host = UnitTemplate::new("Host", StatBlock::base().with(Stat::MaxHealth, 100).with(Stat::CritChance, 0))
         .with_passive(Passive {
             name: "Burst".into(),
             trigger: Trigger::OnDeath,
-            effects: vec![EffectSpec::new(Selector::Source, Effect::Summon { template: minion, count: 3 })],
+            effects: vec![EffectSpec::new(Selector::Source, Effect::Summon { unit: "minion".into(), count: 3 })],
             max_procs: None,
         });
     let (mut c, a, _) = duel(host, grunt("Enemy"), 1);
+    c.register_template("minion", grunt("Minion"));
     c.run();
     assert!(!c.unit(a).is_alive());
     assert_eq!(c.units().len(), 5);

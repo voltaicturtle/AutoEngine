@@ -10,12 +10,12 @@
 //! These are plain data with no behaviour of their own, so content can be
 //! authored in data files and the combat simulation interprets them.
 
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 
 use crate::stats::{Stat, StatBlock, StatMod};
 
 /// How damage is mitigated.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DamageKind {
     /// Reduced by armor.
     Physical,
@@ -26,7 +26,7 @@ pub enum DamageKind {
 }
 
 /// Which unit a scaling value is read from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Who {
     /// The unit producing the effect.
     Source,
@@ -35,14 +35,14 @@ pub enum Who {
 }
 
 /// A value read from a unit at the moment an effect resolves.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScaleBy {
     Stat(Stat),
     CurrentHealth,
     MissingHealth,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scaling {
     pub who: Who,
     pub by: ScaleBy,
@@ -51,7 +51,8 @@ pub struct Scaling {
 
 /// A computed quantity: `flat + sum(scalings)`, optionally multiplied by the
 /// source's ability power.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Amount {
     pub flat: i64,
     pub scalings: Vec<Scaling>,
@@ -78,7 +79,7 @@ impl Amount {
 }
 
 /// A lasting condition on a unit.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StatusKind {
     /// Cannot move, attack or cast.
     Stun,
@@ -89,24 +90,34 @@ pub enum StatusKind {
 }
 
 /// What happens to each selected unit.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Effect {
-    Damage { amount: Amount, kind: DamageKind, can_crit: bool },
+    Damage {
+        amount: Amount,
+        kind: DamageKind,
+        #[serde(default)]
+        can_crit: bool,
+    },
     Heal { amount: Amount },
     /// Absorbs damage before health. `None` lasts the whole combat.
-    Shield { amount: Amount, duration_ms: Option<u32> },
+    Shield {
+        amount: Amount,
+        #[serde(default)]
+        duration_ms: Option<u32>,
+    },
     /// Positive or negative.
     GainMana { amount: i64 },
     ApplyStatus { status: StatusKind, duration_ms: u32 },
     /// Stat changes that last for the rest of the combat.
     ModifyStats { mods: Vec<StatMod> },
-    /// Spawns `count` units on the selected unit's team at the nearest free
-    /// hexes to it.
-    Summon { template: Arc<UnitTemplate>, count: u32 },
+    /// Spawns `count` copies of a unit on the selected unit's team at the
+    /// nearest free hexes to it. `unit` is looked up in the templates
+    /// registered with the combat; unknown ids do nothing.
+    Summon { unit: String, count: u32 },
 }
 
 /// The reference point for area selectors.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Anchor {
     Source,
     CurrentTarget,
@@ -115,7 +126,7 @@ pub enum Anchor {
 /// Which units an effect applies to, relative to the unit producing it.
 /// "Allies" includes the source itself. Results are always produced in a
 /// deterministic order.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Selector {
     /// The unit producing the effect.
     Source,
@@ -138,7 +149,7 @@ pub enum Selector {
 }
 
 /// An effect together with who receives it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectSpec {
     pub target: Selector,
     pub effect: Effect,
@@ -151,16 +162,17 @@ impl EffectSpec {
 }
 
 /// An active ability, cast automatically when the unit's mana is full.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ability {
     pub name: String,
     /// Time the unit spends casting before the effects resolve.
+    #[serde(default)]
     pub cast_time_ms: u32,
     pub effects: Vec<EffectSpec>,
 }
 
 /// When a passive fires.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Trigger {
     CombatStart,
     /// The owner lands a basic attack.
@@ -180,12 +192,14 @@ pub enum Trigger {
 
 /// A triggered set of effects. Traits, items and augments attach these to
 /// units before combat begins.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Passive {
+    #[serde(default)]
     pub name: String,
     pub trigger: Trigger,
     pub effects: Vec<EffectSpec>,
     /// Maximum number of times this fires per combat. `None` is unlimited.
+    #[serde(default)]
     pub max_procs: Option<u32>,
 }
 

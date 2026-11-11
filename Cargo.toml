@@ -12,3 +12,5 @@ name = "autoengine"
 path = "src/main.rs"
 
 [dependencies]
+ron = "0.12.3"
+serde = { version = "1.0.229", features = ["derive", "rc"] }

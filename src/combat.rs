@@ -10,7 +10,7 @@
 //! Units act in id order within a tick. Units spawned during a tick start
 //! acting on the next one.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::effect::{
@@ -224,6 +224,7 @@ pub struct Combat {
     config: CombatConfig,
     rng: Rng,
     units: Vec<CombatUnit>,
+    library: HashMap<String, Arc<UnitTemplate>>,
     occupancy: Vec<Option<UnitId>>,
     tick: u32,
     started: bool,
@@ -245,6 +246,7 @@ impl Combat {
             config,
             rng: Rng::new(seed),
             units: Vec::new(),
+            library: HashMap::new(),
             occupancy: vec![None; cells],
             tick: 0,
             started: false,
@@ -291,6 +293,11 @@ impl Combat {
     }
 
     // ----- setup and stepping ---------------------------------------------
+
+    /// Makes a template available to `Effect::Summon` under the given id.
+    pub fn register_template(&mut self, id: impl Into<String>, template: impl Into<Arc<UnitTemplate>>) {
+        self.library.insert(id.into(), template.into());
+    }
 
     /// Places a unit on the board.
     pub fn spawn(
@@ -735,7 +742,10 @@ impl Combat {
                 });
             }
             Effect::ModifyStats { mods } => self.change_stats(target, mods, true),
-            Effect::Summon { template, count } => {
+            Effect::Summon { unit, count } => {
+                let Some(template) = self.library.get(unit).cloned() else {
+                    return;
+                };
                 let team = self.u(target).team;
                 let center = self.u(target).pos;
                 let reach = self.board.cols() + self.board.rows();
