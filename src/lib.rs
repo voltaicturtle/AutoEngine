@@ -9,8 +9,10 @@
 //! * [`stats`]: integer unit stats and modifiers.
 //! * [`effect`]: the data model for abilities and passives.
 //! * [`combat`]: the tick-based fight simulation.
+//! * [`content`]: units, traits and items loaded from data files.
 
 pub mod combat;
+pub mod content;
 pub mod effect;
 pub mod hex;
 pub mod rng;

@@ -1,0 +1,214 @@
+// Sample units. Stats not listed here use the engine defaults
+// (see StatBlock::base). All content in this folder is original.
+[
+    (
+        id: "ironbark_warden",
+        name: "Ironbark Warden",
+        cost: 2,
+        traits: ["grove", "bulwark"],
+        stats: {
+            MaxHealth: 900, AttackDamage: 45, Armor: 40, MagicResist: 30,
+            AttackSpeed: 600, MaxMana: 80, StartingMana: 30,
+        },
+        ability: (
+            name: "Rootwall",
+            cast_time_ms: 300,
+            effects: [
+                (
+                    target: Source,
+                    effect: Shield(
+                        amount: (flat: 250, power_scaled: true, scalings: [
+                            (who: Source, by: Stat(MaxHealth), permille: 100),
+                        ]),
+                        duration_ms: 4000,
+                    ),
+                ),
+                (
+                    target: EnemiesWithin(anchor: Source, radius: 1),
+                    effect: ApplyStatus(status: Stun, duration_ms: 1000),
+                ),
+            ],
+        ),
+        passives: [
+            (
+                name: "Bramble Hide",
+                trigger: OnDamaged,
+                effects: [
+                    (target: EventOther, effect: Damage(amount: (flat: 12), kind: Magic)),
+                ],
+            ),
+        ],
+    ),
+    (
+        id: "emberlash_duelist",
+        name: "Emberlash Duelist",
+        cost: 3,
+        traits: ["cinder"],
+        stats: {
+            MaxHealth: 650, AttackDamage: 65, Armor: 25, MagicResist: 20,
+            AttackSpeed: 850, MaxMana: 60, Lifesteal: 100,
+        },
+        ability: (
+            name: "Searing Flurry",
+            cast_time_ms: 250,
+            effects: [
+                (
+                    target: CurrentTarget,
+                    effect: Damage(
+                        amount: (flat: 80, power_scaled: true, scalings: [
+                            (who: Source, by: Stat(AttackDamage), permille: 1500),
+                        ]),
+                        kind: Physical,
+                        can_crit: true,
+                    ),
+                ),
+                (
+                    target: Source,
+                    effect: ApplyStatus(
+                        status: StatMods([(stat: AttackSpeed, permille: 400)]),
+                        duration_ms: 3000,
+                    ),
+                ),
+            ],
+        ),
+        passives: [
+            (
+                name: "Last Spark",
+                trigger: HealthBelow(permille: 400),
+                max_procs: 1,
+                effects: [
+                    (target: Source, effect: ModifyStats(mods: [(stat: AttackDamage, permille: 300)])),
+                ],
+            ),
+        ],
+    ),
+    (
+        id: "tidewater_stormcaller",
+        name: "Tidewater Stormcaller",
+        cost: 2,
+        traits: ["tide"],
+        stats: {
+            MaxHealth: 500, AttackDamage: 40, Armor: 15, MagicResist: 15,
+            Range: 4, MaxMana: 70, StartingMana: 20,
+        },
+        ability: (
+            name: "Breaking Wave",
+            cast_time_ms: 500,
+            effects: [
+                (
+                    target: EnemiesWithin(anchor: CurrentTarget, radius: 1),
+                    effect: Damage(amount: (flat: 180, power_scaled: true), kind: Magic),
+                ),
+                (
+                    target: EnemiesWithin(anchor: CurrentTarget, radius: 1),
+                    effect: ApplyStatus(
+                        status: DamageOverTime(per_second: (flat: 30, power_scaled: true), kind: Magic),
+                        duration_ms: 3000,
+                    ),
+                ),
+            ],
+        ),
+    ),
+    (
+        id: "dawnpetal_mender",
+        name: "Dawnpetal Mender",
+        cost: 1,
+        traits: ["grove"],
+        stats: {
+            MaxHealth: 520, AttackDamage: 35, Armor: 15, MagicResist: 25,
+            Range: 3, MaxMana: 60,
+        },
+        ability: (
+            name: "Morning Dew",
+            cast_time_ms: 400,
+            effects: [
+                (
+                    target: LowestHealthAllies(2),
+                    effect: Heal(
+                        amount: (flat: 150, power_scaled: true, scalings: [
+                            (who: Target, by: MissingHealth, permille: 150),
+                        ]),
+                    ),
+                ),
+            ],
+        ),
+    ),
+    (
+        id: "hollow_lantern_keeper",
+        name: "Hollow Lantern Keeper",
+        cost: 2,
+        traits: ["hollow", "bulwark"],
+        stats: { MaxHealth: 700, AttackDamage: 50, Armor: 30, MagicResist: 30 },
+        passives: [
+            (
+                name: "Lantern's Release",
+                trigger: OnDeath,
+                effects: [
+                    (target: Source, effect: Summon(unit: "grave_wisp", count: 2)),
+                ],
+            ),
+        ],
+    ),
+    (
+        id: "ashen_hound",
+        name: "Ashen Hound",
+        cost: 1,
+        traits: ["cinder", "hollow"],
+        stats: {
+            MaxHealth: 550, AttackDamage: 50, Armor: 20, MagicResist: 20,
+            AttackSpeed: 800, MaxMana: 50, MoveSpeed: 2400,
+        },
+        ability: (
+            name: "Cinder Bite",
+            effects: [
+                (
+                    target: CurrentTarget,
+                    effect: Damage(
+                        amount: (scalings: [(who: Source, by: Stat(AttackDamage), permille: 2000)]),
+                        kind: Physical,
+                        can_crit: true,
+                    ),
+                ),
+                (
+                    target: CurrentTarget,
+                    effect: ApplyStatus(
+                        status: StatMods([(stat: Armor, permille: -400)]),
+                        duration_ms: 4000,
+                    ),
+                ),
+            ],
+        ),
+    ),
+    (
+        id: "reed_stalker",
+        name: "Reed Stalker",
+        cost: 1,
+        traits: ["tide", "grove"],
+        stats: {
+            MaxHealth: 480, AttackDamage: 55, Armor: 15, MagicResist: 15,
+            AttackSpeed: 750, Range: 4, MaxMana: 90,
+        },
+        ability: (
+            name: "Piercing Reed",
+            cast_time_ms: 350,
+            effects: [
+                (
+                    target: FarthestEnemies(1),
+                    effect: Damage(
+                        amount: (flat: 120, power_scaled: true, scalings: [
+                            (who: Target, by: CurrentHealth, permille: 80),
+                        ]),
+                        kind: Physical,
+                    ),
+                ),
+            ],
+        ),
+    ),
+    (
+        id: "grave_wisp",
+        name: "Grave Wisp",
+        in_shop: false,
+        traits: ["hollow"],
+        stats: { MaxHealth: 200, AttackDamage: 30, AttackSpeed: 900 },
+    ),
+]

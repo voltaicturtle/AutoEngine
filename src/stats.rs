@@ -11,8 +11,10 @@
 //! * `AbilityPower`: percent multiplier on power-scaled amounts (`100` = 1x).
 //! * Everything else is a plain amount.
 
+use serde::{Deserialize, Serialize};
+
 /// A numeric property of a unit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Stat {
     MaxHealth,
     AttackDamage,
@@ -106,14 +108,30 @@ impl StatBlock {
     pub fn add(&mut self, stat: Stat, delta: i64) {
         self.0[stat.index()] += delta;
     }
+
+    /// Returns a new block with the modifiers permanently folded in, using
+    /// the same stacking rules as [`Stats`].
+    pub fn with_mods(&self, mods: &[StatMod]) -> StatBlock {
+        let mut stats = Stats::new(self.clone());
+        for m in mods {
+            stats.apply(m);
+        }
+        let mut out = StatBlock::zero();
+        for stat in Stat::ALL {
+            out.set(stat, stats.get(stat));
+        }
+        out
+    }
 }
 
 /// A change to one stat: a flat amount, a percentage (permille) of the
 /// flat-adjusted value, or both.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatMod {
     pub stat: Stat,
+    #[serde(default)]
     pub flat: i64,
+    #[serde(default)]
     pub permille: i64,
 }
 

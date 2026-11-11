@@ -1,0 +1,47 @@
+// Sample items: three components and the items they combine into.
+[
+    (id: "whetstone", name: "Whetstone", mods: [(stat: AttackDamage, flat: 15)]),
+    (id: "oak_charm", name: "Oak Charm", mods: [(stat: MaxHealth, flat: 150)]),
+    (id: "ember_core", name: "Ember Core", mods: [(stat: AttackSpeed, permille: 100)]),
+    (
+        id: "barkplate",
+        name: "Barkplate",
+        recipe: ("oak_charm", "oak_charm"),
+        mods: [(stat: MaxHealth, flat: 350), (stat: Armor, flat: 20)],
+        passives: [
+            (
+                name: "Barkplate Splinters",
+                trigger: OnDamaged,
+                effects: [(target: EventOther, effect: Damage(amount: (flat: 20), kind: Magic))],
+            ),
+        ],
+    ),
+    (
+        id: "cinder_blade",
+        name: "Cinder Blade",
+        recipe: ("whetstone", "ember_core"),
+        mods: [(stat: AttackDamage, flat: 25), (stat: AttackSpeed, permille: 150)],
+        passives: [
+            (
+                name: "Cinder Blade Burn",
+                trigger: OnAttack,
+                effects: [
+                    (
+                        target: EventOther,
+                        effect: ApplyStatus(
+                            status: DamageOverTime(per_second: (flat: 20), kind: True),
+                            duration_ms: 2000,
+                        ),
+                    ),
+                ],
+            ),
+        ],
+    ),
+    (
+        id: "grove_sigil",
+        name: "Grove Sigil",
+        recipe: ("oak_charm", "whetstone"),
+        mods: [(stat: MaxHealth, flat: 150), (stat: AttackDamage, flat: 15)],
+        grants_traits: ["grove"],
+    ),
+]
