@@ -18,7 +18,8 @@ use autoengine::effect::StatusKind;
 use autoengine::stats::Stat;
 
 const USAGE: &str = "usage: autoengine fight [seed] [--quiet] [--content DIR] [--match FILE]
-       autoengine lobby [seed] [--players N] [--quiet] [--content DIR]";
+       autoengine lobby [seed] [--players N] [--quiet] [--content DIR]
+       autoengine replay FILE...";
 
 const BOT_NAMES: [&str; 8] = ["Aldra", "Brask", "Cyrene", "Dovik", "Elowen", "Fenn", "Garrick", "Hesper"];
 
@@ -30,6 +31,38 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Re-runs saved fights and reports whether the engine still plays them
+/// out exactly as recorded.
+fn check_replays(files: Vec<String>) -> Result<(), String> {
+    if files.is_empty() {
+        return Err(USAGE.to_string());
+    }
+    let mut failed = 0;
+    for file in &files {
+        let replay = autoengine::replay::ReplayFile::load(std::path::Path::new(file))?;
+        let record = &replay.record;
+        let result = match record.winner {
+            Some(team) => format!("team {} wins", team.0 + 1),
+            None => "draw".to_string(),
+        };
+        let summary = format!(
+            "{}: {}, {:.1}s, {} events",
+            replay.title,
+            result,
+            record.duration_ms as f64 / 1000.0,
+            record.events.len()
+        );
+        match replay.verify() {
+            Ok(()) => println!("ok       {file}  ({summary})"),
+            Err(e) => {
+                failed += 1;
+                println!("MISMATCH {file}  ({summary}): {e}");
+            }
+        }
+    }
+    if failed > 0 { Err(format!("{failed} of {} replays no longer match", files.len())) } else { Ok(()) }
 }
 
 fn run() -> Result<(), String> {
@@ -47,6 +80,10 @@ fn run() -> Result<(), String> {
         }
         Some("fight") => {
             args.next();
+        }
+        Some("replay") => {
+            args.next();
+            return check_replays(args.collect());
         }
         _ => {}
     }

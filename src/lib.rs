@@ -31,6 +31,7 @@ pub mod hex;
 pub mod net;
 pub mod playback;
 pub mod protocol;
+pub mod replay;
 pub mod rng;
 pub mod round;
 pub mod session;

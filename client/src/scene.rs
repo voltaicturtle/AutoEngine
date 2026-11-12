@@ -173,6 +173,11 @@ impl Ground {
         }
     }
 
+    /// A filled circle lying on the ground.
+    pub fn disc(&mut self, center: Vec3, radius: f32, color: Color) {
+        self.ring(center, 0.0, radius, color);
+    }
+
     pub fn draw(&mut self) {
         if !self.indices.is_empty() {
             draw_mesh(&Mesh {

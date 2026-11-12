@@ -3,7 +3,14 @@ name = "autoengine-client"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Sound playback. Off by default: it needs the system audio library (ALSA
+# development files on Linux) to build and a sound device to run.
+audio = ["macroquad/audio"]
+
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+ron = "0.12"
 autoengine = { path = "..", package = "AutoEngine" }
 # OpenGL windowing, drawing and input. Audio is left out so the client
 # builds without extra system libraries.

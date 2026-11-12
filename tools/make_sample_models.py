@@ -3,11 +3,14 @@
 
 The models are simple original shapes built from lathed profiles and boxes.
 They exist to exercise the client's model loading (OBJ with materials, OBJ
-with a texture, PLY with vertex colours); replace them with real art.
+with a texture, PLY with vertex colours, and glTF with a skeleton and
+animation clips); replace them with real art.
 Models face +Z and stand on y = 0.
 
 Usage: python3 tools/make_sample_models.py [output directory]
 """
+import base64
+import json
 import math
 import os
 import random
@@ -159,17 +162,6 @@ def warden():
     return m
 
 
-def duelist():
-    m = Mesh()
-    m.color = {"cloth": (0.72, 0.20, 0.14), "skin": (0.93, 0.74, 0.58), "blade": (1.0, 0.72, 0.25)}
-    m.lathe("cloth", [(0.0, 0.0), (0.20, 0.0), (0.16, 0.45), (0.26, 0.80), (0.12, 0.98), (0.0, 0.98)])
-    m.lathe("skin", ball(0.16, 1.12))
-    m.lathe("cloth", [(0.17, 1.16), (0.10, 1.30), (0.0, 1.50)], segments=10)
-    m.box("blade", (0.30, 0.70, 0.42), (0.05, 0.05, 0.85), pitch=-0.35)
-    m.box("cloth", (0.30, 0.60, 0.10), (0.16, 0.05, 0.05))
-    return m
-
-
 def stormcaller():
     m = Mesh()
     m.color = {"robe": (0.16, 0.40, 0.66), "skin": (0.80, 0.90, 0.95), "orb": (0.55, 0.95, 1.0)}
@@ -222,17 +214,6 @@ def hound():
     return m
 
 
-def stalker():
-    m = Mesh()
-    m.color = {"reed": (0.50, 0.58, 0.28), "skin": (0.72, 0.80, 0.55), "spear": (0.85, 0.82, 0.70)}
-    m.lathe("reed", [(0.0, 0.0), (0.16, 0.0), (0.12, 0.60), (0.20, 0.95), (0.10, 1.10), (0.0, 1.10)])
-    m.lathe("skin", ball(0.14, 1.22))
-    m.lathe("reed", [(0.24, 1.26), (0.12, 1.34), (0.0, 1.36)])
-    m.box("spear", (0.24, 0.85, 0.10), (0.035, 0.035, 1.35), pitch=-0.9)
-    m.lathe("spear", [(0.07, 0.0), (0.0, 0.22)], at=(0.24, 1.36, 0.50), segments=6)
-    return m
-
-
 def wisp():
     m = Mesh()
     m.color = {"glow": (0.45, 0.85, 0.80)}
@@ -254,6 +235,165 @@ def golem():
     return m
 
 
+# --- Rigged models (glTF) -------------------------------------------------
+
+# Joint name -> (parent, position in the bind pose).
+JOINTS = {
+    "hips": (None, (0.0, 0.55, 0.0)),
+    "spine": ("hips", (0.0, 0.62, 0.0)),
+    "head": ("spine", (0.0, 1.15, 0.0)),
+    "arm_r": ("spine", (0.30, 1.06, 0.0)),
+    "arm_l": ("spine", (-0.30, 1.06, 0.0)),
+    "leg_r": ("hips", (0.12, 0.55, 0.0)),
+    "leg_l": ("hips", (-0.12, 0.55, 0.0)),
+}
+
+
+def rot(axis, angle):
+    """Quaternion (x, y, z, w) for a turn of `angle` radians around an axis."""
+    s = math.sin(angle / 2)
+    return tuple(s * a for a in {"x": (1, 0, 0), "y": (0, 1, 0), "z": (0, 0, 1)}[axis]) + (math.cos(angle / 2),)
+
+
+def keys(axis, *pairs):
+    return [(t, rot(axis, a)) for t, a in pairs]
+
+
+# Clip name -> joint -> rotation keys. Forward is +Z, so a negative turn
+# around X swings a hanging arm forward and up.
+CLIPS = {
+    "idle": {
+        "spine": keys("z", (0, 0), (0.5, 0.04), (1.0, 0), (1.5, -0.04), (2.0, 0)),
+        "head": keys("y", (0, 0), (0.5, 0.2), (1.0, 0), (1.5, -0.2), (2.0, 0)),
+        "arm_r": keys("x", (0, 0), (1.0, -0.12), (2.0, 0)),
+        "arm_l": keys("x", (0, 0), (1.0, 0.12), (2.0, 0)),
+    },
+    "walk": {
+        "leg_r": keys("x", (0, 0.6), (0.3, -0.6), (0.6, 0.6)),
+        "leg_l": keys("x", (0, -0.6), (0.3, 0.6), (0.6, -0.6)),
+        "arm_r": keys("x", (0, -0.5), (0.3, 0.5), (0.6, -0.5)),
+        "arm_l": keys("x", (0, 0.5), (0.3, -0.5), (0.6, 0.5)),
+        "spine": keys("x", (0, 0.1), (0.6, 0.1)),
+    },
+    "attack": {
+        "arm_r": keys("x", (0, 0), (0.15, -2.7), (0.27, -0.8), (0.45, 0)),
+        "spine": keys("x", (0, 0), (0.15, -0.2), (0.27, 0.35), (0.45, 0)),
+        "leg_r": keys("x", (0, 0), (0.27, -0.4), (0.45, 0)),
+    },
+    "cast": {
+        "arm_r": keys("x", (0, 0), (0.3, -2.8), (0.7, -2.8), (0.9, 0)),
+        "arm_l": keys("x", (0, 0), (0.3, -2.8), (0.7, -2.8), (0.9, 0)),
+        "head": keys("x", (0, 0), (0.3, -0.35), (0.7, -0.35), (0.9, 0)),
+    },
+}
+
+
+def write_rigged_gltf(path, boxes):
+    """A jointed figure. `boxes` is a list of (joint, colour, centre, size)
+    or (joint, colour, centre, size, pitch); every box follows one joint."""
+    names = list(JOINTS)
+    mesh = Mesh()
+    joint_of, color_of = [], []
+    for joint, color, center, size, *pitch in boxes:
+        before = len(mesh.v)
+        mesh.box("m", center, size, pitch=pitch[0] if pitch else 0.0)
+        joint_of += [names.index(joint)] * (len(mesh.v) - before)
+        color_of += [color] * (len(mesh.v) - before)
+    indices = []
+    for quad in mesh.faces["m"]:
+        indices += [quad[0], quad[1], quad[2], quad[0], quad[2], quad[3]]
+
+    blob = bytearray()
+    views, accessors = [], []
+
+    def add(data, component, kind, count, target=None, bounds=None):
+        while len(blob) % 4:
+            blob.append(0)
+        view = {"buffer": 0, "byteOffset": len(blob), "byteLength": len(data)}
+        if target:
+            view["target"] = target
+        blob.extend(data)
+        views.append(view)
+        accessor = {"bufferView": len(views) - 1, "componentType": component, "count": count, "type": kind}
+        if bounds:
+            accessor["min"], accessor["max"] = bounds
+        accessors.append(accessor)
+        return len(accessors) - 1
+
+    def floats(rows):
+        flat = [c for row in rows for c in row]
+        return struct.pack(f"<{len(flat)}f", *flat)
+
+    n = len(mesh.v)
+    low = [min(p[k] for p in mesh.v) for k in range(3)]
+    high = [max(p[k] for p in mesh.v) for k in range(3)]
+    attributes = {
+        "POSITION": add(floats(mesh.v), 5126, "VEC3", n, 34962, (low, high)),
+        "NORMAL": add(floats(mesh.n), 5126, "VEC3", n, 34962),
+        "COLOR_0": add(floats([c + (1.0,) for c in color_of]), 5126, "VEC4", n, 34962),
+        "JOINTS_0": add(bytes(b for j in joint_of for b in (j, 0, 0, 0)), 5121, "VEC4", n, 34962),
+        "WEIGHTS_0": add(floats([(1.0, 0.0, 0.0, 0.0)] * n), 5126, "VEC4", n, 34962),
+    }
+    index_accessor = add(struct.pack(f"<{len(indices)}H", *indices), 5123, "SCALAR", len(indices), 34963)
+    # Bind matrices undo each joint's position (column-major, translation last).
+    inverse_bind = add(
+        floats([(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -x, -y, -z, 1) for _, (x, y, z) in JOINTS.values()]),
+        5126, "MAT4", len(names))
+
+    # Node 0 carries the mesh; nodes 1.. are the joints.
+    nodes = [{"name": "body", "mesh": 0, "skin": 0}]
+    for name, (parent, pos) in JOINTS.items():
+        origin = JOINTS[parent][1] if parent else (0.0, 0.0, 0.0)
+        node = {"name": name, "translation": [a - b for a, b in zip(pos, origin)]}
+        children = [names.index(c) + 1 for c, (p, _) in JOINTS.items() if p == name]
+        if children:
+            node["children"] = children
+        nodes.append(node)
+
+    animations = []
+    for clip, tracks in CLIPS.items():
+        samplers, channels = [], []
+        for joint, track in tracks.items():
+            times = [t for t, _ in track]
+            time_accessor = add(struct.pack(f"<{len(times)}f", *times), 5126, "SCALAR", len(times), None, ([min(times)], [max(times)]))
+            value_accessor = add(floats([q for _, q in track]), 5126, "VEC4", len(track))
+            samplers.append({"input": time_accessor, "output": value_accessor, "interpolation": "LINEAR"})
+            channels.append({"sampler": len(samplers) - 1, "target": {"node": names.index(joint) + 1, "path": "rotation"}})
+        animations.append({"name": clip, "samplers": samplers, "channels": channels})
+
+    gltf = {
+        "asset": {"version": "2.0", "generator": "AutoEngine sample models"},
+        "scene": 0,
+        "scenes": [{"nodes": [0, 1]}],
+        "nodes": nodes,
+        "meshes": [{"primitives": [{"attributes": attributes, "indices": index_accessor, "material": 0}]}],
+        "materials": [{"name": "painted", "pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 1], "metallicFactor": 0.0}}],
+        "skins": [{"joints": list(range(1, len(names) + 1)), "skeleton": 1, "inverseBindMatrices": inverse_bind}],
+        "animations": animations,
+        "accessors": accessors,
+        "bufferViews": views,
+        "buffers": [{"byteLength": len(blob), "uri": "data:application/octet-stream;base64," + base64.b64encode(bytes(blob)).decode()}],
+    }
+    with open(path, "w") as f:
+        json.dump(gltf, f, separators=(",", ":"))
+
+
+def figure(cloth, skin, trim, weapon):
+    return [
+        ("hips", cloth, (0.0, 0.58, 0.0), (0.36, 0.16, 0.22)),
+        ("spine", cloth, (0.0, 0.90, 0.0), (0.42, 0.50, 0.24)),
+        ("spine", trim, (0.0, 0.92, 0.125), (0.14, 0.34, 0.02)),
+        ("head", skin, (0.0, 1.30, 0.0), (0.26, 0.26, 0.26)),
+        ("head", trim, (0.0, 1.46, -0.02), (0.30, 0.08, 0.30)),
+        ("head", (0.08, 0.08, 0.10), (0.07, 1.32, 0.135), (0.05, 0.05, 0.02)),
+        ("head", (0.08, 0.08, 0.10), (-0.07, 1.32, 0.135), (0.05, 0.05, 0.02)),
+        ("arm_r", skin, (0.30, 0.82, 0.0), (0.12, 0.52, 0.12)),
+        ("arm_l", skin, (-0.30, 0.82, 0.0), (0.12, 0.52, 0.12)),
+        ("leg_r", trim, (0.12, 0.28, 0.0), (0.14, 0.56, 0.14)),
+        ("leg_l", trim, (-0.12, 0.28, 0.0), (0.14, 0.56, 0.14)),
+    ] + weapon
+
+
 def moss_pixel(rng):
     cells = [[rng.random() for _ in range(64)] for _ in range(64)]
 
@@ -271,12 +411,10 @@ def main():
     os.makedirs(out, exist_ok=True)
     models = {
         "ironbark_warden": warden,
-        "emberlash_duelist": duelist,
         "tidewater_stormcaller": stormcaller,
         "dawnpetal_mender": mender,
         "hollow_lantern_keeper": keeper,
         "ashen_hound": hound,
-        "reed_stalker": stalker,
     }
     for name, build in models.items():
         mesh = build()
@@ -288,6 +426,23 @@ def main():
     mesh.write_obj(os.path.join(out, "moss_golem.obj"), texture={"moss": "moss_golem.png"})
     mesh = wisp()
     mesh.write_ply(os.path.join(out, "grave_wisp.ply"))
+
+    blade = (1.0, 0.72, 0.25)
+    write_rigged_gltf(
+        os.path.join(out, "emberlash_duelist.gltf"),
+        figure((0.72, 0.20, 0.14), (0.93, 0.74, 0.58), (0.30, 0.10, 0.10), [
+            ("arm_r", blade, (0.30, 0.56, 0.36), (0.05, 0.05, 0.70)),
+            ("arm_r", (0.30, 0.10, 0.10), (0.30, 0.56, 0.04), (0.18, 0.05, 0.05)),
+        ]),
+    )
+    shaft = (0.85, 0.82, 0.70)
+    write_rigged_gltf(
+        os.path.join(out, "reed_stalker.gltf"),
+        figure((0.50, 0.58, 0.28), (0.72, 0.80, 0.55), (0.30, 0.36, 0.16), [
+            ("arm_r", shaft, (0.30, 0.56, 0.25), (0.04, 0.04, 1.50)),
+            ("arm_r", (0.95, 0.95, 0.90), (0.30, 0.56, 1.05), (0.10, 0.03, 0.22)),
+        ]),
+    )
 
 
 if __name__ == "__main__":

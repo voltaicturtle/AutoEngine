@@ -9,22 +9,32 @@
 //! units that have none. The rest of the interface is drawn flat on top.
 //!
 //! Usage: `autoengine-client [--addr 127.0.0.1:7777] [--name NAME] [--spectate]
-//!         [--assets DIR] [--autoplay] [--no-ready] [--screenshot SECONDS:FILE]...`
+//!         [--assets DIR] [--settings FILE] [--replay FILE] [--autoplay] [--no-ready]
+//!         [--menu] [--stats] [--screenshot SECONDS:FILE]...`
+//!
+//! `--replay FILE` watches a fight the server saved (`--record`) without
+//! connecting to anything. Settings live in `autoengine-client.ron` (see
+//! `settings.rs`) and can be changed from the menu.
 //!
 //! Controls: drag units between the bench and your half of the board, drag a
 //! unit onto the shop to sell it, drag items onto units, click shop cards to
 //! buy. Click a name on the scoreboard to look at that player's board.
 //! Space skips a fight replay. Drag with the right mouse button to turn the
-//! camera, scroll to zoom, Home to reset it.
+//! camera, scroll to zoom, Home to reset it. Escape opens the menu and F3
+//! shows frame-rate and scene statistics.
 
 mod draw;
+mod fx;
 mod model;
 mod scene;
+mod settings;
+mod sound;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 use autoengine::client::ClientState;
 use autoengine::combat::UnitId;
@@ -37,8 +47,11 @@ use autoengine::protocol::{ClientMsg, PROTOCOL_VERSION, ViewPhase};
 use macroquad::prelude::*;
 
 use draw::{Layout, button, draw_health_bar, draw_pips, draw_unit_token, label, panel, text_centered, unit_color};
-use model::{Model, RawModel};
+use model::{Model, Pose, RawModel};
 use scene::Ground;
+use settings::Settings;
+use sound::{Sfx, Sounds};
+use autoengine::replay::ReplayFile;
 
 const BG: Color = Color::new(0.07, 0.08, 0.11, 1.0);
 const PANEL: Color = Color::new(0.12, 0.14, 0.19, 1.0);
@@ -50,9 +63,18 @@ const GOOD: Color = Color::new(0.35, 0.82, 0.45, 1.0);
 const BAD: Color = Color::new(0.92, 0.33, 0.33, 1.0);
 const ACCENT: Color = Color::new(0.35, 0.62, 0.98, 1.0);
 
+#[derive(Clone)]
 struct Options {
-    addr: String,
-    name: String,
+    /// Server address and player name; the settings file fills these in
+    /// when the command line does not.
+    addr: Option<String>,
+    name: Option<String>,
+    settings: PathBuf,
+    /// A saved fight to watch instead of connecting to a server.
+    replay: Option<PathBuf>,
+    /// Start with the menu open, or with the statistics overlay on.
+    menu: bool,
+    stats: bool,
     spectate: bool,
     /// Folder that model files named by the content are looked up in.
     assets: PathBuf,
@@ -66,11 +88,15 @@ struct Options {
 }
 
 fn parse_options() -> Result<Options, String> {
-    let usage = "usage: autoengine-client [--addr HOST:PORT] [--name NAME] [--spectate] [--assets DIR] [--autoplay] \
-                 [--no-ready] [--screenshot SECONDS:FILE]...";
+    let usage = "usage: autoengine-client [--addr HOST:PORT] [--name NAME] [--spectate] [--assets DIR] [--settings FILE] [--replay FILE] [--autoplay] \
+                 [--no-ready] [--menu] [--stats] [--screenshot SECONDS:FILE]...";
     let mut o = Options {
-        addr: "127.0.0.1:7777".into(),
-        name: "Player".into(),
+        addr: None,
+        name: None,
+        settings: PathBuf::from("autoengine-client.ron"),
+        replay: None,
+        menu: false,
+        stats: false,
         spectate: false,
         assets: PathBuf::from("content"),
         autoplay: false,
@@ -82,8 +108,12 @@ fn parse_options() -> Result<Options, String> {
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(usage.to_string());
         match arg.as_str() {
-            "--addr" => o.addr = value()?,
-            "--name" => o.name = value()?,
+            "--addr" => o.addr = Some(value()?),
+            "--name" => o.name = Some(value()?),
+            "--settings" => o.settings = PathBuf::from(value()?),
+            "--replay" => o.replay = Some(PathBuf::from(value()?)),
+            "--menu" => o.menu = true,
+            "--stats" => o.stats = true,
             "--spectate" => o.spectate = true,
             "--assets" => o.assets = PathBuf::from(value()?),
             "--autoplay" => o.autoplay = true,
@@ -100,11 +130,28 @@ fn parse_options() -> Result<Options, String> {
     Ok(o)
 }
 
+/// Options, settings and any problem reading the settings file; or the
+/// usage text when the command line is wrong.
+type Startup = Result<(Options, Settings, Option<String>), String>;
+
+/// The command line and the settings file, read once: the window needs
+/// them before `main` starts.
+fn startup() -> &'static Startup {
+    static STARTUP: OnceLock<Startup> = OnceLock::new();
+    STARTUP.get_or_init(|| {
+        let options = parse_options()?;
+        let (settings, problem) = Settings::load(&options.settings);
+        Ok((options, settings, problem))
+    })
+}
+
 fn window_conf() -> Conf {
+    let settings = startup().as_ref().map(|s| s.1.clone()).unwrap_or_default();
     Conf {
         window_title: "AutoEngine".to_owned(),
-        window_width: 1280,
-        window_height: 800,
+        window_width: settings.window_width,
+        window_height: settings.window_height,
+        fullscreen: settings.fullscreen,
         high_dpi: false,
         ..Default::default()
     }
@@ -127,6 +174,16 @@ struct Show {
     done_for_ms: f32,
     /// Which way each unit is turned, as a yaw angle.
     facing: HashMap<UnitId, f32>,
+    /// Replay time up to which effects and sounds have been set off.
+    fx_seen_ms: u32,
+    /// Whether the result has been announced with a sound.
+    announced: bool,
+}
+
+impl Show {
+    fn new(playback: Playback, flipped: bool, title: String) -> Self {
+        Show { playback, flipped, time_ms: 0.0, title, done_for_ms: 0.0, facing: HashMap::new(), fx_seen_ms: 0, announced: false }
+    }
 }
 
 /// Height of a unit at 100% scale, in hex radii.
@@ -140,11 +197,18 @@ struct Look {
     model: Rc<Model>,
     scale: f32,
     yaw: f32,
+    /// Whether to play animation clips (a setting).
+    animate: bool,
 }
 
 impl Look {
     fn height(&self) -> f32 {
         self.model.height * self.scale
+    }
+
+    /// A moment of the named clip, if the model has it.
+    fn pose(&self, clip: &str, time: f32, looped: bool) -> Option<Pose> {
+        self.model.clip(clip).filter(|_| self.animate).map(|clip| Pose { clip, time, looped })
     }
 }
 
@@ -182,6 +246,7 @@ impl Models {
             model,
             scale: UNIT_HEIGHT * wanted.map_or(100, |m| m.scale_percent) as f32 / 100.0,
             yaw: (wanted.map_or(0, |m| m.yaw_degrees) as f32).to_radians(),
+            animate: true,
         }
     }
 }
@@ -206,6 +271,16 @@ struct App {
     /// distance that just fits the board.
     camera_yaw: f32,
     camera_zoom: f32,
+    settings: Settings,
+    particles: fx::Particles,
+    sounds: Sounds,
+    menu_open: bool,
+    /// A saved fight being watched instead of a live game.
+    replay: Option<ReplayFile>,
+    /// Units and vertices drawn this frame, for the statistics overlay.
+    drawn: Cell<(usize, usize)>,
+    /// Recent frame times in milliseconds.
+    frame_ms: Vec<f32>,
 }
 
 impl App {
@@ -221,7 +296,8 @@ impl App {
     /// first welcome gets our seat back.
     fn connect(&mut self) {
         self.last_reconnect_at = get_time();
-        match Connection::connect(&self.options.addr) {
+        let addr = self.options.addr.clone().unwrap_or_else(|| self.settings.addr.clone());
+        match Connection::connect(&addr) {
             Ok(conn) => {
                 self.conn = Some(conn);
                 self.connect_error = None;
@@ -229,7 +305,7 @@ impl App {
                     ClientMsg::Spectate { version: PROTOCOL_VERSION }
                 } else {
                     ClientMsg::Join {
-                        name: self.options.name.clone(),
+                        name: self.options.name.clone().unwrap_or_else(|| self.settings.name.clone()),
                         version: PROTOCOL_VERSION,
                         token: self.state.token.clone(),
                     }
@@ -238,7 +314,7 @@ impl App {
             }
             Err(e) => {
                 self.conn = None;
-                self.connect_error = Some(format!("cannot reach the server at {}: {e}", self.options.addr));
+                self.connect_error = Some(format!("cannot reach the server at {addr}: {e}"));
             }
         }
     }
@@ -247,13 +323,36 @@ impl App {
     fn look_of(&self, unit_id: &str) -> Look {
         let def = self.state.content.as_ref().and_then(|c| c.unit(unit_id));
         let name = def.map_or(unit_id, |d| d.name.as_str());
-        self.models.borrow_mut().look(def, name)
+        let mut look = self.models.borrow_mut().look(def, name);
+        look.animate = self.settings.animations;
+        look
     }
 
     /// The look of a unit given the name fights report it under.
     fn look_of_name(&self, name: &str) -> Look {
         let def = self.state.content.as_ref().and_then(|c| c.units().find(|u| u.name == name));
-        self.models.borrow_mut().look(def, name)
+        let mut look = self.models.borrow_mut().look(def, name);
+        look.animate = self.settings.animations;
+        look
+    }
+
+    /// Draws a unit's model and counts it for the statistics overlay.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_model(&self, look: &Look, at: Vec3, yaw: f32, scale: f32, tint: [f32; 3], flash: f32, pose: Option<Pose>) {
+        let (units, vertices) = self.drawn.get();
+        self.drawn.set((units + 1, vertices + look.model.vertex_count()));
+        look.model.draw(at, yaw + look.yaw, scale, tint, flash, pose);
+    }
+
+    fn play(&mut self, sfx: Sfx) {
+        self.sounds.play(sfx, self.settings.volume);
+    }
+
+    /// Writes the settings file after a change.
+    fn save_settings(&mut self) {
+        if let Err(e) = self.settings.save(&self.options.settings) {
+            self.connect_error = Some(format!("could not save {}: {e}", self.options.settings.display()));
+        }
     }
 
     fn command(&mut self, command: Command) {
@@ -323,7 +422,7 @@ impl App {
                 Opponent::Neutral => "the neutral camp".to_string(),
             };
             let title = format!("{} vs {}", self.state.player_name(record.home), away);
-            self.show = Some(Show { playback: Playback::new(&record), flipped, time_ms: 0.0, title, done_for_ms: 0.0, facing: HashMap::new() });
+            self.show = Some(Show::new(Playback::new(&record), flipped, title));
         }
     }
 
@@ -410,14 +509,33 @@ impl App {
 
 #[macroquad::main(window_conf)]
 async fn main() {
-    let options = match parse_options() {
-        Ok(o) => o,
+    let (options, mut settings, problem) = match startup() {
+        Ok(start) => start.clone(),
         Err(usage) => {
             eprintln!("{usage}");
             return;
         }
     };
+    if let Some(problem) = &problem {
+        eprintln!("{problem}");
+    }
+    settings.show_stats |= options.stats;
+    let replay = match options.replay.as_deref().map(ReplayFile::load) {
+        Some(Err(e)) => {
+            eprintln!("{e}");
+            return;
+        }
+        Some(Ok(replay)) => Some(replay),
+        None => None,
+    };
     let mut app = App {
+        settings,
+        particles: fx::Particles::default(),
+        sounds: Sounds::load().await,
+        menu_open: options.menu,
+        replay,
+        drawn: Cell::new((0, 0)),
+        frame_ms: Vec::new(),
         conn: None,
         state: ClientState::new(),
         drag: None,
@@ -433,7 +551,18 @@ async fn main() {
         camera_zoom: 1.0,
         options,
     };
-    app.connect();
+    if let Some(replay) = &app.replay {
+        match replay.content.clone().into_content() {
+            Ok(content) => app.state.content = Some(content),
+            Err(e) => {
+                eprintln!("the replay's content is invalid: {e:?}");
+                return;
+            }
+        }
+    } else {
+        app.connect();
+    }
+    app.connect_error = app.connect_error.take().or(problem);
     // Room for a whole model part in one draw call.
     macroquad::window::gl_set_drawcall_buffer_capacity(model::MAX_PART_VERTICES + 16, model::MAX_PART_INDICES + 16);
 
@@ -442,15 +571,30 @@ async fn main() {
     let mut shots = shots.into_iter().peekable();
 
     loop {
-        app.pump_network();
-        if app.options.autoplay {
-            app.autoplay();
+        if app.replay.is_none() {
+            app.pump_network();
+            if app.options.autoplay {
+                app.autoplay();
+            }
         }
         clear_background(BG);
+        app.drawn.set((0, 0));
+        app.frame_ms.push(get_frame_time() * 1000.0);
+        if app.frame_ms.len() > 120 {
+            app.frame_ms.remove(0);
+        }
+        app.particles.update(get_frame_time());
+        if is_key_pressed(KeyCode::Escape) {
+            app.menu_open = !app.menu_open;
+        }
+        if is_key_pressed(KeyCode::F3) {
+            app.settings.show_stats = !app.settings.show_stats;
+            app.save_settings();
+        }
         // Camera: right-drag turns it, the wheel zooms, Home resets.
         let turn = mouse_delta_position();
         if is_mouse_button_down(MouseButton::Right) {
-            app.camera_yaw += turn.x * 2.5;
+            app.camera_yaw += turn.x * 2.5 * app.settings.camera_turn_percent as f32 / 100.0;
         }
         let wheel = mouse_wheel().1;
         if wheel != 0.0 {
@@ -460,10 +604,18 @@ async fn main() {
             (app.camera_yaw, app.camera_zoom) = (0.0, 1.0);
         }
         let layout = Layout::new(&app);
-        if app.state.view.is_none() {
+        if app.menu_open {
+            // The game carries on underneath; the menu has the screen.
+            draw_menu(&mut app);
+        } else if app.replay.is_some() {
+            draw_replay_viewer(&mut app, &layout);
+        } else if app.state.view.is_none() {
             draw_lobby(&mut app);
         } else {
             draw_game(&mut app, &layout);
+        }
+        if app.settings.show_stats && !app.menu_open {
+            draw_stats(&app, &layout);
         }
         draw_banner(&app);
 
@@ -520,11 +672,9 @@ fn draw_lobby(app: &mut App) {
     }
 }
 
-fn draw_game(app: &mut App, layout: &Layout) {
-    draw_top_bar(app);
-    draw_traits(app, layout);
-    draw_scoreboard(app, layout);
-
+/// Moves the fight on screen forward by one frame, and ends it when it has
+/// been over for a moment or Space skips it.
+fn advance_show(app: &mut App) {
     let dt_ms = get_frame_time() * 1000.0;
     let skip = is_key_pressed(KeyCode::Space);
     let mut finished = false;
@@ -539,7 +689,128 @@ fn draw_game(app: &mut App, layout: &Layout) {
     }
     if finished {
         app.show = None;
+        app.particles.clear();
     }
+}
+
+/// Watching a saved fight: no server, no shop, just the replay on a loop.
+fn draw_replay_viewer(app: &mut App, layout: &Layout) {
+    let Some(replay) = &app.replay else { return };
+    let (title, events) = (replay.title.clone(), replay.record.events.len());
+    if app.show.is_none() {
+        app.show = Some(Show::new(Playback::new(&replay.record), false, title.clone()));
+    }
+    let (w, h) = (screen_width(), screen_height());
+    panel(0.0, 0.0, w, 44.0, PANEL);
+    label("Replay", 16.0, 29.0, 22.0, TEXT);
+    text_centered(&title, w / 2.0, 29.0, 22.0, ACCENT);
+    panel(0.0, 44.0, layout.left_w, h - 44.0, PANEL);
+    panel(w - layout.right_w, 44.0, layout.right_w, h - 44.0, PANEL);
+    let x = w - layout.right_w + 14.0;
+    label("Saved fight", x, 74.0, 22.0, TEXT);
+    let file = app.options.replay.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    draw::wrapped(&file, x, 86.0, layout.right_w - 28.0, 16.0, MUTED);
+    label(&format!("{events} events"), x, 150.0, 16.0, MUTED);
+    for (i, line) in ["Space: restart", "Right-drag: turn the camera", "Scroll: zoom", "Esc: menu", "F3: statistics"].iter().enumerate() {
+        label(line, x, 190.0 + i as f32 * 22.0, 16.0, MUTED);
+    }
+    advance_show(app);
+    draw_replay(app, layout);
+}
+
+/// The menu: settings that take effect at once and are saved to the file.
+fn draw_menu(app: &mut App) {
+    let (w, h) = (screen_width(), screen_height());
+    draw_rectangle(0.0, 0.0, w, h, Color::new(0.03, 0.04, 0.06, 0.82));
+    let (pw, ph) = (460.0, 470.0);
+    let (x, y) = (w / 2.0 - pw / 2.0, h / 2.0 - ph / 2.0);
+    panel(x, y, pw, ph, PANEL);
+    draw_rectangle_lines(x, y, pw, ph, 1.0, MUTED);
+    text_centered("Menu", w / 2.0, y + 40.0, 30.0, TEXT);
+
+    let before = app.settings.clone();
+    let on_off = |on: bool| if on { "On" } else { "Off" };
+    let mut row = 0.0;
+    let mut toggle = |name: &str, value: &mut bool| {
+        let ry = y + 70.0 + row * 46.0;
+        row += 1.0;
+        label(name, x + 30.0, ry + 25.0, 20.0, TEXT);
+        if button(on_off(*value), x + pw - 150.0, ry, 120.0, 36.0, true) {
+            *value = !*value;
+        }
+    };
+    toggle("Particles", &mut app.settings.particles);
+    toggle("Shadows", &mut app.settings.shadows);
+    toggle("Animations", &mut app.settings.animations);
+    toggle("Statistics (F3)", &mut app.settings.show_stats);
+    toggle("Fullscreen", &mut app.settings.fullscreen);
+
+    let stepper = |name: &str, shown: String, row: f32| -> i32 {
+        let ry = y + 70.0 + row * 46.0;
+        label(name, x + 30.0, ry + 25.0, 20.0, TEXT);
+        let minus = button("-", x + pw - 150.0, ry, 36.0, 36.0, true);
+        text_centered(&shown, x + pw - 90.0, ry + 25.0, 20.0, TEXT);
+        let plus = button("+", x + pw - 66.0, ry, 36.0, 36.0, true);
+        plus as i32 - minus as i32
+    };
+    let volume = if Sounds::AVAILABLE { "Volume" } else { "Volume (sound not built in)" };
+    let step = stepper(volume, app.settings.volume.to_string(), 5.0);
+    app.settings.volume = (app.settings.volume as i32 + step * 10).clamp(0, 100) as u8;
+    let step = stepper("Camera turn speed", format!("{}%", app.settings.camera_turn_percent), 6.0);
+    app.settings.camera_turn_percent = (app.settings.camera_turn_percent as i32 + step * 25).clamp(25, 400) as u32;
+
+    if app.settings != before {
+        if app.settings.fullscreen != before.fullscreen {
+            set_fullscreen(app.settings.fullscreen);
+        }
+        if app.settings.volume != before.volume {
+            app.play(Sfx::Buy);
+        }
+        app.save_settings();
+    }
+    let by = y + ph - 58.0;
+    if button("Resume", x + 30.0, by, 190.0, 40.0, true) {
+        app.menu_open = false;
+    }
+    if button("Quit", x + pw - 220.0, by, 190.0, 40.0, true) {
+        macroquad::miniquad::window::order_quit();
+    }
+}
+
+/// Frame rate and what the scene is costing, in the corner of the 3D view.
+fn draw_stats(app: &App, layout: &Layout) {
+    let frames = &app.frame_ms;
+    let average = frames.iter().sum::<f32>() / frames.len().max(1) as f32;
+    let worst = frames.iter().copied().fold(0.0, f32::max);
+    let (units, vertices) = app.drawn.get();
+    let link = if app.replay.is_some() {
+        "replay file"
+    } else if app.conn.as_ref().is_some_and(|c| !c.is_closed()) {
+        "connected"
+    } else {
+        "not connected"
+    };
+    let lines = [
+        format!("{} fps", get_fps()),
+        format!("frame {average:.1} ms, worst {worst:.1} ms"),
+        format!("{units} models, {vertices} vertices"),
+        format!("{} particles", app.particles.len()),
+        format!("{}x{}", screen_width() as i32, screen_height() as i32),
+        link.to_string(),
+    ];
+    let (x, y) = (layout.view.area.x + 8.0, layout.view.area.y + 8.0);
+    draw_rectangle(x, y, 250.0, lines.len() as f32 * 18.0 + 10.0, Color::new(0.0, 0.0, 0.0, 0.6));
+    for (i, line) in lines.iter().enumerate() {
+        label(line, x + 8.0, y + 20.0 + i as f32 * 18.0, 16.0, GOOD);
+    }
+}
+
+fn draw_game(app: &mut App, layout: &Layout) {
+    draw_top_bar(app);
+    draw_traits(app, layout);
+    draw_scoreboard(app, layout);
+
+    advance_show(app);
 
     if app.show.is_some() {
         draw_replay(app, layout);
@@ -694,6 +965,7 @@ fn star_scale(star: u8) -> f32 {
 }
 
 const RING_LIFT: Vec3 = Vec3::new(0.0, 0.03, 0.0);
+const SHADOW: Color = Color::new(0.0, 0.0, 0.0, 0.38);
 
 fn draw_planning(app: &mut App, layout: &Layout) {
     let Some(player) = app.shown_player().cloned() else { return };
@@ -730,17 +1002,23 @@ fn draw_planning(app: &mut App, layout: &Layout) {
         ground.hex_tile(layout.bench_world(i), 0.72, 0.14, fill);
     }
     for (_, at, _) in &standing {
+        if app.settings.shadows {
+            ground.disc(*at + RING_LIFT * 0.5, 0.48, SHADOW);
+        }
         ground.ring(*at + RING_LIFT, 0.50, 0.62, FRIEND);
     }
     ground.draw();
     for (unit, at, yaw) in &standing {
         let look = app.look_of(&unit.unit);
-        look.model.draw(*at, yaw + look.yaw, look.scale * star_scale(unit.star), [1.0; 3], 0.0);
+        // Offset each unit's idle so they do not sway in step.
+        let pose = look.pose("idle", get_time() as f32 + unit.uid as f32 * 0.37, true);
+        app.draw_model(&look, *at, *yaw, look.scale * star_scale(unit.star), [1.0; 3], 0.0, pose);
     }
     let held = dragged_unit.and_then(|uid| player.unit(uid)).zip(view.ground_at(mouse));
     if let Some((unit, at)) = held {
         let look = app.look_of(&unit.unit);
-        look.model.draw(at + vec3(0.0, 0.45, 0.0), std::f32::consts::PI + look.yaw, look.scale * star_scale(unit.star), [1.0; 3], 0.12);
+        let pose = look.pose("walk", get_time() as f32, true);
+        app.draw_model(&look, at + vec3(0.0, 0.45, 0.0), std::f32::consts::PI, look.scale * star_scale(unit.star), [1.0; 3], 0.12, pose);
     }
     view.end();
 
@@ -881,6 +1159,7 @@ fn draw_shop(app: &mut App, layout: &Layout, player: &Player) {
     let ready = button(if player.ready { "Ready!" } else { "Ready" }, b.x, b.y + 72.0, b.w, 34.0, !player.ready);
     if let Some(slot) = buy {
         app.command(Command::BuyUnit { slot });
+        app.play(Sfx::Buy);
     }
     if reroll {
         app.command(Command::Reroll);
@@ -1022,13 +1301,19 @@ fn draw_replay(app: &mut App, layout: &Layout) {
     // Attacks: turn to the target and lunge at it; hits flash white.
     let mut lunge: HashMap<UnitId, Vec3> = HashMap::new();
     let mut hit: HashMap<UnitId, f32> = HashMap::new();
-    for (age, flash) in show.playback.recent_flashes(400) {
+    // Seconds since each unit last attacked.
+    let mut attacked: HashMap<UnitId, f32> = HashMap::new();
+    for (age, flash) in show.playback.recent_flashes(900) {
         match flash {
             Flash::Attack { source, target } => {
                 if let (Some(a), Some(b)) = (world_of(&show.playback, *source), world_of(&show.playback, *target))
                     && let Some(yaw) = yaw_towards(a, b)
                 {
-                    show.facing.insert(*source, yaw);
+                    let since = attacked.entry(*source).or_insert(f32::MAX);
+                    *since = since.min(age as f32 / 1000.0);
+                    if age < 400 {
+                        show.facing.insert(*source, yaw);
+                    }
                     if age < 180 {
                         let reach = (std::f32::consts::PI * age as f32 / 180.0).sin() * 0.35;
                         lunge.insert(*source, (b - a).normalize_or_zero() * reach);
@@ -1044,6 +1329,73 @@ fn draw_replay(app: &mut App, layout: &Layout) {
         }
     }
 
+    // Set off particles and sounds for what happened since the last frame.
+    let fresh = now.saturating_sub(show.fx_seen_ms).min(300);
+    show.fx_seen_ms = now;
+    let chest = vec3(0.0, 0.9, 0.0);
+    let mut cues: Vec<Sfx> = Vec::new();
+    for (age, flash) in show.playback.recent_flashes(fresh) {
+        if age >= fresh {
+            continue;
+        }
+        use autoengine::effect::DamageKind;
+        use fx::Burst;
+        let particles = app.settings.particles;
+        match flash {
+            Flash::Attack { source, target } => {
+                if let (Some(a), Some(b)) = (world_of(&show.playback, *source), world_of(&show.playback, *target))
+                    && a.distance(b) > 2.2
+                    && particles
+                {
+                    app.particles.bolt(a + chest, b + chest, 0.12, Color::new(1.0, 0.85, 0.45, 1.0));
+                }
+            }
+            Flash::Damage { target, amount, kind, crit, .. } => {
+                cues.push(Sfx::Hit);
+                if let Some(at) = world_of(&show.playback, *target).filter(|_| particles && *amount > 0) {
+                    let color = match kind {
+                        DamageKind::Physical => Color::new(1.0, 0.60, 0.25, 1.0),
+                        DamageKind::Magic => Color::new(0.50, 0.65, 1.0, 1.0),
+                        DamageKind::True => WHITE,
+                    };
+                    let count = if *crit { 16 } else { 7 };
+                    app.particles.burst(at + chest, Burst { count, color, speed: 2.4, life: 0.45, size: 0.13, gravity: 6.0 });
+                }
+            }
+            Flash::Heal { target, .. } => {
+                cues.push(Sfx::Heal);
+                if let Some(at) = world_of(&show.playback, *target).filter(|_| particles) {
+                    let color = Color::new(0.45, 1.0, 0.55, 1.0);
+                    app.particles.burst(at + chest * 0.5, Burst { count: 9, color, speed: 0.9, life: 0.9, size: 0.12, gravity: -2.5 });
+                }
+            }
+            Flash::Cast { unit } => {
+                cues.push(Sfx::Cast);
+                if let Some(at) = world_of(&show.playback, *unit).filter(|_| particles) {
+                    let color = Color::new(0.50, 0.78, 1.0, 1.0);
+                    app.particles.burst(at + chest, Burst { count: 22, color, speed: 2.6, life: 0.6, size: 0.14, gravity: 0.0 });
+                }
+            }
+            Flash::Death { unit } => {
+                cues.push(Sfx::Death);
+                if let Some(at) = world_of(&show.playback, *unit).filter(|_| particles) {
+                    let color = Color::new(0.75, 0.75, 0.80, 0.9);
+                    app.particles.burst(at + chest * 0.6, Burst { count: 26, color, speed: 1.5, life: 0.9, size: 0.2, gravity: -0.8 });
+                }
+            }
+        }
+    }
+    if show.playback.is_finished() && !show.announced {
+        show.announced = true;
+        if app.state.seat.is_some() {
+            cues.push(if show.playback.winner().is_some_and(|t| t.0 == my_team) { Sfx::Victory } else { Sfx::Defeat });
+        }
+    }
+    cues.dedup();
+    for cue in cues {
+        app.play(cue);
+    }
+
     // The 3D scene.
     view.begin();
     let mut ground = Ground::default();
@@ -1051,6 +1403,9 @@ fn draw_replay(app: &mut App, layout: &Layout) {
     for u in show.playback.units().filter(|u| u.alive) {
         let (q, r) = u.position_at(now);
         let at = place(q, r) + RING_LIFT;
+        if app.settings.shadows {
+            ground.disc(at - RING_LIFT * 0.5, 0.48, SHADOW);
+        }
         ground.ring(at, 0.50, 0.62, if u.team.0 == my_team { FRIEND } else { ENEMY });
         if u.casting {
             let pulse = 0.72 + 0.06 * (now as f32 / 90.0).sin();
@@ -1074,8 +1429,24 @@ fn draw_replay(app: &mut App, layout: &Layout) {
         let yaw = show.facing.get(&u.id).copied().unwrap_or(0.0);
         let stunned = u.stunned_until_ms > now;
         let tint = if stunned { [0.62, 0.62, 0.70] } else { [1.0; 3] };
-        look.model.draw(at, yaw + look.yaw, look.scale, tint, hit.get(&u.id).copied().unwrap_or(0.0));
+        // Animated models act out what the unit is doing.
+        let seconds = now as f32 / 1000.0;
+        let walking = u.pos != u.prev_pos && now.saturating_sub(u.moved_at_ms) < autoengine::playback::MOVE_ANIMATION_MS;
+        let swing = attacked.get(&u.id).and_then(|age| look.pose("attack", *age, false)).filter(|p| p.time < look.model.clip_duration(p.clip));
+        let pose = if stunned {
+            look.pose("idle", 0.0, false)
+        } else if u.casting {
+            look.pose("cast", seconds, true)
+        } else if swing.is_some() {
+            swing
+        } else if walking {
+            look.pose("walk", seconds, true)
+        } else {
+            look.pose("idle", seconds + u.id.0 as f32 * 0.37, true)
+        };
+        app.draw_model(&look, at, yaw, look.scale, tint, hit.get(&u.id).copied().unwrap_or(0.0), pose);
     }
+    app.particles.draw(&view.camera);
     view.end();
 
     // Flat markers on top: health, numbers, lines.

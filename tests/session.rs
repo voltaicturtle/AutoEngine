@@ -329,3 +329,35 @@ fn a_client_can_play_over_tcp() {
     assert!(session.has_started());
     assert!(session.seat_is_bot(0), "the server noticed the client leaving");
 }
+
+#[test]
+fn recorded_fights_can_be_loaded_and_verified() {
+    use autoengine::replay::{ReplayError, ReplayFile};
+    let dir = std::env::temp_dir().join(format!("autoengine-replays-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut s = session(2);
+    s.record_to(&dir);
+    s.handle(1, ClientMsg::Join { name: "Ana".into(), version: PROTOCOL_VERSION, token: None }, 0);
+    s.handle(1, ClientMsg::Start, 0);
+    let mut now = 0;
+    while !s.is_over() && now < 4_000_000 {
+        now += 30_000;
+        s.tick(now);
+        s.drain_outbox();
+    }
+    let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+    files.sort();
+    assert!(files.len() >= 2, "every fight is saved");
+    for file in &files {
+        let replay = ReplayFile::load(file).unwrap();
+        assert!(!replay.title.is_empty());
+        assert_eq!(replay.verify(), Ok(()), "{}", file.display());
+    }
+    // A tampered replay is caught.
+    let mut replay = ReplayFile::load(&files[0]).unwrap();
+    replay.record.events.pop();
+    assert!(matches!(replay.verify(), Err(ReplayError::Diverged { .. })));
+    replay.record.teams.clear();
+    assert_eq!(replay.verify(), Err(ReplayError::NoTeams));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

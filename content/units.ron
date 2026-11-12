@@ -42,7 +42,7 @@
     ),
     (
         id: "emberlash_duelist",
-        model: (file: "models/emberlash_duelist.obj", scale_percent: 100),
+        model: (file: "models/emberlash_duelist.gltf", scale_percent: 100),
         name: "Emberlash Duelist",
         cost: 3,
         traits: ["cinder"],
@@ -187,7 +187,7 @@
     ),
     (
         id: "reed_stalker",
-        model: (file: "models/reed_stalker.obj", scale_percent: 100),
+        model: (file: "models/reed_stalker.gltf", scale_percent: 100),
         name: "Reed Stalker",
         cost: 1,
         traits: ["tide", "grove"],

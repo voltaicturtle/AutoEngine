@@ -25,6 +25,7 @@ All five roadmap steps are in place: the combat core, data-driven content, the g
 - `protocol`: the client and server messages, sent as one line of JSON each.
 - `session`: a hosted game independent of any transport: seats, bots for empty or dropped seats, round timers, reconnecting with a seat token, spectators, and per-viewer filtering of private information.
 - `net`: the TCP transport for both ends, using only the standard library.
+- `replay`: fights saved to files, which can be watched again or re-run to check that the engine still plays them out identically.
 - `client` and `playback`: the display-side model a client builds from server messages, with no rendering in it, so other front ends can reuse it.
 
 Two binaries sit on top: `autoengine-server` (headless) and, in the `client/`
@@ -50,8 +51,11 @@ press Space to skip a fight replay. Drag with the right mouse button to turn
 the camera, scroll to zoom, and press Home to reset it. If the connection drops, the client keeps
 retrying and takes its seat back; a bot plays it in the meantime.
 
+Escape opens a menu with the settings, and F3 shows frame-rate and scene
+statistics.
+
 Server options: `--port`, `--bind`, `--seats`, `--seed`, `--planning-secs`,
-`--content DIR`. `--autoplay` makes a client play by itself, which is handy
+`--content DIR`, `--record DIR`. `--autoplay` makes a client play by itself, which is handy
 for demos.
 
 ### 3D models
@@ -81,11 +85,51 @@ without help. To run the executable directly, copy `libassimp` from
 `target/<profile>/build/russimp-sys-*/out/dylib/lib` next to it, or install
 Assimp and remove the `prebuilt` feature in `client/Cargo.toml`.
 
+### Animation
+
+A model file with animations keeps its skeleton, and the client plays its
+clips by name: `idle` while standing, `walk` while moving, `attack` on each
+attack and `cast` while casting. Names are matched without regard to case and
+may be part of a longer name such as `Armature|Walk`. Missing clips are
+simply not played. Skinning uses up to four bones per vertex and runs on the
+CPU. Two of the sample units (`emberlash_duelist.gltf`, `reed_stalker.gltf`)
+are rigged this way.
+
+### Effects, sound and settings
+
+Fights throw particles for hits, heals, casts and deaths, ranged attacks fire
+a bolt, and units cast a soft shadow. Settings (name, server address, window
+size, fullscreen, volume, and switches for particles, shadows and animations)
+live in `autoengine-client.ron` in the folder the client is started from
+(`--settings FILE` to use another) and are saved when changed in the menu.
+
+Sound effects are synthesised by the client, so there are no sound files.
+Playback is behind a cargo feature because it needs the system audio library
+to build (ALSA development files on Linux):
+
+```
+cargo run -p autoengine-client --features audio
+```
+
+### Replays
+
+`autoengine-server --record DIR` saves every fight as a JSON file holding the
+content, both teams, the seed and the events.
+
+```
+cargo run -p autoengine-client -- --replay DIR/round-004-you-vs-bot-3.json   # watch it
+cargo run -- replay DIR/*.json                                               # re-run and compare
+```
+
+The second command fights each recorded battle again and reports any whose
+events no longer match, which makes saved replays a regression test for
+balance-neutral engine changes.
+
 Known limits: connections are plain TCP with no encryption or accounts, so
-host it only for people you trust. Models are static: skeletal animation in a
-file is not played, and movement, attacks and hits are shown by moving,
-turning and flashing the whole model. Lighting is a single fixed light worked
-out per vertex. There is no sound yet.
+host it only for people you trust. Lighting is a single fixed light worked
+out per vertex, and shadows are simple discs. Animation clips switch without
+blending. The menu covers the game while it is open, and keys cannot be
+rebound yet.
 
 ## Game loop
 

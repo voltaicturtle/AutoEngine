@@ -16,6 +16,7 @@ use std::sync::Arc;
 use crate::bot;
 use crate::content::ContentSet;
 use crate::game::{Game, Opponent, PlayerId};
+use crate::replay::ReplayFile;
 use crate::protocol::{ClientMsg, ContentInfo, GameView, PROTOCOL_VERSION, ServerMsg, ViewPhase, visible_to};
 use crate::rng::Rng;
 
@@ -71,6 +72,8 @@ pub struct Session {
     seats: Vec<Seat>,
     conns: BTreeMap<ConnId, Role>,
     game: Option<Game>,
+    /// Where to save every fight as a replay file, if anywhere.
+    record_dir: Option<std::path::PathBuf>,
     phase: Phase,
     bot_rng: Rng,
     /// Source of seat tokens; seeded from the clock, never from the game seed.
@@ -80,6 +83,11 @@ pub struct Session {
 }
 
 impl Session {
+    /// Saves every fight from now on as a replay file in `dir`.
+    pub fn record_to(&mut self, dir: impl Into<std::path::PathBuf>) {
+        self.record_dir = Some(dir.into());
+    }
+
     pub fn new(content: impl Into<Arc<ContentSet>>, config: SessionConfig) -> Self {
         assert!((1..=250).contains(&config.seats), "a session needs 1 to 250 seats");
         Session {
@@ -87,6 +95,7 @@ impl Session {
             seats: vec![Seat::default(); config.seats],
             conns: BTreeMap::new(),
             game: None,
+            record_dir: None,
             phase: Phase::Lobby,
             bot_rng: Rng::new(config.seed ^ 0xB075),
             token_rng: Rng::new(
@@ -331,6 +340,7 @@ impl Session {
 
     fn resolve(&mut self, now: u64) {
         let game = self.game.as_mut().unwrap();
+        let round_played = game.round_index();
         game.finish_round().expect("a round is in progress");
         let combats = game.combats().to_vec();
         let longest = combats.iter().map(|c| c.duration_ms as u64).max();
@@ -343,6 +353,24 @@ impl Session {
             };
             Phase::Showing { until: now + wait }
         };
+        if let Some(dir) = &self.record_dir {
+            let game = self.game.as_ref().unwrap();
+            let content = ContentInfo::from_content(game.content());
+            for record in &combats {
+                let away = match &record.away {
+                    Opponent::Player(p) => game.player(*p).name.clone(),
+                    Opponent::Ghost(p) => format!("{} (ghost)", game.player(*p).name),
+                    Opponent::Neutral => "the neutral camp".to_string(),
+                };
+                let title = format!("{} vs {}", game.player(record.home).name, away);
+                let path = dir.join(crate::replay::file_name(round_played, &title));
+                let saved = std::fs::create_dir_all(dir)
+                    .and_then(|_| ReplayFile::new(title, content.clone(), record.clone()).save(&path));
+                if let Err(e) = saved {
+                    eprintln!("could not save replay {}: {e}", path.display());
+                }
+            }
+        }
         // Fights first, so a client has them before the state says to show them.
         for (conn, role) in self.conns.clone() {
             for record in &combats {

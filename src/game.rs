@@ -237,6 +237,10 @@ pub struct CombatRecord {
     pub duration_ms: u32,
     /// Units of the winning side still standing.
     pub survivors: u32,
+    /// Both sides as they entered the fight, home first. With the seed
+    /// this is enough to fight it again (see `replay`).
+    #[serde(default)]
+    pub teams: Vec<TeamSetup>,
     pub events: Vec<Event>,
 }
 
@@ -946,10 +950,8 @@ impl Game {
             Opponent::Player(p) | Opponent::Ghost(p) => self.team_setup(*p),
             Opponent::Neutral => TeamSetup { units: neutral.to_vec(), bonuses: Vec::new() },
         };
-        let mut combat = self
-            .content
-            .setup_combat(seed, &[self.team_setup(home), away_setup])
-            .expect("boards are validated when they are built");
+        let teams = vec![self.team_setup(home), away_setup];
+        let mut combat = self.content.setup_combat(seed, &teams).expect("boards are validated when they are built");
         let outcome = combat.run().clone();
         let survivors = match outcome.winner {
             Some(team) => combat.units().iter().filter(|u| u.is_alive() && u.team() == team).count() as u32,
@@ -964,6 +966,7 @@ impl Game {
             winner: outcome.winner,
             duration_ms: outcome.duration_ms,
             survivors,
+            teams,
             events: combat.drain_events(),
         });
         self.emit(GameEvent::CombatFinished { combat: index, home, away, winner: outcome.winner });
