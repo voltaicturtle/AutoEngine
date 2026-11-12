@@ -3,7 +3,8 @@
 //   Pve     everyone fights the listed neutral board for rewards
 //   Draft   a shared pool of units is offered; lowest health picks first
 //   Choice  each player picks one of several augments or items
-//   Custom  a round type registered by the game's own code
+//   Custom  a round type from a script in scripts/ (the file name is the
+//           kind) or registered by the game's own code
 // When the list ends it loops from `repeat_from`, one stage higher each time,
 // so losses hurt more the longer the game goes on.
 (
@@ -37,5 +38,7 @@
         (name: "3-5", stage: 3, kind: Pvp),
         (name: "3-6", stage: 3, kind: Choice(options: 3, offer: Items)),
         (name: "3-7", stage: 3, kind: Pvp),
+        // A round type written as a script: see scripts/payday.rhai.
+        (name: "3-8", stage: 3, kind: Custom(kind: "payday", params: {"gold": 2})),
     ],
 )

@@ -380,7 +380,8 @@ fn players_without_health_are_eliminated_and_the_last_one_wins() {
     assert!(g.is_over());
     assert_eq!(g.winner(), Some(P0));
     assert_eq!(g.pool_count("ashen_hound"), pool, "an eliminated player's units go back to the pool");
-    assert!(matches!(g.events().last(), Some(GameEvent::GameOver { winner }) if *winner == P0));
+    // Scripts in the sample content may add their own events after it.
+    assert!(g.events().iter().any(|e| matches!(e, GameEvent::GameOver { winner } if *winner == P0)));
     assert_eq!(g.begin_round(), Err(CommandError::GameOver));
     assert_eq!(g.apply(P0, Command::Ready), Err(CommandError::GameOver));
 }

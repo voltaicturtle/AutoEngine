@@ -16,7 +16,7 @@
         description: "Cinder units attack faster.",
         breakpoints: [
             (count: 2, bonuses: [(mods: [(stat: AttackSpeed, permille: 200)])]),
-            (count: 4, bonuses: [(mods: [(stat: AttackSpeed, permille: 450)])]),
+            (count: 3, bonuses: [(mods: [(stat: AttackSpeed, permille: 450)])]),
         ],
     ),
     (

@@ -269,6 +269,18 @@ pub enum GameEvent {
     PlayerDamaged { player: PlayerId, amount: i64, health: i64 },
     PlayerEliminated { player: PlayerId, placement: u32 },
     GameOver { winner: PlayerId },
+    /// A line a script logged, or an error it ran into.
+    Script { script: String, message: String },
+}
+
+/// Code that reacts to what happens in a game.
+///
+/// Hooks are called with every [`GameEvent`], after the command or round
+/// step that produced it has finished, and may change the game in response;
+/// events they cause are delivered too. This is how scripts listen in, and
+/// games built on the engine can register their own with [`Game::add_hook`].
+pub trait GameHook: Send {
+    fn on_event(&mut self, game: &mut Game, event: &GameEvent);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -303,6 +315,9 @@ pub struct Game {
     events: Vec<GameEvent>,
     combats: Vec<CombatRecord>,
     next_uid: u32,
+    hooks: Vec<Box<dyn GameHook>>,
+    /// How many of `events` the hooks have been shown.
+    hooks_seen: usize,
 }
 
 impl Game {
@@ -341,7 +356,8 @@ impl Game {
                 ready: false,
             })
             .collect();
-        Game {
+        let scripts = content.scripts().clone();
+        let mut game = Game {
             content,
             rng: Rng::new(seed),
             players,
@@ -356,7 +372,47 @@ impl Game {
             events: Vec::new(),
             combats: Vec::new(),
             next_uid: 1,
+            hooks: Vec::new(),
+            hooks_seen: 0,
+        };
+        if !scripts.is_empty() {
+            // Content is checked when it is built, so this only fails for
+            // scripts that never went through that check.
+            match crate::script::ScriptHost::compile(&scripts) {
+                Ok(host) => Arc::new(host).install(&mut game),
+                Err(e) => game.emit(GameEvent::Script { script: e.script, message: format!("error: {}", e.message) }),
+            }
         }
+        game
+    }
+
+    /// Subscribes a hook to everything that happens from now on.
+    pub fn add_hook(&mut self, hook: Box<dyn GameHook>) {
+        self.hooks.push(hook);
+    }
+
+    /// Shows the hooks every event they have not seen yet, including the
+    /// ones they cause, up to a limit that stops hooks feeding each other
+    /// forever.
+    fn run_hooks(&mut self) {
+        if self.hooks.is_empty() {
+            self.hooks_seen = self.events.len();
+            return;
+        }
+        let mut hooks = std::mem::take(&mut self.hooks);
+        let mut budget = 10_000;
+        while self.hooks_seen < self.events.len() && budget > 0 {
+            let event = self.events[self.hooks_seen].clone();
+            self.hooks_seen += 1;
+            budget -= 1;
+            for hook in &mut hooks {
+                hook.on_event(self, &event);
+            }
+        }
+        self.hooks_seen = self.events.len();
+        // Hooks added while running come after the existing ones.
+        hooks.append(&mut self.hooks);
+        self.hooks = hooks;
     }
 
     /// Registers a custom round type under the name used by
@@ -432,6 +488,7 @@ impl Game {
     }
     /// Removes and returns the events recorded since the last call.
     pub fn drain_events(&mut self) -> Vec<GameEvent> {
+        self.hooks_seen = 0;
         std::mem::take(&mut self.events)
     }
     /// Fights of the most recent round.
@@ -444,6 +501,12 @@ impl Game {
     /// Starts the next round: pays income, refreshes shops and hands control
     /// to the round type named by the schedule.
     pub fn begin_round(&mut self) -> Result<(), CommandError> {
+        let result = self.begin_round_inner();
+        self.run_hooks();
+        result
+    }
+
+    fn begin_round_inner(&mut self) -> Result<(), CommandError> {
         match self.phase {
             Phase::Over => return Err(CommandError::GameOver),
             Phase::Planning => return Ok(()),
@@ -500,6 +563,12 @@ impl Game {
 
     /// Resolves the current round and eliminates players without health.
     pub fn finish_round(&mut self) -> Result<(), CommandError> {
+        let result = self.finish_round_inner();
+        self.run_hooks();
+        result
+    }
+
+    fn finish_round_inner(&mut self) -> Result<(), CommandError> {
         if self.phase != Phase::Planning {
             return Err(CommandError::NotPlanning);
         }
@@ -548,6 +617,12 @@ impl Game {
 
     /// Applies a player's command, or rejects it without changing anything.
     pub fn apply(&mut self, id: PlayerId, command: Command) -> Result<(), CommandError> {
+        let result = self.apply_inner(id, command);
+        self.run_hooks();
+        result
+    }
+
+    fn apply_inner(&mut self, id: PlayerId, command: Command) -> Result<(), CommandError> {
         if self.phase == Phase::Over {
             return Err(CommandError::GameOver);
         }

@@ -34,5 +34,7 @@ pub mod protocol;
 pub mod replay;
 pub mod rng;
 pub mod round;
+pub mod script;
 pub mod session;
 pub mod stats;
+pub mod tools;

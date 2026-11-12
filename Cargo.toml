@@ -2,6 +2,7 @@
 name = "AutoEngine"
 version = "0.1.0"
 edition = "2024"
+default-run = "autoengine"
 
 [workspace]
 members = [".", "client"]
@@ -21,4 +22,5 @@ path = "src/bin/server.rs"
 [dependencies]
 ron = "0.12.3"
 serde = { version = "1.0.229", features = ["derive", "rc"] }
+rhai = { version = "1.27", features = ["sync", "only_i64", "no_float"] }
 serde_json = "1.0.154"

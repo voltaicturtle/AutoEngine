@@ -480,9 +480,24 @@ pub struct ContentSet {
     augments: BTreeMap<String, AugmentDef>,
     schedule: Schedule,
     rules: GameRules,
+    /// Script sources by name (see the `script` module).
+    scripts: BTreeMap<String, String>,
 }
 
 impl ContentSet {
+    /// Adds scripts, given as name and source, after checking that they
+    /// compile. A script named `x` defines the round kind `x`.
+    pub fn with_scripts(mut self, scripts: BTreeMap<String, String>) -> Result<Self, ContentError> {
+        crate::script::ScriptHost::compile(&scripts)
+            .map_err(|e| ContentError::Parse { file: format!("scripts/{}.rhai", e.script), message: e.message })?;
+        self.scripts = scripts;
+        Ok(self)
+    }
+
+    pub fn scripts(&self) -> &BTreeMap<String, String> {
+        &self.scripts
+    }
+
     /// Builds and validates a content set from already-parsed definitions.
     pub fn new(
         units: Vec<UnitDef>,
@@ -497,6 +512,7 @@ impl ContentSet {
             augments: BTreeMap::new(),
             schedule: Schedule::default(),
             rules,
+            scripts: BTreeMap::new(),
         };
         set.validate()?;
         Ok(set)
@@ -549,6 +565,20 @@ impl ContentSet {
         }
         if let Some(text) = optional("rounds.ron")? {
             set = set.with_schedule(parse_ron("rounds.ron", &text)?)?;
+        }
+        let scripts_dir = dir.join("scripts");
+        if scripts_dir.is_dir() {
+            let io = |e: std::io::Error| ContentError::Io { path: scripts_dir.display().to_string(), message: e.to_string() };
+            let mut scripts = BTreeMap::new();
+            for entry in std::fs::read_dir(&scripts_dir).map_err(io)? {
+                let path = entry.map_err(io)?.path();
+                if path.extension().is_some_and(|e| e == "rhai")
+                    && let Some(name) = path.file_stem().and_then(|n| n.to_str())
+                {
+                    scripts.insert(name.to_string(), read(&path)?);
+                }
+            }
+            set = set.with_scripts(scripts)?;
         }
         Ok(set)
     }

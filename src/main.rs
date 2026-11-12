@@ -19,7 +19,9 @@ use autoengine::stats::Stat;
 
 const USAGE: &str = "usage: autoengine fight [seed] [--quiet] [--content DIR] [--match FILE]
        autoengine lobby [seed] [--players N] [--quiet] [--content DIR]
-       autoengine replay FILE...";
+       autoengine replay FILE...
+       autoengine check [DIR]
+       autoengine sim [--games N] [--players N] [--seed N] [--content DIR]";
 
 const BOT_NAMES: [&str; 8] = ["Aldra", "Brask", "Cyrene", "Dovik", "Elowen", "Fenn", "Garrick", "Hesper"];
 
@@ -31,6 +33,46 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Loads a content folder and reports errors and likely mistakes.
+fn check_content(dir: &str) -> Result<(), String> {
+    let content = ContentSet::load_dir(dir).map_err(|e| format!("error: {e}"))?;
+    println!(
+        "{dir}: {} units, {} traits, {} items, {} augments, {} rounds, {} scripts",
+        content.units().count(),
+        content.traits().count(),
+        content.items().count(),
+        content.augments().count(),
+        content.schedule().rounds.len(),
+        content.scripts().len()
+    );
+    let warnings = autoengine::tools::lint(&content, Some(std::path::Path::new(dir)));
+    for warning in &warnings {
+        println!("warning: {warning}");
+    }
+    println!("{}", if warnings.is_empty() { "no problems found".to_string() } else { format!("{} warnings", warnings.len()) });
+    Ok(())
+}
+
+/// Plays bot games and prints how units and traits did.
+fn run_sim(args: Vec<String>) -> Result<(), String> {
+    let (mut games, mut players, mut seed, mut dir) = (50u32, 8usize, 1u64, "content".to_string());
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let mut number = || args.next().and_then(|v| v.parse::<u64>().ok()).ok_or(USAGE.to_string());
+        match arg.as_str() {
+            "--games" => games = number()?.clamp(1, 100_000) as u32,
+            "--players" => players = number()?.clamp(2, 8) as usize,
+            "--seed" => seed = number()?,
+            "--content" => dir = args.next().ok_or(USAGE)?,
+            _ => return Err(USAGE.to_string()),
+        }
+    }
+    let content = std::sync::Arc::new(ContentSet::load_dir(&dir).map_err(|e| e.to_string())?);
+    let report = autoengine::tools::simulate(content.clone(), games, players, seed);
+    print!("{}", report.to_text(&content));
+    Ok(())
 }
 
 /// Re-runs saved fights and reports whether the engine still plays them
@@ -84,6 +126,14 @@ fn run() -> Result<(), String> {
         Some("replay") => {
             args.next();
             return check_replays(args.collect());
+        }
+        Some("check") => {
+            args.next();
+            return check_content(&args.next().unwrap_or_else(|| "content".to_string()));
+        }
+        Some("sim") => {
+            args.next();
+            return run_sim(args.collect());
         }
         _ => {}
     }
@@ -189,6 +239,7 @@ fn run_lobby(content: ContentSet, seed: u64, players: usize, quiet: bool) -> Res
                     format!("  {} is eliminated in place {placement}", name(&game, player))
                 }
                 GameEvent::GameOver { winner } => format!("\n{} wins the game", name(&game, winner)),
+                GameEvent::Script { script, message } => format!("  [{script}] {message}"),
                 _ => continue,
             };
             if !quiet {

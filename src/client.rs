@@ -134,6 +134,7 @@ impl ClientState {
                 format!("{} was eliminated in place {placement}", name(player))
             }
             GameEvent::GameOver { winner } => format!("{} wins the game", name(winner)),
+            GameEvent::Script { message, .. } => message.clone(),
             _ => return None,
         })
     }
