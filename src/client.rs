@@ -21,6 +21,8 @@ const LOG_LINES: usize = 50;
 pub struct ClientState {
     /// Our seat, or `None` while not joined or when spectating.
     pub seat: Option<PlayerId>,
+    /// Secret for taking our seat back after a disconnect.
+    pub token: Option<String>,
     pub welcomed: bool,
     pub content: Option<ContentSet>,
     pub lobby: Vec<Option<String>>,
@@ -42,8 +44,9 @@ impl ClientState {
     /// Folds one server message into the state.
     pub fn apply(&mut self, message: ServerMsg) {
         match message {
-            ServerMsg::Welcome { seat, content, .. } => {
+            ServerMsg::Welcome { seat, token, content, .. } => {
                 self.seat = seat;
+                self.token = token.or(self.token.take());
                 self.welcomed = true;
                 match content.into_content() {
                     Ok(content) => self.content = Some(content),

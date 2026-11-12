@@ -17,9 +17,14 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Client to server.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMsg {
-    /// Take a seat. Joining with the name of a seat whose player
-    /// disconnected takes that seat back.
-    Join { name: String, version: u32 },
+    /// Take a seat. To take back a seat after a disconnect, join with the
+    /// same name and the token from the earlier [`ServerMsg::Welcome`].
+    Join {
+        name: String,
+        version: u32,
+        #[serde(default)]
+        token: Option<String>,
+    },
     /// Watch without playing.
     Spectate { version: u32 },
     /// Start the game now; empty seats are filled with bots.
@@ -89,7 +94,8 @@ pub struct GameView {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerMsg {
     /// Sent once after joining or spectating.
-    Welcome { version: u32, seat: Option<PlayerId>, content: ContentInfo },
+    /// `token` proves ownership of the seat when reconnecting.
+    Welcome { version: u32, seat: Option<PlayerId>, token: Option<String>, content: Box<ContentInfo> },
     /// Who is seated. `None` is an open seat.
     Lobby { seats: Vec<Option<String>>, started: bool },
     State(GameView),

@@ -18,12 +18,16 @@ fn session(seats: usize) -> Session {
 }
 
 fn join(name: &str) -> ClientMsg {
-    ClientMsg::Join { name: name.into(), version: PROTOCOL_VERSION }
+    ClientMsg::Join { name: name.into(), version: PROTOCOL_VERSION, token: None }
 }
 
 /// Messages queued for one connection.
 fn inbox(s: &mut Session, conn: ConnId) -> Vec<ServerMsg> {
     s.drain_outbox().into_iter().filter(|(c, _)| *c == conn).map(|(_, m)| m).collect()
+}
+
+fn inbox_of(all: &[(ConnId, ServerMsg)], conn: ConnId) -> Vec<ServerMsg> {
+    all.iter().filter(|(c, _)| *c == conn).map(|(_, m)| m.clone()).collect()
 }
 
 fn last_state(messages: &[ServerMsg]) -> Option<&GameView> {
@@ -117,7 +121,7 @@ fn start_fills_empty_seats_with_bots_and_refuses_bad_requests() {
     let mut s = session(4);
     s.handle(9, ClientMsg::Start, 0);
     assert_eq!(errors(&inbox(&mut s, 9)), ["only seated players can start the game"]);
-    s.handle(9, ClientMsg::Join { name: "Old".into(), version: 0 }, 0);
+    s.handle(9, ClientMsg::Join { name: "Old".into(), version: 0, token: None }, 0);
     assert!(errors(&inbox(&mut s, 9))[0].contains("protocol version 0"));
     s.handle(9, join("   "), 0);
     assert_eq!(errors(&inbox(&mut s, 9)), ["a name is required"]);
@@ -192,6 +196,10 @@ fn a_disconnected_seat_is_played_by_a_bot_until_the_player_returns() {
     let mut s = session(2);
     s.handle(1, join("Ana"), 0);
     s.handle(2, join("Ben"), 0);
+    let ben_token = inbox_of(&s.drain_outbox(), 2)
+        .into_iter()
+        .find_map(|m| if let ServerMsg::Welcome { token, .. } = m { token } else { None })
+        .expect("seated players get a token");
     s.handle(1, ClientMsg::Command(Command::Ready), 0);
     assert_eq!(s.game().unwrap().round_index(), 0, "still waiting for Ben");
 
@@ -201,18 +209,21 @@ fn a_disconnected_seat_is_played_by_a_bot_until_the_player_returns() {
     s.tick(11);
     inbox(&mut s, 1);
 
-    // A stranger cannot take the seat, but can watch.
-    s.handle(3, join("Cy"), 20);
-    let msgs = inbox(&mut s, 3);
-    assert!(matches!(&msgs[0], ServerMsg::Welcome { seat: None, .. }));
-    assert_eq!(last_state(&msgs).unwrap().you, None);
+    // Knowing the name is not enough to take the seat; strangers just watch.
+    for (conn, token) in [(3, None), (5, Some("not-the-token".to_string()))] {
+        s.handle(conn, ClientMsg::Join { name: "Ben".into(), version: PROTOCOL_VERSION, token }, 20);
+        let msgs = inbox(&mut s, conn);
+        assert!(matches!(&msgs[0], ServerMsg::Welcome { seat: None, token: None, .. }));
+        assert_eq!(last_state(&msgs).unwrap().you, None);
+    }
     s.handle(3, ClientMsg::Command(Command::Reroll), 20);
     assert_eq!(errors(&inbox(&mut s, 3)), ["spectators cannot act"]);
+    assert!(s.seat_is_bot(1));
 
-    // Ben comes back under the same name and gets the seat and the state.
-    s.handle(4, join("Ben"), 30);
+    // Ben comes back with his token and gets the seat and the state.
+    s.handle(4, ClientMsg::Join { name: "Ben".into(), version: PROTOCOL_VERSION, token: Some(ben_token.clone()) }, 30);
     let msgs = inbox(&mut s, 4);
-    assert!(matches!(&msgs[0], ServerMsg::Welcome { seat: Some(PlayerId(1)), .. }));
+    assert!(matches!(&msgs[0], ServerMsg::Welcome { seat: Some(PlayerId(1)), token: Some(t), .. } if *t == ben_token));
     let view = last_state(&msgs).unwrap();
     assert_eq!(view.you, Some(PlayerId(1)));
     assert_eq!(view.players[1].shop.len(), 5);

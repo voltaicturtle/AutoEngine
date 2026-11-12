@@ -1,0 +1,10 @@
+[package]
+name = "autoengine-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+autoengine = { path = "..", package = "AutoEngine" }
+# OpenGL windowing, drawing and input. Audio is left out so the client
+# builds without extra system libraries.
+macroquad = { version = "0.4", default-features = false }

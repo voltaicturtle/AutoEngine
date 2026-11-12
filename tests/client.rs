@@ -23,7 +23,7 @@ fn play(rounds: usize) -> (Session, ClientState) {
             client.apply(decode::<ServerMsg>(&encode(&message)).unwrap());
         }
     };
-    session.handle(1, ClientMsg::Join { name: "Ana".into(), version: PROTOCOL_VERSION }, 0);
+    session.handle(1, ClientMsg::Join { name: "Ana".into(), version: PROTOCOL_VERSION, token: None }, 0);
     session.handle(1, ClientMsg::Start, 0);
     pump(&mut session, &mut client);
     for now in 1..=rounds as u64 {

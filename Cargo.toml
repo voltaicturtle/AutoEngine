@@ -3,6 +3,9 @@ name = "AutoEngine"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = [".", "client"]
+
 [lib]
 name = "autoengine"
 path = "src/lib.rs"

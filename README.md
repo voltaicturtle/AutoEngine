@@ -1,12 +1,16 @@
 # AutoEngine
 
 A Rust engine for building autochess games. The core is a headless,
-deterministic simulation library; a server runs it and GUI clients render the
-event stream it produces.
+deterministic simulation library. A headless server runs the game, and
+clients contain only graphics and input: they send the player's commands and
+draw what the server reports.
+
+![Planning phase in the client](docs/client-planning.png)
+![A fight being replayed in the client](docs/client-fight.png)
 
 ## Status
 
-Steps 1 to 3 of the roadmap are in place: the combat core, data-driven content, and the game loop.
+All five roadmap steps are in place: the combat core, data-driven content, the game loop, the server and graphical client, and play over the network.
 
 - `hex`: hex board (odd-r offset / axial coordinates), rings, lines, mirroring, deterministic pathfinding.
 - `rng`: seedable xoshiro256** generator with integer-only helpers.
@@ -18,7 +22,40 @@ Steps 1 to 3 of the roadmap are in place: the combat core, data-driven content, 
 - `round`: pluggable round types behind one trait. Built in: player fights (with ghost boards for odd lobbies), neutral fights with rewards, a shared draft in health order, and private choice rounds for augments or items. Games can register their own kinds.
 - `bot`: simple computer players that use the same commands as people.
 
-Still to come: the server binary and protocol, and the OpenGL client.
+- `protocol`: the client and server messages, sent as one line of JSON each.
+- `session`: a hosted game independent of any transport: seats, bots for empty or dropped seats, round timers, reconnecting with a seat token, spectators, and per-viewer filtering of private information.
+- `net`: the TCP transport for both ends, using only the standard library.
+- `client` and `playback`: the display-side model a client builds from server messages, with no rendering in it, so other front ends can reuse it.
+
+Two binaries sit on top: `autoengine-server` (headless) and, in the `client/`
+crate, `autoengine-client` (OpenGL, through macroquad). The core library has no
+graphics dependencies.
+
+## Play
+
+```
+cargo run --bin autoengine-server -- --seats 8          # terminal 1
+cargo run -p autoengine-client -- --name You            # terminal 2
+```
+
+Press "Start game" in the client; empty seats are filled with bots. More
+people can join first with their own `--name`, and `--spectate` watches
+instead. To play across machines, start the server with `--bind 0.0.0.0` and
+point clients at it with `--addr HOST:7777`.
+
+In the client: click shop cards to buy, drag units between the bench and your
+half of the board, drag a unit onto the shop to sell it, drag items onto
+units, click a name on the scoreboard to look at that player's board, and
+press Space to skip a fight replay. If the connection drops, the client keeps
+retrying and takes its seat back; a bot plays it in the meantime.
+
+Server options: `--port`, `--bind`, `--seats`, `--seed`, `--planning-secs`,
+`--content DIR`. `--autoplay` makes a client play by itself, which is handy
+for demos.
+
+Known limits: connections are plain TCP with no encryption or accounts, so
+host it only for people you trust; units are drawn as labelled tokens, with
+no art or sound yet.
 
 ## Game loop
 
@@ -50,7 +87,7 @@ Abilities, trait bonuses and item effects are all written with the same
 building blocks: an effect (damage, heal, shield, stun, stat change, summon,
 ...), a selector for who it hits, and for passives a trigger for when it fires.
 
-## Try it
+## Headless tools
 
 ```
 cargo run -- lobby 7              # eight bots play a whole game; prints every round

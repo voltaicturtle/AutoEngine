@@ -60,6 +60,8 @@ enum Role {
 struct Seat {
     name: Option<String>,
     conn: Option<ConnId>,
+    /// Secret handed to the seat's player, needed to reclaim it.
+    token: Option<String>,
 }
 
 /// One hosted game and everyone connected to it.
@@ -71,6 +73,8 @@ pub struct Session {
     game: Option<Game>,
     phase: Phase,
     bot_rng: Rng,
+    /// Source of seat tokens; seeded from the clock, never from the game seed.
+    token_rng: Rng,
     events_sent: usize,
     outbox: Vec<(ConnId, ServerMsg)>,
 }
@@ -85,6 +89,13 @@ impl Session {
             game: None,
             phase: Phase::Lobby,
             bot_rng: Rng::new(config.seed ^ 0xB075),
+            token_rng: Rng::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0)
+                    ^ (std::process::id() as u64) << 32,
+            ),
             events_sent: 0,
             outbox: Vec::new(),
             config,
@@ -128,7 +139,7 @@ impl Session {
     /// Handles a message from a connection.
     pub fn handle(&mut self, conn: ConnId, message: ClientMsg, now: u64) {
         match message {
-            ClientMsg::Join { name, version } => {
+            ClientMsg::Join { name, version, token } => {
                 if !self.check_version(conn, version) || self.conns.contains_key(&conn) {
                     return;
                 }
@@ -136,17 +147,23 @@ impl Session {
                 if name.is_empty() {
                     return self.send(conn, ServerMsg::Error { message: "a name is required".into() });
                 }
-                // A seat left by a player of this name, else an open seat
-                // (only before the game starts), else watch.
-                let returning =
-                    self.seats.iter().position(|s| s.conn.is_none() && s.name.as_deref() == Some(name.as_str()));
+                // The seat this player left (name and token must match),
+                // else an open seat (only before the game starts), else watch.
+                let returning = self.seats.iter().position(|s| {
+                    s.conn.is_none() && s.name.as_deref() == Some(name.as_str()) && s.token.is_some() && s.token == token
+                });
                 let open = if self.has_started() { None } else { self.seats.iter().position(|s| s.name.is_none()) };
-                let role = match returning.or(open) {
-                    Some(i) => {
-                        self.seats[i] = Seat { name: Some(name), conn: Some(conn) };
+                let role = match (returning, open) {
+                    (Some(i), _) => {
+                        self.seats[i].conn = Some(conn);
                         Role::Seat(i)
                     }
-                    None => Role::Spectator,
+                    (None, Some(i)) => {
+                        let token = format!("{:016x}{:016x}", self.token_rng.next_u64(), self.token_rng.next_u64());
+                        self.seats[i] = Seat { name: Some(name), conn: Some(conn), token: Some(token) };
+                        Role::Seat(i)
+                    }
+                    (None, None) => Role::Spectator,
                 };
                 self.welcome(conn, role, now);
                 if !self.has_started() && self.seats.iter().all(|s| s.conn.is_some()) {
@@ -241,8 +258,12 @@ impl Session {
             Role::Seat(i) => Some(PlayerId(i as u8)),
             Role::Spectator => None,
         };
-        let content = ContentInfo::from_content(&self.content);
-        self.send(conn, ServerMsg::Welcome { version: PROTOCOL_VERSION, seat, content });
+        let token = match role {
+            Role::Seat(i) => self.seats[i].token.clone(),
+            Role::Spectator => None,
+        };
+        let content = Box::new(ContentInfo::from_content(&self.content));
+        self.send(conn, ServerMsg::Welcome { version: PROTOCOL_VERSION, seat, token, content });
         self.send_lobby();
         if self.game.is_some() {
             let view = self.view(seat, now);
