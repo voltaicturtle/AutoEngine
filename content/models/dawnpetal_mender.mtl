@@ -1,0 +1,9 @@
+newmtl stem
+Kd 0.350 0.620 0.300
+
+newmtl petal
+Kd 0.980 0.720 0.800
+
+newmtl heart
+Kd 1.000 0.880 0.400
+

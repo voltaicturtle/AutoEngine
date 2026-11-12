@@ -3,6 +3,7 @@
 [
     (
         id: "ironbark_warden",
+        model: (file: "models/ironbark_warden.obj", scale_percent: 110),
         name: "Ironbark Warden",
         cost: 2,
         traits: ["grove", "bulwark"],
@@ -41,6 +42,7 @@
     ),
     (
         id: "emberlash_duelist",
+        model: (file: "models/emberlash_duelist.obj", scale_percent: 100),
         name: "Emberlash Duelist",
         cost: 3,
         traits: ["cinder"],
@@ -84,6 +86,7 @@
     ),
     (
         id: "tidewater_stormcaller",
+        model: (file: "models/tidewater_stormcaller.obj", scale_percent: 100),
         name: "Tidewater Stormcaller",
         cost: 2,
         traits: ["tide"],
@@ -111,6 +114,7 @@
     ),
     (
         id: "dawnpetal_mender",
+        model: (file: "models/dawnpetal_mender.obj", scale_percent: 100),
         name: "Dawnpetal Mender",
         cost: 1,
         traits: ["grove"],
@@ -135,6 +139,7 @@
     ),
     (
         id: "hollow_lantern_keeper",
+        model: (file: "models/hollow_lantern_keeper.obj", scale_percent: 100),
         name: "Hollow Lantern Keeper",
         cost: 2,
         traits: ["hollow", "bulwark"],
@@ -151,6 +156,7 @@
     ),
     (
         id: "ashen_hound",
+        model: (file: "models/ashen_hound.obj", scale_percent: 80),
         name: "Ashen Hound",
         cost: 1,
         traits: ["cinder", "hollow"],
@@ -181,6 +187,7 @@
     ),
     (
         id: "reed_stalker",
+        model: (file: "models/reed_stalker.obj", scale_percent: 100),
         name: "Reed Stalker",
         cost: 1,
         traits: ["tide", "grove"],
@@ -206,6 +213,7 @@
     ),
     (
         id: "grave_wisp",
+        model: (file: "models/grave_wisp.ply", scale_percent: 80),
         name: "Grave Wisp",
         in_shop: false,
         traits: ["hollow"],
@@ -213,6 +221,7 @@
     ),
     (
         id: "moss_golem",
+        model: (file: "models/moss_golem.obj", scale_percent: 125),
         name: "Moss Golem",
         in_shop: false,
         stats: { MaxHealth: 450, AttackDamage: 35, Armor: 10, MagicResist: 10, AttackSpeed: 550 },

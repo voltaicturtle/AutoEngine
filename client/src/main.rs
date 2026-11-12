@@ -4,18 +4,31 @@
 //! `autoengine-server`, draws what the server reports and sends the player's
 //! clicks back as commands. Rendering goes through OpenGL (via macroquad).
 //!
+//! The board is a 3D scene: units are models loaded through Assimp from
+//! the files the content names (see `model.rs`), with a stand-in figure for
+//! units that have none. The rest of the interface is drawn flat on top.
+//!
 //! Usage: `autoengine-client [--addr 127.0.0.1:7777] [--name NAME] [--spectate]
-//!         [--autoplay] [--no-ready] [--screenshot SECONDS:FILE]...`
+//!         [--assets DIR] [--autoplay] [--no-ready] [--screenshot SECONDS:FILE]...`
 //!
 //! Controls: drag units between the bench and your half of the board, drag a
 //! unit onto the shop to sell it, drag items onto units, click shop cards to
 //! buy. Click a name on the scoreboard to look at that player's board.
-//! Space skips a fight replay.
+//! Space skips a fight replay. Drag with the right mouse button to turn the
+//! camera, scroll to zoom, Home to reset it.
 
 mod draw;
+mod model;
+mod scene;
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::rc::Rc;
 
 use autoengine::client::ClientState;
-use autoengine::content::BoardUnit;
+use autoengine::combat::UnitId;
+use autoengine::content::{BoardUnit, UnitDef};
 use autoengine::game::{Command, Opponent, OwnedUnit, Player, PlayerId, Slot};
 use autoengine::hex::Hex;
 use autoengine::net::Connection;
@@ -23,7 +36,9 @@ use autoengine::playback::{Flash, Playback};
 use autoengine::protocol::{ClientMsg, PROTOCOL_VERSION, ViewPhase};
 use macroquad::prelude::*;
 
-use draw::{Layout, button, draw_unit_token, label, panel, text_centered, unit_color};
+use draw::{Layout, button, draw_health_bar, draw_pips, draw_unit_token, label, panel, text_centered, unit_color};
+use model::{Model, RawModel};
+use scene::Ground;
 
 const BG: Color = Color::new(0.07, 0.08, 0.11, 1.0);
 const PANEL: Color = Color::new(0.12, 0.14, 0.19, 1.0);
@@ -39,6 +54,8 @@ struct Options {
     addr: String,
     name: String,
     spectate: bool,
+    /// Folder that model files named by the content are looked up in.
+    assets: PathBuf,
     /// Play on its own: start the game, buy, place units and ready up.
     autoplay: bool,
     /// With `autoplay`, leave readying up to the round timer.
@@ -49,12 +66,13 @@ struct Options {
 }
 
 fn parse_options() -> Result<Options, String> {
-    let usage = "usage: autoengine-client [--addr HOST:PORT] [--name NAME] [--spectate] [--autoplay] \
+    let usage = "usage: autoengine-client [--addr HOST:PORT] [--name NAME] [--spectate] [--assets DIR] [--autoplay] \
                  [--no-ready] [--screenshot SECONDS:FILE]...";
     let mut o = Options {
         addr: "127.0.0.1:7777".into(),
         name: "Player".into(),
         spectate: false,
+        assets: PathBuf::from("content"),
         autoplay: false,
         no_ready: false,
         screenshots: Vec::new(),
@@ -67,6 +85,7 @@ fn parse_options() -> Result<Options, String> {
             "--addr" => o.addr = value()?,
             "--name" => o.name = value()?,
             "--spectate" => o.spectate = true,
+            "--assets" => o.assets = PathBuf::from(value()?),
             "--autoplay" => o.autoplay = true,
             "--no-ready" => o.no_ready = true,
             "--screenshot" => {
@@ -106,6 +125,65 @@ struct Show {
     time_ms: f32,
     title: String,
     done_for_ms: f32,
+    /// Which way each unit is turned, as a yaw angle.
+    facing: HashMap<UnitId, f32>,
+}
+
+/// Height of a unit at 100% scale, in hex radii.
+const UNIT_HEIGHT: f32 = 1.7;
+const FRIEND: Color = Color::new(0.35, 0.62, 0.98, 1.0);
+const ENEMY: Color = Color::new(0.92, 0.33, 0.33, 1.0);
+
+/// How to draw one kind of unit.
+#[derive(Clone)]
+struct Look {
+    model: Rc<Model>,
+    scale: f32,
+    yaw: f32,
+}
+
+impl Look {
+    fn height(&self) -> f32 {
+        self.model.height * self.scale
+    }
+}
+
+/// Models loaded so far. Each file is read once, the first time a unit
+/// that uses it comes on screen.
+struct Models {
+    assets: PathBuf,
+    files: HashMap<String, Option<Rc<Model>>>,
+    figures: HashMap<String, Rc<Model>>,
+}
+
+impl Models {
+    fn look(&mut self, def: Option<&UnitDef>, name: &str) -> Look {
+        let wanted = def.and_then(|d| d.model.as_ref());
+        let loaded = wanted.and_then(|m| {
+            let assets = &self.assets;
+            self.files
+                .entry(m.file.clone())
+                .or_insert_with(|| match model::load_geometry(&assets.join(&m.file)) {
+                    Ok(raw) => Some(Rc::new(Model::upload(raw))),
+                    Err(e) => {
+                        eprintln!("model {e}; drawing a stand-in");
+                        None
+                    }
+                })
+                .clone()
+        });
+        let model = loaded.unwrap_or_else(|| {
+            self.figures
+                .entry(name.to_string())
+                .or_insert_with(|| Rc::new(Model::upload(RawModel::figure(unit_color(name)))))
+                .clone()
+        });
+        Look {
+            model,
+            scale: UNIT_HEIGHT * wanted.map_or(100, |m| m.scale_percent) as f32 / 100.0,
+            yaw: (wanted.map_or(0, |m| m.yaw_degrees) as f32).to_radians(),
+        }
+    }
 }
 
 struct App {
@@ -123,6 +201,11 @@ struct App {
     last_reconnect_at: f64,
     /// Time left in the current phase as last reported, and when that was.
     countdown: (u64, f64),
+    models: RefCell<Models>,
+    /// Camera angle around the board, and distance as a multiple of the
+    /// distance that just fits the board.
+    camera_yaw: f32,
+    camera_zoom: f32,
 }
 
 impl App {
@@ -158,6 +241,19 @@ impl App {
                 self.connect_error = Some(format!("cannot reach the server at {}: {e}", self.options.addr));
             }
         }
+    }
+
+    /// The look of a unit given its content id.
+    fn look_of(&self, unit_id: &str) -> Look {
+        let def = self.state.content.as_ref().and_then(|c| c.unit(unit_id));
+        let name = def.map_or(unit_id, |d| d.name.as_str());
+        self.models.borrow_mut().look(def, name)
+    }
+
+    /// The look of a unit given the name fights report it under.
+    fn look_of_name(&self, name: &str) -> Look {
+        let def = self.state.content.as_ref().and_then(|c| c.units().find(|u| u.name == name));
+        self.models.borrow_mut().look(def, name)
     }
 
     fn command(&mut self, command: Command) {
@@ -227,7 +323,7 @@ impl App {
                 Opponent::Neutral => "the neutral camp".to_string(),
             };
             let title = format!("{} vs {}", self.state.player_name(record.home), away);
-            self.show = Some(Show { playback: Playback::new(&record), flipped, time_ms: 0.0, title, done_for_ms: 0.0 });
+            self.show = Some(Show { playback: Playback::new(&record), flipped, time_ms: 0.0, title, done_for_ms: 0.0, facing: HashMap::new() });
         }
     }
 
@@ -332,9 +428,14 @@ async fn main() {
         error_shown_at: 0.0,
         last_reconnect_at: 0.0,
         countdown: (0, 0.0),
+        models: RefCell::new(Models { assets: options.assets.clone(), files: HashMap::new(), figures: HashMap::new() }),
+        camera_yaw: 0.0,
+        camera_zoom: 1.0,
         options,
     };
     app.connect();
+    // Room for a whole model part in one draw call.
+    macroquad::window::gl_set_drawcall_buffer_capacity(model::MAX_PART_VERTICES + 16, model::MAX_PART_INDICES + 16);
 
     let mut shots = std::mem::take(&mut app.options.screenshots);
     shots.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -346,6 +447,18 @@ async fn main() {
             app.autoplay();
         }
         clear_background(BG);
+        // Camera: right-drag turns it, the wheel zooms, Home resets.
+        let turn = mouse_delta_position();
+        if is_mouse_button_down(MouseButton::Right) {
+            app.camera_yaw += turn.x * 2.5;
+        }
+        let wheel = mouse_wheel().1;
+        if wheel != 0.0 {
+            app.camera_zoom = (app.camera_zoom - wheel.signum() * 0.08).clamp(0.55, 1.8);
+        }
+        if is_key_pressed(KeyCode::Home) {
+            (app.camera_yaw, app.camera_zoom) = (0.0, 1.0);
+        }
         let layout = Layout::new(&app);
         if app.state.view.is_none() {
             draw_lobby(&mut app);
@@ -553,14 +666,20 @@ fn draw_scoreboard(app: &mut App, layout: &Layout) {
 }
 
 /// The hex grid itself. `own_half` highlights the rows a player may use.
-fn draw_board(layout: &Layout, own_half: bool) {
+/// Queues the board's tiles. `own_half` tints the near half, where the
+/// viewer may place units; `highlight` marks the hex under a dragged unit.
+fn board_tiles(ground: &mut Ground, layout: &Layout, own_half: bool, highlight: Option<(i32, i32)>) {
     for row in 0..layout.rows {
         for col in 0..layout.cols {
-            let c = layout.hex_center(col, row);
-            let mine = row >= layout.rows / 2;
-            let fill = if own_half && mine { Color::new(0.17, 0.22, 0.30, 1.0) } else { Color::new(0.13, 0.15, 0.20, 1.0) };
-            draw_poly(c.x, c.y, 6, layout.hex - 1.5, 30.0, fill);
-            draw_poly_lines(c.x, c.y, 6, layout.hex - 1.5, 30.0, 1.5, Color::new(0.26, 0.30, 0.40, 1.0));
+            let mine = own_half && row >= layout.rows / 2;
+            let mut fill = if mine { Color::new(0.24, 0.31, 0.43, 1.0) } else { Color::new(0.19, 0.22, 0.29, 1.0) };
+            if (col + row) % 2 == 0 {
+                fill = Color::new(fill.r * 0.93, fill.g * 0.93, fill.b * 0.93, 1.0);
+            }
+            if highlight == Some((col, row)) {
+                fill = Color::new(0.45, 0.62, 0.85, 1.0);
+            }
+            ground.hex_tile(layout.hex_world(col, row), 0.94, 0.22, fill);
         }
     }
 }
@@ -569,54 +688,84 @@ fn unit_label(app: &App, unit: &OwnedUnit) -> String {
     app.state.display_name(&unit.unit)
 }
 
+/// Stars make a unit a little bigger.
+fn star_scale(star: u8) -> f32 {
+    1.0 + 0.14 * star.saturating_sub(1) as f32
+}
+
+const RING_LIFT: Vec3 = Vec3::new(0.0, 0.03, 0.0);
+
 fn draw_planning(app: &mut App, layout: &Layout) {
     let Some(player) = app.shown_player().cloned() else { return };
     let own = app.viewing_self() && player.alive;
     let (mx, my) = mouse_position();
     let mouse = vec2(mx, my);
-    draw_board(layout, true);
-    if !own {
-        text_centered(&format!("{}'s board", player.name), layout.board_mid_x, layout.board_top - 6.0, 20.0, MUTED);
-    }
-
+    let view = &layout.view;
     let dragged = app.drag;
-    let mut hovered: Option<OwnedUnit> = None;
-    let mut pressed_unit = None;
+    let dragged_unit = match dragged {
+        Some(Drag::Unit(uid)) => Some(uid),
+        _ => None,
+    };
 
-    // Units on the board.
+    // Everyone standing somewhere: the unit, where, and which way it faces.
+    let mut standing: Vec<(&OwnedUnit, Vec3, f32)> = Vec::new();
     for (pos, unit) in &player.board {
-        let c = layout.hex_center(pos.0, pos.1);
-        if dragged == Some(Drag::Unit(unit.uid)) {
-            continue;
+        standing.push((unit, layout.hex_world(pos.0, pos.1), std::f32::consts::PI));
+    }
+    for (i, slot) in player.bench.iter().enumerate().take(layout.bench_slots) {
+        if let Some(unit) = slot {
+            standing.push((unit, layout.bench_world(i), 0.0));
         }
-        draw_unit_token(c, layout.hex * 0.62, &unit_label(app, unit), unit.star, unit.items.len(), true, None);
-        if mouse.distance(c) < layout.hex * 0.7 {
-            hovered = Some(unit.clone());
-            if is_mouse_button_pressed(MouseButton::Left) {
-                pressed_unit = Some(unit.uid);
-            }
-        }
+    }
+    standing.retain(|(unit, _, _)| dragged_unit != Some(unit.uid));
+
+    // The 3D scene.
+    view.begin();
+    let mut ground = Ground::default();
+    let drop_hex = dragged_unit.and_then(|_| layout.hex_at(mouse)).filter(|(_, row)| *row >= layout.rows / 2);
+    board_tiles(&mut ground, layout, true, drop_hex);
+    let drop_bench = dragged_unit.and_then(|_| layout.bench_at(mouse));
+    for i in 0..layout.bench_slots {
+        let fill = if drop_bench == Some(i) { Color::new(0.45, 0.62, 0.85, 1.0) } else { Color::new(0.16, 0.18, 0.24, 1.0) };
+        ground.hex_tile(layout.bench_world(i), 0.72, 0.14, fill);
+    }
+    for (_, at, _) in &standing {
+        ground.ring(*at + RING_LIFT, 0.50, 0.62, FRIEND);
+    }
+    ground.draw();
+    for (unit, at, yaw) in &standing {
+        let look = app.look_of(&unit.unit);
+        look.model.draw(*at, yaw + look.yaw, look.scale * star_scale(unit.star), [1.0; 3], 0.0);
+    }
+    let held = dragged_unit.and_then(|uid| player.unit(uid)).zip(view.ground_at(mouse));
+    if let Some((unit, at)) = held {
+        let look = app.look_of(&unit.unit);
+        look.model.draw(at + vec3(0.0, 0.45, 0.0), std::f32::consts::PI + look.yaw, look.scale * star_scale(unit.star), [1.0; 3], 0.12);
+    }
+    view.end();
+
+    if !own {
+        text_centered(&format!("{}'s board", player.name), layout.board_mid_x, view.area.y + 22.0, 20.0, MUTED);
     }
 
-    // Bench.
-    for i in 0..layout.bench_slots {
-        let r = layout.bench_slot(i);
-        panel(r.x, r.y, r.w, r.h, PANEL);
-        if let Some(Some(unit)) = player.bench.get(i) {
-            if dragged == Some(Drag::Unit(unit.uid)) {
-                continue;
-            }
-            let c = r.center();
-            draw_unit_token(c, r.w * 0.40, &unit_label(app, unit), unit.star, unit.items.len(), true, None);
-            if r.contains(mouse) {
-                hovered = Some(unit.clone());
-                if is_mouse_button_pressed(MouseButton::Left) {
-                    pressed_unit = Some(unit.uid);
-                }
-            }
+    // Flat markers on top of the scene, and what the mouse is over.
+    let mut hovered: Option<(f32, OwnedUnit)> = None;
+    for (unit, at, _) in &standing {
+        let size = view.pixels_per_unit(*at);
+        draw_pips(view.project(*at) + vec2(0.0, size * 0.42), unit.star, unit.items.len());
+        let height = app.look_of(&unit.unit).height() * star_scale(unit.star);
+        let body = view.project(*at + vec3(0.0, height * 0.5, 0.0));
+        let reach = (mouse - body) / vec2(size * 0.55, size * height * 0.5);
+        if reach.length() < 1.0 && hovered.as_ref().is_none_or(|(best, _)| reach.length() < *best) {
+            hovered = Some((reach.length(), (*unit).clone()));
         }
     }
-    label("Bench", layout.bench_slot(0).x - 62.0, layout.bench_slot(0).y + 34.0, 18.0, MUTED);
+    let hovered = hovered.map(|(_, unit)| unit);
+    let pressed_unit = hovered.as_ref().filter(|_| is_mouse_button_pressed(MouseButton::Left)).map(|u| u.uid);
+    if layout.bench_slots > 0 {
+        let first = view.project(layout.bench_world(0) + vec3(-1.0, 0.0, 0.0));
+        label("Bench", (first.x - 50.0).max(layout.left_w + 6.0), first.y + 5.0, 18.0, MUTED);
+    }
 
     // Item inventory.
     let mut pressed_item = None;
@@ -647,8 +796,11 @@ fn draw_planning(app: &mut App, layout: &Layout) {
     // Whatever is being dragged follows the mouse.
     match app.drag {
         Some(Drag::Unit(uid)) => {
-            if let Some(unit) = player.unit(uid) {
-                draw_unit_token(mouse, layout.hex * 0.62, &unit_label(app, unit), unit.star, unit.items.len(), true, None);
+            // Over the scene the model itself is in hand; elsewhere a token.
+            if let Some(unit) = player.unit(uid)
+                && view.ground_at(mouse).is_none()
+            {
+                draw_unit_token(mouse, 26.0, &unit_label(app, unit), unit.star, unit.items.len(), true, None);
             }
         }
         Some(Drag::Item(i)) => {
@@ -748,7 +900,7 @@ fn handle_drop(app: &mut App, layout: &Layout, player: &Player, mouse: Vec2) {
     }
     let Some(drag) = app.drag.take() else { return };
     let over_hex = layout.hex_at(mouse);
-    let over_bench = (0..layout.bench_slots).find(|i| layout.bench_slot(*i).contains(mouse));
+    let over_bench = layout.bench_at(mouse);
     match drag {
         Drag::Unit(uid) => {
             if let Some((col, row)) = over_hex {
@@ -797,7 +949,7 @@ fn draw_choice(app: &mut App, layout: &Layout) {
     let rows = (n / per_row).ceil();
     let total_w = per_row * cw + (per_row - 1.0) * gap;
     let x0 = layout.board_mid_x - total_w / 2.0;
-    let y0 = layout.board_top + 40.0;
+    let y0 = layout.view.area.y + 70.0;
     draw_rectangle(x0 - 16.0, y0 - 44.0, total_w + 32.0, rows * (ch + gap) + 56.0, Color::new(0.04, 0.05, 0.07, 0.94));
     text_centered(&title, layout.board_mid_x, y0 - 14.0, 24.0, if my_turn { GOLD_COLOR } else { MUTED });
     let (mx, my) = mouse_position();
@@ -836,32 +988,110 @@ fn draw_choice(app: &mut App, layout: &Layout) {
 }
 
 fn draw_replay(app: &mut App, layout: &Layout) {
-    let Some(show) = &app.show else { return };
-    draw_board(layout, false);
-    text_centered(&show.title, layout.board_mid_x, layout.board_top - 6.0, 22.0, TEXT);
+    let Some(mut show) = app.show.take() else { return };
+    let view = &layout.view;
     let now = show.playback.time_ms();
     let my_team = if show.flipped { 1 } else { 0 };
+    let flipped = show.flipped;
     let place = |q: f32, r: f32| {
-        let p = layout.axial_center(q, r);
-        if show.flipped { layout.flip(p) } else { p }
+        let p = layout.axial_world(q, r);
+        if flipped { layout.flip(p) } else { p }
     };
-    let pos_of = |id| {
-        show.playback.unit(id).map(|u| {
+    let world_of = |playback: &Playback, id| {
+        playback.unit(id).map(|u| {
             let (q, r) = u.position_at(now);
             place(q, r)
         })
     };
+    let yaw_towards = |from: Vec3, to: Vec3| {
+        let d = to - from;
+        (d.x.abs() + d.z.abs() > 1e-3).then(|| d.x.atan2(d.z))
+    };
 
+    // Which way everyone faces: where they walk, then whom they hit.
+    for u in show.playback.units().filter(|u| u.alive) {
+        let ahead = if u.team.0 == my_team { std::f32::consts::PI } else { 0.0 };
+        let facing = show.facing.entry(u.id).or_insert(ahead);
+        if u.pos != u.prev_pos
+            && now.saturating_sub(u.moved_at_ms) < autoengine::playback::MOVE_ANIMATION_MS
+            && let Some(yaw) = yaw_towards(place(u.prev_pos.q as f32, u.prev_pos.r as f32), place(u.pos.q as f32, u.pos.r as f32))
+        {
+            *facing = yaw;
+        }
+    }
+    // Attacks: turn to the target and lunge at it; hits flash white.
+    let mut lunge: HashMap<UnitId, Vec3> = HashMap::new();
+    let mut hit: HashMap<UnitId, f32> = HashMap::new();
+    for (age, flash) in show.playback.recent_flashes(400) {
+        match flash {
+            Flash::Attack { source, target } => {
+                if let (Some(a), Some(b)) = (world_of(&show.playback, *source), world_of(&show.playback, *target))
+                    && let Some(yaw) = yaw_towards(a, b)
+                {
+                    show.facing.insert(*source, yaw);
+                    if age < 180 {
+                        let reach = (std::f32::consts::PI * age as f32 / 180.0).sin() * 0.35;
+                        lunge.insert(*source, (b - a).normalize_or_zero() * reach);
+                    }
+                }
+            }
+            Flash::Damage { target, amount, .. } if age < 140 && *amount > 0 => {
+                let strength = 0.55 * (1.0 - age as f32 / 140.0);
+                let entry = hit.entry(*target).or_insert(0.0);
+                *entry = entry.max(strength);
+            }
+            _ => {}
+        }
+    }
+
+    // The 3D scene.
+    view.begin();
+    let mut ground = Ground::default();
+    board_tiles(&mut ground, layout, false, None);
     for u in show.playback.units().filter(|u| u.alive) {
         let (q, r) = u.position_at(now);
-        let c = place(q, r);
-        let health = (u.health as f32 / u.max_health.max(1) as f32, u.shield as f32 / u.max_health.max(1) as f32);
-        draw_unit_token(c, layout.hex * 0.60, &u.name, 0, 0, u.team.0 == my_team, Some(health));
+        let at = place(q, r) + RING_LIFT;
+        ground.ring(at, 0.50, 0.62, if u.team.0 == my_team { FRIEND } else { ENEMY });
         if u.casting {
-            draw_circle_lines(c.x, c.y, layout.hex * 0.72, 3.0, ACCENT);
+            let pulse = 0.72 + 0.06 * (now as f32 / 90.0).sin();
+            ground.ring(at, pulse, pulse + 0.10, ACCENT);
         }
+    }
+    for (age, flash) in show.playback.recent_flashes(450) {
+        if let Flash::Cast { unit } = flash
+            && let Some(at) = world_of(&show.playback, *unit)
+        {
+            let t = age as f32 / 450.0;
+            let radius = 0.7 + t * 1.3;
+            ground.ring(at + RING_LIFT * 2.0, radius, radius + 0.14 * (1.0 - t), Color::new(0.45, 0.72, 1.0, 1.0));
+        }
+    }
+    ground.draw();
+    for u in show.playback.units().filter(|u| u.alive) {
+        let (q, r) = u.position_at(now);
+        let at = place(q, r) + lunge.get(&u.id).copied().unwrap_or(Vec3::ZERO);
+        let look = app.look_of_name(&u.name);
+        let yaw = show.facing.get(&u.id).copied().unwrap_or(0.0);
+        let stunned = u.stunned_until_ms > now;
+        let tint = if stunned { [0.62, 0.62, 0.70] } else { [1.0; 3] };
+        look.model.draw(at, yaw + look.yaw, look.scale, tint, hit.get(&u.id).copied().unwrap_or(0.0));
+    }
+    view.end();
+
+    // Flat markers on top: health, numbers, lines.
+    text_centered(&show.title, layout.board_mid_x, view.area.y + 24.0, 22.0, TEXT);
+    let head_of = |playback: &Playback, id| {
+        playback.unit(id).zip(world_of(playback, id)).map(|(u, at)| {
+            let height = app.look_of_name(&u.name).height();
+            (view.project(at + vec3(0.0, height + 0.25, 0.0)), view.project(at + vec3(0.0, height * 0.55, 0.0)), view.pixels_per_unit(at))
+        })
+    };
+    for u in show.playback.units().filter(|u| u.alive) {
+        let Some((head, _, size)) = head_of(&show.playback, u.id) else { continue };
+        let full = u.max_health.max(1) as f32;
+        draw_health_bar(head, (size * 1.1).clamp(28.0, 70.0), u.health as f32 / full, u.shield as f32 / full, u.team.0 == my_team);
         if u.stunned_until_ms > now {
-            text_centered("stun", c.x, c.y - layout.hex * 0.95, 14.0, GOLD_COLOR);
+            text_centered("stun", head.x, head.y - 8.0, 14.0, GOLD_COLOR);
         }
     }
 
@@ -869,13 +1099,13 @@ fn draw_replay(app: &mut App, layout: &Layout) {
         let age = age as f32;
         match flash {
             Flash::Attack { source, target } if age < 160.0 => {
-                if let (Some(a), Some(b)) = (pos_of(*source), pos_of(*target)) {
+                if let (Some((_, a, _)), Some((_, b, _))) = (head_of(&show.playback, *source), head_of(&show.playback, *target)) {
                     let alpha = 1.0 - age / 160.0;
-                    draw_line(a.x, a.y, b.x, b.y, 2.5, Color::new(1.0, 1.0, 1.0, alpha * 0.8));
+                    draw_line(a.x, a.y, b.x, b.y, 2.0, Color::new(1.0, 1.0, 1.0, alpha * 0.6));
                 }
             }
             Flash::Damage { target, amount, absorbed, kind, crit } => {
-                if let Some(p) = pos_of(*target) {
+                if let Some((p, _, _)) = head_of(&show.playback, *target) {
                     let alpha = (1.0 - age / 900.0).max(0.0);
                     let mut color = match kind {
                         autoengine::effect::DamageKind::Physical => Color::new(1.0, 0.55, 0.30, alpha),
@@ -889,25 +1119,20 @@ fn draw_replay(app: &mut App, layout: &Layout) {
                     // Spread numbers out a little so simultaneous hits stay readable.
                     let jitter = ((shown * 37) % 56) as f32 - 28.0;
                     let size = if *crit { 24.0 } else { 17.0 };
-                    text_centered(&shown.to_string(), p.x + jitter, p.y - layout.hex * 0.9 - age * 0.03, size, color);
+                    text_centered(&shown.to_string(), p.x + jitter, p.y - 12.0 - age * 0.03, size, color);
                 }
             }
             Flash::Heal { target, amount } => {
-                if let Some(p) = pos_of(*target) {
+                if let Some((_, p, _)) = head_of(&show.playback, *target) {
                     let alpha = (1.0 - age / 900.0).max(0.0);
-                    text_centered(&format!("+{amount}"), p.x, p.y + layout.hex * 0.2 - age * 0.03, 17.0, Color::new(0.4, 1.0, 0.5, alpha));
-                }
-            }
-            Flash::Cast { unit } if age < 450.0 => {
-                if let Some(p) = pos_of(*unit) {
-                    let t = age / 450.0;
-                    draw_circle_lines(p.x, p.y, layout.hex * (0.7 + t * 1.2), 3.0, Color::new(0.35, 0.62, 0.98, 1.0 - t));
+                    text_centered(&format!("+{amount}"), p.x, p.y - age * 0.03, 17.0, Color::new(0.4, 1.0, 0.5, alpha));
                 }
             }
             Flash::Death { unit } if age < 500.0 => {
-                if let Some(p) = pos_of(*unit) {
+                if let Some(at) = world_of(&show.playback, *unit) {
+                    let p = view.project(at + vec3(0.0, 0.4, 0.0));
                     let alpha = 1.0 - age / 500.0;
-                    let s = layout.hex * 0.4;
+                    let s = view.pixels_per_unit(at) * 0.4;
                     let c = Color::new(0.9, 0.3, 0.3, alpha);
                     draw_line(p.x - s, p.y - s, p.x + s, p.y + s, 4.0, c);
                     draw_line(p.x - s, p.y + s, p.x + s, p.y - s, 4.0, c);
@@ -918,7 +1143,7 @@ fn draw_replay(app: &mut App, layout: &Layout) {
     }
 
     let secs = (now as f32 / 1000.0).min(show.playback.duration_ms() as f32 / 1000.0);
-    let footer_y = layout.bench_slot(0).y + 30.0;
+    let footer_y = layout.scene_bottom() - 14.0;
     if show.playback.is_finished() {
         let result = match show.playback.winner() {
             Some(team) if app.state.seat.is_none() => format!("Team {} wins", team.0 + 1),
@@ -930,6 +1155,7 @@ fn draw_replay(app: &mut App, layout: &Layout) {
     } else {
         text_centered(&format!("{secs:.1}s   (Space to skip)"), layout.board_mid_x, footer_y, 18.0, MUTED);
     }
+    app.show = Some(show);
 }
 
 fn draw_game_over(app: &App) {

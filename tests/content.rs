@@ -259,3 +259,18 @@ fn summons_and_trait_passives_work_from_data() {
     assert_eq!(wisps, 2, "the keeper's death summons two wisps from the content set");
     assert!(combat.units().iter().filter(|u| u.name() == "Grave Wisp").all(|u| u.team().0 == 0));
 }
+
+#[test]
+fn sample_units_name_model_files_that_exist() {
+    let content = sample();
+    let mut with_model = 0;
+    for unit in content.units() {
+        if let Some(model) = &unit.model {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("content").join(&model.file);
+            assert!(path.is_file(), "{} names a missing model: {}", unit.id, model.file);
+            assert!(model.scale_percent > 0);
+            with_model += 1;
+        }
+    }
+    assert!(with_model > 0);
+}

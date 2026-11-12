@@ -1,0 +1,7 @@
+newmtl moss
+Kd 1.000 1.000 1.000
+map_Kd moss_golem.png
+
+newmtl eye
+Kd 0.950 0.850 0.350
+

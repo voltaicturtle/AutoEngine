@@ -28,8 +28,8 @@ All five roadmap steps are in place: the combat core, data-driven content, the g
 - `client` and `playback`: the display-side model a client builds from server messages, with no rendering in it, so other front ends can reuse it.
 
 Two binaries sit on top: `autoengine-server` (headless) and, in the `client/`
-crate, `autoengine-client` (OpenGL, through macroquad). The core library has no
-graphics dependencies.
+crate, `autoengine-client` (3D, on OpenGL through macroquad, with models
+loaded through Assimp). The core library has no graphics dependencies.
 
 ## Play
 
@@ -46,16 +46,46 @@ point clients at it with `--addr HOST:7777`.
 In the client: click shop cards to buy, drag units between the bench and your
 half of the board, drag a unit onto the shop to sell it, drag items onto
 units, click a name on the scoreboard to look at that player's board, and
-press Space to skip a fight replay. If the connection drops, the client keeps
+press Space to skip a fight replay. Drag with the right mouse button to turn
+the camera, scroll to zoom, and press Home to reset it. If the connection drops, the client keeps
 retrying and takes its seat back; a bot plays it in the meantime.
 
 Server options: `--port`, `--bind`, `--seats`, `--seed`, `--planning-secs`,
 `--content DIR`. `--autoplay` makes a client play by itself, which is handy
 for demos.
 
+### 3D models
+
+The board is a 3D scene and every unit is a model. A unit names its model in
+`units.ron`:
+
+```ron
+model: (file: "models/ironbark_warden.obj", scale_percent: 110, yaw_degrees: 0),
+```
+
+The file is looked up in the client's assets folder (`--assets DIR`, default
+`content`) and read with [Assimp](https://www.assimp.org/) through the
+`russimp` crate, so OBJ, glTF, FBX, PLY, Collada and the other formats Assimp
+imports all work. The client uses the material's diffuse or base colour,
+vertex colours, and a diffuse texture, either embedded or in a file next to
+the model. Models are scaled to a standard height, centred and stood on the
+ground, and should face +Z (use `yaw_degrees` for files that do not). A unit
+with no model, or whose file cannot be read, gets a plain stand-in figure.
+
+The models in `content/models` are simple original placeholders made by
+`tools/make_sample_models.py`; they cover OBJ with materials, OBJ with a
+texture, and PLY with vertex colours.
+
+The first build downloads a ready-made Assimp library. `cargo run` finds it
+without help. To run the executable directly, copy `libassimp` from
+`target/<profile>/build/russimp-sys-*/out/dylib/lib` next to it, or install
+Assimp and remove the `prebuilt` feature in `client/Cargo.toml`.
+
 Known limits: connections are plain TCP with no encryption or accounts, so
-host it only for people you trust; units are drawn as labelled tokens, with
-no art or sound yet.
+host it only for people you trust. Models are static: skeletal animation in a
+file is not played, and movement, attacks and hits are shown by moving,
+turning and flashing the whole model. Lighting is a single fixed light worked
+out per vertex. There is no sound yet.
 
 ## Game loop
 
@@ -75,7 +105,8 @@ original sample set:
 
 | File | Contents |
 | --- | --- |
-| `units.ron` | Units: cost, traits, stats, ability, passives |
+| `units.ron` | Units: cost, traits, stats, ability, passives, 3D model |
+| `models/` | The model files the units name |
 | `traits.ron` | Traits and the bonuses each breakpoint grants |
 | `items.ron` | Items: stat bonuses, passives, granted traits, recipes |
 | `rules.ron` | Board size, item limit, star-level bonuses (economy, levels and shop odds use engine defaults unless set here) |

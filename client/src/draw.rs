@@ -3,24 +3,30 @@
 use autoengine::hex::Hex;
 use macroquad::prelude::*;
 
+use crate::scene::{SQRT3, View};
 use crate::{App, BG, GOOD, MUTED, PANEL_LIGHT, TEXT};
 
-const SQRT3: f32 = 1.732_050_8;
-
 /// Where everything goes for the current window size.
+///
+/// The board and bench live in the 3D scene; the methods here translate
+/// between board coordinates, world space and the window. The shop and the
+/// rest of the interface are flat and laid out around the 3D picture.
 pub struct Layout {
     pub left_w: f32,
     pub right_w: f32,
     pub cols: i32,
     pub rows: i32,
-    /// Hex radius (center to corner).
-    pub hex: f32,
-    pub board_top: f32,
     pub board_mid_x: f32,
-    board_left: f32,
+    pub view: View,
+    /// World position of the middle of hex (0, 0) before centring.
+    origin: Vec3,
     pub bench_slots: usize,
     shop_slots: usize,
 }
+
+/// Height of the units' feet above the plane the tiles are drawn around.
+pub const TILE_TOP: f32 = 0.0;
+const BENCH_SPACING: f32 = 1.55;
 
 impl Layout {
     pub fn new(app: &App) -> Self {
@@ -28,56 +34,81 @@ impl Layout {
         let (cols, rows) = (rules.board_cols as i32, rules.board_rows as i32);
         let (left_w, right_w) = (210.0, 300.0);
         let (w, h) = (screen_width(), screen_height());
-        let center_w = w - left_w - right_w;
-        // Fit the board into the space above the bench and shop.
-        let room_h = h - 44.0 - 30.0 - 250.0;
-        let by_height = room_h / (1.5 * (rows - 1) as f32 + 2.0);
-        let by_width = (center_w - 140.0) / (SQRT3 * (cols as f32 + 0.5));
-        let hex = by_height.min(by_width).clamp(12.0, 60.0);
-        let board_w = SQRT3 * hex * (cols as f32 + 0.5);
-        let board_mid_x = left_w + center_w / 2.0;
-        Layout {
+        let center_w = (w - left_w - right_w).max(100.0);
+        // The scene takes the space between the top bar and the item row.
+        let area = Rect::new(left_w, 44.0, center_w, (h - 44.0 - 172.0).max(100.0));
+
+        // Centre the board on the origin.
+        let raw = |col: i32, row: i32| {
+            let hex = Hex::from_offset(col, row);
+            vec3(SQRT3 * (hex.q as f32 + hex.r as f32 / 2.0), 0.0, 1.5 * hex.r as f32)
+        };
+        let origin = (raw(0, 0) + raw(cols - 1, rows - 1)) / 2.0;
+        let mut layout = Layout {
             left_w,
             right_w,
             cols,
             rows,
-            hex,
-            board_top: 44.0 + 30.0,
-            board_mid_x,
-            board_left: board_mid_x - board_w / 2.0,
+            board_mid_x: left_w + center_w / 2.0,
+            view: View::fitted(area, Vec3::ZERO, &[], 0.0, 1.0),
+            origin,
             bench_slots: rules.bench_size,
             shop_slots: rules.shop_size,
+        };
+
+        // Everything that has to stay on screen: the corners of the board,
+        // the ends of the bench, and room for a unit standing at each.
+        let mut fit = Vec::new();
+        for (col, row) in [(0, 0), (cols - 1, 0), (0, rows - 1), (cols - 1, rows - 1), (0, 1.min(rows - 1)), (cols - 1, 1.min(rows - 1))] {
+            for (dx, dz) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                fit.push(layout.hex_world(col, row) + vec3(dx, 0.0, dz));
+            }
+            fit.push(layout.hex_world(col, row) + vec3(0.0, 2.2, 0.0));
         }
+        if layout.bench_slots > 0 {
+            for i in [0, layout.bench_slots - 1] {
+                fit.push(layout.bench_world(i) + vec3(0.0, 0.0, 0.9));
+                fit.push(layout.bench_world(i) + vec3(i as f32 - 0.5, 0.0, 0.0).clamp_length_max(0.9));
+            }
+        }
+        let low = fit.iter().fold(Vec3::splat(f32::MAX), |a, p| a.min(*p));
+        let high = fit.iter().fold(Vec3::splat(f32::MIN), |a, p| a.max(*p));
+        let target = vec3(0.0, 0.0, (low.z + high.z) / 2.0);
+        layout.view = View::fitted(area, target, &fit, app.camera_yaw, app.camera_zoom);
+        layout
     }
 
-    /// Screen position of a point in axial hex coordinates.
-    pub fn axial_center(&self, q: f32, r: f32) -> Vec2 {
-        vec2(
-            self.board_left + SQRT3 * self.hex * (q + r / 2.0 + 0.5),
-            self.board_top + self.hex + 1.5 * self.hex * r,
-        )
+    /// World position of a point in axial hex coordinates.
+    pub fn axial_world(&self, q: f32, r: f32) -> Vec3 {
+        vec3(SQRT3 * (q + r / 2.0), TILE_TOP, 1.5 * r) - self.origin
     }
 
-    /// Screen position of the hex at `(column, row)`.
-    pub fn hex_center(&self, col: i32, row: i32) -> Vec2 {
+    /// World position of the middle of the hex at `(column, row)`.
+    pub fn hex_world(&self, col: i32, row: i32) -> Vec3 {
         let h = Hex::from_offset(col, row);
-        self.axial_center(h.q as f32, h.r as f32)
+        self.axial_world(h.q as f32, h.r as f32)
     }
 
-    /// Rotates a board position half a turn around the board's center.
-    pub fn flip(&self, p: Vec2) -> Vec2 {
-        let a = self.hex_center(0, 0);
-        let b = self.hex_center(self.cols - 1, self.rows - 1);
-        a + b - p
+    /// Rotates a world position half a turn around the board's centre.
+    pub fn flip(&self, p: Vec3) -> Vec3 {
+        vec3(-p.x, p.y, -p.z)
     }
 
-    /// The hex under a screen position, if any.
+    /// Where bench slot `i` is: a row of pads in front of the board.
+    pub fn bench_world(&self, i: usize) -> Vec3 {
+        let z = self.hex_world(0, self.rows - 1).z + 2.5;
+        let x = (i as f32 - (self.bench_slots as f32 - 1.0) / 2.0) * BENCH_SPACING;
+        vec3(x, TILE_TOP, z)
+    }
+
+    /// The hex under a window position, if any.
     pub fn hex_at(&self, p: Vec2) -> Option<(i32, i32)> {
+        let ground = self.view.ground_at(p)?;
         let mut best = None;
         for row in 0..self.rows {
             for col in 0..self.cols {
-                let d = self.hex_center(col, row).distance(p);
-                if d < self.hex * 0.9 && best.is_none_or(|(bd, _)| d < bd) {
+                let d = self.hex_world(col, row).distance(ground);
+                if d < 0.92 && best.is_none_or(|(bd, _)| d < bd) {
                     best = Some((d, (col, row)));
                 }
             }
@@ -85,20 +116,22 @@ impl Layout {
         best.map(|(_, pos)| pos)
     }
 
-    fn board_bottom(&self) -> f32 {
-        self.board_top + 1.5 * self.hex * (self.rows - 1) as f32 + 2.0 * self.hex
+    /// The bench slot under a window position, if any.
+    pub fn bench_at(&self, p: Vec2) -> Option<usize> {
+        let ground = self.view.ground_at(p)?;
+        (0..self.bench_slots).find(|i| {
+            let d = ground - self.bench_world(*i);
+            d.x.abs() < BENCH_SPACING / 2.0 && d.z.abs() < 0.85
+        })
     }
 
-    pub fn bench_slot(&self, i: usize) -> Rect {
-        let size = 54.0;
-        let gap = 6.0;
-        let total = self.bench_slots as f32 * (size + gap) - gap;
-        Rect::new(self.board_mid_x - total / 2.0 + i as f32 * (size + gap), self.board_bottom() + 10.0, size, size)
+    /// Bottom edge of the 3D picture.
+    pub fn scene_bottom(&self) -> f32 {
+        self.view.area.y + self.view.area.h
     }
 
     pub fn item_slot(&self, i: usize) -> Rect {
-        let first = self.bench_slot(0);
-        Rect::new(first.x + i as f32 * 42.0, first.y + first.h + 8.0, 36.0, 36.0)
+        Rect::new(self.left_w + 72.0 + i as f32 * 42.0, self.scene_bottom() + 6.0, 36.0, 36.0)
     }
 
     pub fn shop_area(&self) -> Rect {
@@ -213,5 +246,36 @@ pub fn draw_unit_token(
             let start = if health + shield <= 1.0 { health } else { start };
             draw_rectangle(x + w * start, y, w * shield.min(1.0 - start), 5.0, Color::new(0.92, 0.94, 0.98, 0.95));
         }
+    }
+}
+
+/// Star pips with item pips after them, centred on `c`.
+pub fn draw_pips(c: Vec2, star: u8, items: usize) {
+    let (star, items) = (star.min(5) as usize, items.min(3));
+    let width = (star + items) as f32 * 9.0;
+    for i in 0..star + items {
+        let x = c.x - width / 2.0 + 4.5 + i as f32 * 9.0;
+        if i < star {
+            draw_circle(x, c.y, 4.5, BG);
+            draw_circle(x, c.y, 3.5, Color::new(0.98, 0.80, 0.25, 1.0));
+        } else {
+            draw_rectangle(x - 4.0, c.y - 4.0, 8.0, 8.0, BG);
+            draw_rectangle(x - 3.0, c.y - 3.0, 6.0, 6.0, Color::new(0.70, 0.86, 0.98, 1.0));
+        }
+    }
+}
+
+/// A health bar centred on `c`; `health` and `shield` are fractions of
+/// maximum health. The shield is drawn after the health, or over its end
+/// when there is no room left.
+pub fn draw_health_bar(c: Vec2, w: f32, health: f32, shield: f32, friendly: bool) {
+    let (x, y) = (c.x - w / 2.0, c.y - 3.0);
+    draw_rectangle(x - 1.0, y - 1.0, w + 2.0, 8.0, BG);
+    let health = health.clamp(0.0, 1.0);
+    draw_rectangle(x, y, w * health, 6.0, if friendly { GOOD } else { Color::new(0.92, 0.33, 0.33, 1.0) });
+    let shield = shield.clamp(0.0, 1.0);
+    if shield > 0.0 {
+        let start = health.min(1.0 - shield);
+        draw_rectangle(x + w * start, y, w * shield, 6.0, Color::new(0.92, 0.94, 0.98, 0.95));
     }
 }

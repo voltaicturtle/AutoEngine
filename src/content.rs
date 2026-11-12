@@ -49,6 +49,30 @@ pub struct UnitDef {
     /// to `false`.
     #[serde(default = "default_true")]
     pub in_shop: bool,
+    /// How graphical clients should draw the unit. The engine itself never
+    /// looks at this.
+    #[serde(default)]
+    pub model: Option<ModelRef>,
+}
+
+/// A 3D model for a unit: display-only data that travels with the content
+/// so every client draws the same thing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRef {
+    /// Model file, relative to the client's assets directory. Any format
+    /// the client's importer understands (OBJ, glTF, FBX, PLY, ...).
+    pub file: String,
+    /// Height on the board as a percentage of the standard unit height.
+    #[serde(default = "default_hundred")]
+    pub scale_percent: u32,
+    /// Turn applied to the model so that it faces forward, for files
+    /// authored facing another way.
+    #[serde(default)]
+    pub yaw_degrees: i32,
+}
+
+fn default_hundred() -> u32 {
+    100
 }
 
 /// Who receives a bonus.

@@ -1,0 +1,9 @@
+newmtl cloth
+Kd 0.720 0.200 0.140
+
+newmtl skin
+Kd 0.930 0.740 0.580
+
+newmtl blade
+Kd 1.000 0.720 0.250
+

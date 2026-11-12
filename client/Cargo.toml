@@ -8,3 +8,8 @@ autoengine = { path = "..", package = "AutoEngine" }
 # OpenGL windowing, drawing and input. Audio is left out so the client
 # builds without extra system libraries.
 macroquad = { version = "0.4", default-features = false }
+# Assimp bindings for model loading. "prebuilt" downloads a ready-made
+# Assimp shared library at build time, so none has to be installed. `cargo
+# run` finds it by itself; to run the executable directly, keep the library
+# next to it (see build.rs). Drop the feature to link a system Assimp.
+russimp = { version = "3.2", features = ["prebuilt"] }
