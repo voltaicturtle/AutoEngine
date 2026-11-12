@@ -21,6 +21,8 @@ All five roadmap steps are in place: the combat core, data-driven content, the g
 - `game`: the authoritative lobby state. Players send commands (buy, sell, reroll, buy XP, move, equip, pick, ready); the game handles the shared unit pool, shop odds by level, gold with interest and streaks, bench and board limits, star upgrades, item combining, damage and elimination, and reports everything as events.
 - `round`: pluggable round types behind one trait. Built in: player fights (with ghost boards for odd lobbies), neutral fights with rewards, a shared draft in health order, and private choice rounds for augments or items. Games can register their own kinds.
 - `bot`: simple computer players that use the same commands as people.
+- `script`: round types and game rules written as Rhai scripts, loaded with the content.
+- `tools`: the content checker and the balance simulator.
 
 - `protocol`: the client and server messages, sent as one line of JSON each.
 - `session`: a hosted game independent of any transport: seats, bots for empty or dropped seats, round timers, reconnecting with a seat token, spectators, and per-viewer filtering of private information.
@@ -142,6 +144,94 @@ finish_round()  the round resolves, fights run, players without health are out
 The schedule in `rounds.ron` decides which kind each round is, so a game can
 mix fights with drafts, choices and its own custom rounds freely.
 
+## For programmers
+
+### Scripting
+
+Game rules can be written as [Rhai](https://rhai.rs) scripts in
+`content/scripts/`, with no engine rebuild. A script can be a round type, a
+rule that listens to events, or both.
+
+```rhai
+// content/scripts/payday.rhai: the file name is the round kind.
+fn begin(game)  { game.log("Payday!"); }
+fn finish(game) {
+    for p in game.players() { game.give_gold(p, game.param("gold") + game.stage()); }
+}
+
+// content/scripts/second_wind.rhai: called for everything that happens.
+fn on_event(game, event) {
+    if event.kind == "PlayerDamaged" && event.health < 40 { game.give_gold(event.player, 8); }
+}
+```
+
+A scripted round is used from `rounds.ron` as
+`Custom(kind: "payday", params: {"gold": 2})`. Through `game` a script can read
+players (`players`, `name`, `gold`, `health`, `level`, `unit_count`,
+`item_count`, `streak`, `stage`, `round`, `param`), keep its own numbers
+(`get`, `set`), roll dice (`random`), and act (`give_gold`, `give_xp`,
+`give_item`, `give_random_item`, `give_unit`, `give_augment`, `damage`, `log`,
+`fight_all`). Scripts use whole numbers and the game's seeded dice, so games
+stay repeatable, and a runaway script is stopped rather than hanging the
+server.
+
+Rust code can do the same through the `GameHook` trait (`Game::add_hook`) and
+the `RoundKind` trait for round types.
+
+### Checking and balancing content
+
+```
+cargo run -- check                 # look for mistakes in content/ and its assets
+cargo run -- sim --games 50        # bots play 50 games; prints a balance table
+cargo run -- sim --games 20 --players 4 --seed 3 --content DIR
+```
+
+`check` reports things that load but are probably wrong: trait breakpoints no
+team can reach, traits no shop unit has, units whose cost never appears in a
+shop, model files that are named but missing, and rounds that use a kind
+nothing defines. `sim` plays whole games with bots
+and prints, for each unit and trait, how often it fought, its win rate and the
+average placement of boards that used it.
+
+### Cheats for testing
+
+Start the server with `--dev` and press F1 in the client for a console:
+`gold N`, `xp N`, `unit ID`, `item ID`, `augment ID`, `hurt N`, `skip`.
+Servers without `--dev` refuse these.
+
+## For artists
+
+Everything below is read from the content folder and reloaded while the client
+runs. Save the file and the change shows up within a second.
+
+| File | What it controls |
+| --- | --- |
+| `theme.ron` | Interface and board colours, the scene light, every particle effect, the font |
+| `models/` | Unit models, in any format Assimp reads |
+| `icons/<item id>.png` | Item icons (items without one get a lettered badge) |
+| `sounds/<name>.wav` or `.ogg` | Replaces a built-in sound: `hit`, `cast`, `heal`, `death`, `buy`, `victory`, `defeat` |
+
+### Asset viewer
+
+```
+cargo run -p autoengine-client -- --view content/models/reed_stalker.gltf
+```
+
+Shows one model on a tile with its triangle, vertex, bone and texture counts.
+Number keys play its animation clips and letter keys fire each particle effect
+from `theme.ron`, so a model or an effect can be tuned without starting a game.
+The model reloads when its file is saved.
+
+### Keys
+
+Keys are set in the client's settings file (`autoengine-client.ron`):
+
+```ron
+keys: { "console": "Tab", "skip": "Enter" }
+```
+
+The actions are `menu`, `stats`, `skip`, `camera_reset` and `console`.
+
 ## Content
 
 Game content lives in data files, not code. The `content/` folder holds a small
@@ -156,6 +246,8 @@ original sample set:
 | `rules.ron` | Board size, item limit, star-level bonuses (economy, levels and shop odds use engine defaults unless set here) |
 | `augments.ron` | Augments: lasting team-wide modifiers |
 | `rounds.ron` | The round schedule |
+| `scripts/` | Round types and rules written as scripts |
+| `theme.ron`, `icons/`, `sounds/` | The look and sound of the client |
 | `sample_match.ron` | Two boards to fight each other |
 
 Abilities, trait bonuses and item effects are all written with the same

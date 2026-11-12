@@ -302,7 +302,7 @@ impl ScriptHost {
             round: game.round_index() as INT + 1,
             round_name: game.round_name().to_string(),
             params: params.clone(),
-            rng: game.rng().fork(0x5C21_97),
+            rng: game.rng().fork(0x005C_2197),
             actions: Vec::new(),
             vars: vars.clone(),
         };

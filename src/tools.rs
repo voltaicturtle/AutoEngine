@@ -102,12 +102,12 @@ pub struct UnitRecord {
 
 impl UnitRecord {
     pub fn win_percent(&self) -> u32 {
-        if self.fights == 0 { 0 } else { self.wins * 100 / self.fights }
+        (self.wins * 100).checked_div(self.fights).unwrap_or(0)
     }
 
     /// Average final placement, times ten (25 means 2.5).
     pub fn placement_tenths(&self) -> u32 {
-        if self.final_boards == 0 { 0 } else { self.placement_sum * 10 / self.final_boards }
+        (self.placement_sum * 10).checked_div(self.final_boards).unwrap_or(0)
     }
 }
 

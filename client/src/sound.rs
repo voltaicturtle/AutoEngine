@@ -1,8 +1,9 @@
 //! Sound effects.
 //!
-//! The effects are synthesised when the client starts, so there are no
-//! sound files to ship; swap [`synth`] for real recordings when there are
-//! some. Playback needs the `audio` cargo feature, which is off by default
+//! Each effect is read from `sounds/<name>.wav` or `sounds/<name>.ogg` in
+//! the assets folder (`hit`, `cast`, `heal`, `death`, `buy`, `victory`,
+//! `defeat`). An effect with no file is synthesised instead, so the game
+//! makes noise before any audio has been recorded. Playback needs the `audio` cargo feature, which is off by default
 //! because it needs the system's audio library to build and a sound device
 //! to run. Without it every call here does nothing.
 
@@ -17,6 +18,26 @@ pub enum Sfx {
     Buy,
     Victory,
     Defeat,
+}
+
+impl Sfx {
+    /// The file name an artist uses to replace this effect.
+    pub fn name(self) -> &'static str {
+        match self {
+            Sfx::Hit => "hit",
+            Sfx::Cast => "cast",
+            Sfx::Heal => "heal",
+            Sfx::Death => "death",
+            Sfx::Buy => "buy",
+            Sfx::Victory => "victory",
+            Sfx::Defeat => "defeat",
+        }
+    }
+}
+
+/// The recording for an effect, if the assets folder has one.
+pub fn file_bytes(assets: &std::path::Path, sfx: Sfx) -> Option<Vec<u8>> {
+    ["wav", "ogg"].iter().find_map(|ext| std::fs::read(assets.join("sounds").join(format!("{}.{ext}", sfx.name()))).ok())
 }
 
 pub const ALL: [Sfx; 7] = [Sfx::Hit, Sfx::Cast, Sfx::Heal, Sfx::Death, Sfx::Buy, Sfx::Victory, Sfx::Defeat];
@@ -70,7 +91,7 @@ mod backend {
 
     use macroquad::audio::{PlaySoundParams, Sound, load_sound_from_bytes, play_sound};
 
-    use super::{ALL, Sfx, wav};
+    use super::{ALL, Sfx, file_bytes, wav};
 
     #[derive(Default)]
     pub struct Sounds {
@@ -81,10 +102,11 @@ mod backend {
     }
 
     impl Sounds {
-        pub async fn load() -> Sounds {
+        pub async fn load(assets: &std::path::Path) -> Sounds {
             let mut sounds = Sounds::default();
             for sfx in ALL {
-                match load_sound_from_bytes(&wav(sfx)).await {
+                let bytes = file_bytes(assets, sfx).unwrap_or_else(|| wav(sfx));
+                match load_sound_from_bytes(&bytes).await {
                     Ok(sound) => {
                         sounds.loaded.insert(sfx, sound);
                     }
@@ -117,7 +139,7 @@ mod backend {
     pub struct Sounds;
 
     impl Sounds {
-        pub async fn load() -> Sounds {
+        pub async fn load(_assets: &std::path::Path) -> Sounds {
             Sounds
         }
 
@@ -132,6 +154,19 @@ pub use backend::Sounds;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_recording_in_the_assets_folder_replaces_the_synthesised_effect() {
+        let assets = std::env::temp_dir().join(format!("autoengine-sounds-{}", std::process::id()));
+        std::fs::create_dir_all(assets.join("sounds")).unwrap();
+        assert_eq!(file_bytes(&assets, Sfx::Hit), None);
+        std::fs::write(assets.join("sounds/hit.ogg"), b"ogg").unwrap();
+        assert_eq!(file_bytes(&assets, Sfx::Hit).as_deref(), Some(&b"ogg"[..]));
+        std::fs::write(assets.join("sounds/hit.wav"), b"wav").unwrap();
+        assert_eq!(file_bytes(&assets, Sfx::Hit).as_deref(), Some(&b"wav"[..]), "wav wins");
+        assert_eq!(file_bytes(&assets, Sfx::Cast), None);
+        std::fs::remove_dir_all(&assets).unwrap();
+    }
 
     #[test]
     fn every_effect_is_a_valid_wav() {

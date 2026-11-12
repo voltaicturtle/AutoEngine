@@ -24,10 +24,15 @@ use russimp::scene::{PostProcess, Scene};
 pub const MAX_PART_VERTICES: usize = 30_000;
 pub const MAX_PART_INDICES: usize = 60_000;
 
-/// Direction the light travels towards the scene from (normalised in use).
-const LIGHT: Vec3 = Vec3::new(0.35, 0.85, 0.40);
-const AMBIENT: f32 = 0.50;
-const DIFFUSE: f32 = 0.62;
+thread_local! {
+    /// The scene's light: direction towards it, ambient and diffuse strength.
+    static LIGHT: std::cell::Cell<(Vec3, f32, f32)> = const { std::cell::Cell::new((Vec3::new(0.35, 0.85, 0.40), 0.50, 0.62)) };
+}
+
+/// Changes the light every model is shaded with (see the theme file).
+pub fn set_light(direction: Vec3, ambient: f32, diffuse: f32) {
+    LIGHT.with(|l| l.set((direction, ambient, diffuse)));
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ModelVertex {
@@ -514,6 +519,20 @@ fn diffuse_texture(material: &Material, folder: &Path) -> Option<Vec<u8>> {
     None
 }
 
+/// What a model is made of.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModelInfo {
+    pub vertices: usize,
+    pub triangles: usize,
+    /// Draw calls: one per material, more for very large meshes.
+    pub parts: usize,
+    pub textures: usize,
+    pub bones: usize,
+    pub nodes: usize,
+    /// Animation clips: name and length in seconds.
+    pub clips: Vec<(String, f32)>,
+}
+
 /// A model ready to draw.
 pub struct Model {
     raw: RawModel,
@@ -554,13 +573,28 @@ impl Model {
         self.raw.vertex_count()
     }
 
+    /// Facts about the model for the asset viewer.
+    pub fn info(&self) -> ModelInfo {
+        let rig = self.raw.rig.as_ref();
+        ModelInfo {
+            vertices: self.raw.vertex_count(),
+            triangles: self.raw.triangle_count(),
+            parts: self.raw.parts.len(),
+            textures: self.textures.iter().filter(|t| t.is_some()).count(),
+            bones: rig.map_or(0, |r| r.bones.len()),
+            nodes: rig.map_or(0, |r| r.nodes.len()),
+            clips: rig.map_or(Vec::new(), |r| r.clips.iter().map(|c| (c.name.clone(), c.duration)).collect()),
+        }
+    }
+
     /// Draws the model standing at `at`, turned `yaw` radians around the Y
     /// axis and scaled, in the given pose if it is animated. `tint`
     /// multiplies the colours and `flash` blends them towards white.
     /// Skinning and lighting are worked out here, per vertex.
     pub fn draw(&self, at: Vec3, yaw: f32, scale: f32, tint: [f32; 3], flash: f32, pose: Option<Pose>) {
         let (sin, cos) = yaw.sin_cos();
-        let light = LIGHT.normalize();
+        let (light, ambient, diffuse) = LIGHT.with(|l| l.get());
+        let light = light.normalize_or_zero();
         let turn = |v: Vec3| vec3(v.x * cos + v.z * sin, v.y, -v.x * sin + v.z * cos);
         let posed = self.raw.posed(pose);
         for ((part, placed), texture) in self.raw.parts.iter().zip(&posed).zip(&self.textures) {
@@ -569,7 +603,7 @@ impl Model {
                 .iter()
                 .zip(placed)
                 .map(|(v, (pos, normal))| {
-                    let shade = AMBIENT + DIFFUSE * turn(*normal).dot(light).max(0.0);
+                    let shade = ambient + diffuse * turn(*normal).dot(light).max(0.0);
                     let channel = |c: f32, t: f32| {
                         let lit = (c * t * shade).min(1.0);
                         ((lit + (1.0 - lit) * flash) * 255.0) as u8

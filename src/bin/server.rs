@@ -16,7 +16,7 @@ use autoengine::net::serve;
 use autoengine::session::{Session, SessionConfig};
 
 const USAGE: &str = "usage: autoengine-server [--port 7777] [--bind ADDR] [--seats 8] [--seed N] \
-[--planning-secs 30] [--content DIR] [--record DIR]";
+[--planning-secs 30] [--content DIR] [--record DIR] [--dev]";
 
 fn main() -> ExitCode {
     match run() {
@@ -42,12 +42,14 @@ fn run() -> Result<(), String> {
     };
     let mut args = std::env::args().skip(1);
     let mut record: Option<String> = None;
+    let mut dev = false;
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(USAGE.to_string());
         match arg.as_str() {
             "--port" => port = value()?.parse().map_err(|_| USAGE)?,
             "--bind" => bind = value()?,
             "--record" => record = Some(value()?),
+            "--dev" => dev = true,
             "--seats" => {
                 config.seats = value()?.parse().ok().filter(|n| (2..=8).contains(n)).ok_or(USAGE)?;
             }
@@ -68,6 +70,10 @@ fn run() -> Result<(), String> {
     );
     let stop = AtomicBool::new(false);
     let mut session = Session::new(content, config);
+    if dev {
+        println!("developer commands are on");
+        session.allow_dev(true);
+    }
     if let Some(dir) = record {
         println!("saving every fight as a replay in {dir}");
         session.record_to(dir);

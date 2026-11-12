@@ -406,6 +406,32 @@ def moss_pixel(rng):
     return pixel
 
 
+
+# --- Item icons -----------------------------------------------------------
+
+def write_icon(path, base, glyph):
+    """A 64x64 badge: a dark rounded square with a simple shape on it."""
+    def pixel(x, y):
+        dx, dy = x - 31.5, y - 31.5
+        edge = max(abs(dx), abs(dy))
+        if edge > 30 or (abs(dx) > 26 and abs(dy) > 26 and (abs(dx) - 26) ** 2 + (abs(dy) - 26) ** 2 > 16):
+            return (18, 20, 28)
+        if glyph(dx, dy):
+            return tuple(min(255, int(c * 255 * (1.15 - (y / 64) * 0.4))) for c in base)
+        shade = 0.22 + 0.10 * (1 - y / 64)
+        return tuple(int(c * 255 * shade) for c in base)
+    write_png(path, 64, 64, pixel)
+
+
+ICONS = {
+    "whetstone": ((0.70, 0.74, 0.80), lambda x, y: abs(x + y) < 7 and abs(x - y) < 34),
+    "oak_charm": ((0.45, 0.75, 0.35), lambda x, y: x * x + (y + 4) ** 2 < 260 or (abs(x) < 4 and 8 < y < 22)),
+    "ember_core": ((1.00, 0.50, 0.20), lambda x, y: x * x + y * y < 190 and not x * x + y * y < 45),
+    "barkplate": ((0.60, 0.42, 0.25), lambda x, y: abs(x) < 17 and -18 < y < 14 - abs(x) * 0.5),
+    "cinder_blade": ((1.00, 0.72, 0.25), lambda x, y: abs(x - y) < 5 and abs(x + y) < 36 or (abs(x + y + 22) < 4 and abs(x - y) < 16)),
+    "grove_sigil": ((0.35, 0.85, 0.55), lambda x, y: abs(abs(x) + abs(y) - 16) < 4 or x * x + y * y < 20),
+}
+
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), "..", "content", "models")
     os.makedirs(out, exist_ok=True)
@@ -426,6 +452,11 @@ def main():
     mesh.write_obj(os.path.join(out, "moss_golem.obj"), texture={"moss": "moss_golem.png"})
     mesh = wisp()
     mesh.write_ply(os.path.join(out, "grave_wisp.ply"))
+
+    icons = os.path.join(out, "..", "icons")
+    os.makedirs(icons, exist_ok=True)
+    for name, (base, glyph) in ICONS.items():
+        write_icon(os.path.join(icons, name + ".png"), base, glyph)
 
     blade = (1.0, 0.72, 0.25)
     write_rigged_gltf(

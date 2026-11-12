@@ -17,6 +17,7 @@ use crate::bot;
 use crate::content::ContentSet;
 use crate::game::{Game, Opponent, PlayerId};
 use crate::replay::ReplayFile;
+use crate::protocol::DevCommand;
 use crate::protocol::{ClientMsg, ContentInfo, GameView, PROTOCOL_VERSION, ServerMsg, ViewPhase, visible_to};
 use crate::rng::Rng;
 
@@ -74,6 +75,7 @@ pub struct Session {
     game: Option<Game>,
     /// Where to save every fight as a replay file, if anywhere.
     record_dir: Option<std::path::PathBuf>,
+    dev: bool,
     phase: Phase,
     bot_rng: Rng,
     /// Source of seat tokens; seeded from the clock, never from the game seed.
@@ -83,6 +85,43 @@ pub struct Session {
 }
 
 impl Session {
+    /// Lets players use [`DevCommand`] cheats. For development only.
+    pub fn allow_dev(&mut self, allow: bool) {
+        self.dev = allow;
+    }
+
+    fn dev_command(&mut self, conn: ConnId, command: DevCommand, now: u64) {
+        let error = |s: &mut Self, message: &str| s.send(conn, ServerMsg::Error { message: message.to_string() });
+        if !self.dev {
+            return error(self, "developer commands are off; start the server with --dev");
+        }
+        let Some(seat) = self.seat_of(conn) else { return error(self, "spectators cannot act") };
+        if !matches!(self.phase, Phase::Planning { .. }) {
+            return error(self, "no round is in progress");
+        }
+        let id = PlayerId(seat as u8);
+        let game = self.game.as_mut().expect("a started session has a game");
+        let known = match &command {
+            DevCommand::Unit(unit) => game.content().unit(unit).is_some(),
+            DevCommand::Item(item) => game.content().item(item).is_some(),
+            DevCommand::Augment(augment) => game.content().augment(augment).is_some(),
+            _ => true,
+        };
+        if !known {
+            return error(self, "there is nothing with that id");
+        }
+        match command {
+            DevCommand::Gold(n) => game.add_gold(id, n),
+            DevCommand::Xp(n) => game.add_xp(id, n),
+            DevCommand::Unit(unit) => game.add_unit(id, &unit, Vec::new()),
+            DevCommand::Item(item) => game.give_item(id, &item),
+            DevCommand::Augment(augment) => game.give_augment(id, &augment),
+            DevCommand::Hurt(n) => game.damage_player(id, n.max(0)),
+            DevCommand::Skip => return self.resolve(now),
+        }
+        self.broadcast(now);
+    }
+
     /// Saves every fight from now on as a replay file in `dir`.
     pub fn record_to(&mut self, dir: impl Into<std::path::PathBuf>) {
         self.record_dir = Some(dir.into());
@@ -96,6 +135,7 @@ impl Session {
             conns: BTreeMap::new(),
             game: None,
             record_dir: None,
+            dev: false,
             phase: Phase::Lobby,
             bot_rng: Rng::new(config.seed ^ 0xB075),
             token_rng: Rng::new(
@@ -193,6 +233,7 @@ impl Session {
                     self.start(now);
                 }
             }
+            ClientMsg::Dev(command) => self.dev_command(conn, command, now),
             ClientMsg::Command(command) => {
                 let Some(seat) = self.seat_of(conn) else {
                     return self.send(conn, ServerMsg::Error { message: "spectators cannot act".into() });

@@ -21,7 +21,7 @@ struct Particle {
 }
 
 /// How a burst of particles looks.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Burst {
     pub count: usize,
     pub color: Color,

@@ -14,6 +14,44 @@ use crate::game::{CombatRecord, Command, GameEvent, Player, PlayerId};
 /// Bumped whenever the messages change incompatibly.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Shortcuts for trying things out while building a game. They act on the
+/// sender's own seat.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DevCommand {
+    Gold(i64),
+    Xp(u32),
+    /// Add a unit by id, without paying or touching the shop.
+    Unit(String),
+    Item(String),
+    Augment(String),
+    /// Lose this much health.
+    Hurt(i64),
+    /// End the planning phase now.
+    Skip,
+}
+
+impl DevCommand {
+    /// Reads a console line such as `gold 50`, `unit ashen_hound` or `skip`.
+    pub fn parse(line: &str) -> Result<DevCommand, String> {
+        const HELP: &str = "commands: gold N, xp N, unit ID, item ID, augment ID, hurt N, skip";
+        let mut words = line.split_whitespace();
+        let command = words.next().ok_or(HELP)?;
+        let arg = words.next();
+        let number = || arg.and_then(|a| a.parse::<i64>().ok()).ok_or(format!("{command} needs a number"));
+        let id = || arg.map(str::to_string).ok_or(format!("{command} needs an id"));
+        Ok(match command {
+            "gold" => DevCommand::Gold(number()?),
+            "xp" => DevCommand::Xp(number()?.clamp(0, 10_000) as u32),
+            "unit" => DevCommand::Unit(id()?),
+            "item" => DevCommand::Item(id()?),
+            "augment" => DevCommand::Augment(id()?),
+            "hurt" => DevCommand::Hurt(number()?),
+            "skip" => DevCommand::Skip,
+            _ => return Err(HELP.to_string()),
+        })
+    }
+}
+
 /// Client to server.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMsg {
@@ -31,6 +69,8 @@ pub enum ClientMsg {
     Start,
     /// A game command for the sender's seat.
     Command(Command),
+    /// A developer cheat, accepted only by servers started with `--dev`.
+    Dev(DevCommand),
 }
 
 /// The definitions a client needs to label and draw things.

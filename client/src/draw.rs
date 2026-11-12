@@ -4,7 +4,8 @@ use autoengine::hex::Hex;
 use macroquad::prelude::*;
 
 use crate::scene::{SQRT3, View};
-use crate::{App, BG, GOOD, MUTED, PANEL_LIGHT, TEXT};
+use crate::App;
+use crate::theme::{self, ui};
 
 /// Where everything goes for the current window size.
 ///
@@ -159,12 +160,11 @@ pub fn panel(x: f32, y: f32, w: f32, h: f32, color: Color) {
 
 /// Text with its baseline at `y`.
 pub fn label(text: &str, x: f32, y: f32, size: f32, color: Color) {
-    draw_text(text, x, y, size, color);
+    theme::text(text, x, y, size, color);
 }
 
 pub fn text_centered(text: &str, x: f32, y: f32, size: f32, color: Color) {
-    let m = measure_text(text, None, size as u16, 1.0);
-    draw_text(text, x - m.width / 2.0, y, size, color);
+    theme::text(text, x - theme::text_width(text, size) / 2.0, y, size, color);
 }
 
 /// Word-wrapped text, top-left at `(x, y)`.
@@ -173,8 +173,8 @@ pub fn wrapped(text: &str, x: f32, y: f32, width: f32, size: f32, color: Color) 
     let mut row = 0.0;
     for word in text.split_whitespace() {
         let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
-        if measure_text(&candidate, None, size as u16, 1.0).width > width && !line.is_empty() {
-            draw_text(&line, x, y + row * (size + 2.0) + size, size, color);
+        if theme::text_width(&candidate, size) > width && !line.is_empty() {
+            theme::text(&line, x, y + row * (size + 2.0) + size, size, color);
             row += 1.0;
             line = word.to_string();
         } else {
@@ -182,7 +182,7 @@ pub fn wrapped(text: &str, x: f32, y: f32, width: f32, size: f32, color: Color) 
         }
     }
     if !line.is_empty() {
-        draw_text(&line, x, y + row * (size + 2.0) + size, size, color);
+        theme::text(&line, x, y + row * (size + 2.0) + size, size, color);
     }
 }
 
@@ -190,10 +190,10 @@ pub fn wrapped(text: &str, x: f32, y: f32, width: f32, size: f32, color: Color) 
 pub fn button(text: &str, x: f32, y: f32, w: f32, h: f32, enabled: bool) -> bool {
     let (mx, my) = mouse_position();
     let hover = enabled && mx >= x && mx <= x + w && my >= y && my <= y + h;
-    let fill = if hover { Color::new(0.30, 0.38, 0.52, 1.0) } else { PANEL_LIGHT };
+    let fill = if hover { Color::new(0.30, 0.38, 0.52, 1.0) } else { ui().panel_light };
     draw_rectangle(x, y, w, h, fill);
-    draw_rectangle_lines(x, y, w, h, 1.0, if enabled { TEXT } else { MUTED });
-    text_centered(text, x + w / 2.0, y + h / 2.0 + 6.0, 19.0, if enabled { TEXT } else { MUTED });
+    draw_rectangle_lines(x, y, w, h, 1.0, if enabled { ui().text } else { ui().muted });
+    text_centered(text, x + w / 2.0, y + h / 2.0 + 6.0, 19.0, if enabled { ui().text } else { ui().muted });
     hover && is_mouse_button_pressed(MouseButton::Left)
 }
 
@@ -221,7 +221,7 @@ pub fn draw_unit_token(
 ) {
     let ring = if friendly { Color::new(0.35, 0.62, 0.98, 1.0) } else { Color::new(0.92, 0.33, 0.33, 1.0) };
     draw_circle(c.x, c.y, radius + 4.0, ring);
-    draw_circle(c.x, c.y, radius + 1.0, BG);
+    draw_circle(c.x, c.y, radius + 1.0, ui().background);
     draw_circle(c.x, c.y, radius, unit_color(name));
     let initials: String = name.split_whitespace().filter_map(|w| w.chars().next()).take(2).collect();
     let size = (radius * 0.95).max(12.0);
@@ -237,9 +237,9 @@ pub fn draw_unit_token(
     if let Some((health, shield)) = bars {
         let w = radius * 2.2;
         let (x, y) = (c.x - w / 2.0, c.y - radius - 11.0);
-        draw_rectangle(x - 1.0, y - 1.0, w + 2.0, 7.0, BG);
+        draw_rectangle(x - 1.0, y - 1.0, w + 2.0, 7.0, ui().background);
         let health = health.clamp(0.0, 1.0);
-        draw_rectangle(x, y, w * health, 5.0, if friendly { GOOD } else { Color::new(0.92, 0.33, 0.33, 1.0) });
+        draw_rectangle(x, y, w * health, 5.0, if friendly { ui().good } else { Color::new(0.92, 0.33, 0.33, 1.0) });
         let shield = shield.clamp(0.0, 1.0 - health).max(shield.min(0.35).min(1.0)).min(1.0);
         if shield > 0.0 {
             let start = (health - shield).max(0.0).min(1.0 - shield);
@@ -256,10 +256,10 @@ pub fn draw_pips(c: Vec2, star: u8, items: usize) {
     for i in 0..star + items {
         let x = c.x - width / 2.0 + 4.5 + i as f32 * 9.0;
         if i < star {
-            draw_circle(x, c.y, 4.5, BG);
+            draw_circle(x, c.y, 4.5, ui().background);
             draw_circle(x, c.y, 3.5, Color::new(0.98, 0.80, 0.25, 1.0));
         } else {
-            draw_rectangle(x - 4.0, c.y - 4.0, 8.0, 8.0, BG);
+            draw_rectangle(x - 4.0, c.y - 4.0, 8.0, 8.0, ui().background);
             draw_rectangle(x - 3.0, c.y - 3.0, 6.0, 6.0, Color::new(0.70, 0.86, 0.98, 1.0));
         }
     }
@@ -270,9 +270,9 @@ pub fn draw_pips(c: Vec2, star: u8, items: usize) {
 /// when there is no room left.
 pub fn draw_health_bar(c: Vec2, w: f32, health: f32, shield: f32, friendly: bool) {
     let (x, y) = (c.x - w / 2.0, c.y - 3.0);
-    draw_rectangle(x - 1.0, y - 1.0, w + 2.0, 8.0, BG);
+    draw_rectangle(x - 1.0, y - 1.0, w + 2.0, 8.0, ui().background);
     let health = health.clamp(0.0, 1.0);
-    draw_rectangle(x, y, w * health, 6.0, if friendly { GOOD } else { Color::new(0.92, 0.33, 0.33, 1.0) });
+    draw_rectangle(x, y, w * health, 6.0, if friendly { ui().good } else { Color::new(0.92, 0.33, 0.33, 1.0) });
     let shield = shield.clamp(0.0, 1.0);
     if shield > 0.0 {
         let start = health.min(1.0 - shield);

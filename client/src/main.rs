@@ -9,8 +9,12 @@
 //! units that have none. The rest of the interface is drawn flat on top.
 //!
 //! Usage: `autoengine-client [--addr 127.0.0.1:7777] [--name NAME] [--spectate]
-//!         [--assets DIR] [--settings FILE] [--replay FILE] [--autoplay] [--no-ready]
+//!         [--assets DIR] [--settings FILE] [--replay FILE] [--view FILE] [--autoplay] [--no-ready]
 //!         [--menu] [--stats] [--screenshot SECONDS:FILE]...`
+//!
+//! `--view FILE` opens the asset viewer on a model file: it shows the model
+//! with its statistics, plays its animation clips, previews the particle
+//! effects, and reloads when the file changes.
 //!
 //! `--replay FILE` watches a fight the server saved (`--record`) without
 //! connecting to anything. Settings live in `autoengine-client.ron` (see
@@ -29,6 +33,7 @@ mod model;
 mod scene;
 mod settings;
 mod sound;
+mod theme;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -43,25 +48,18 @@ use autoengine::game::{Command, Opponent, OwnedUnit, Player, PlayerId, Slot};
 use autoengine::hex::Hex;
 use autoengine::net::Connection;
 use autoengine::playback::{Flash, Playback};
+use autoengine::protocol::DevCommand;
 use autoengine::protocol::{ClientMsg, PROTOCOL_VERSION, ViewPhase};
 use macroquad::prelude::*;
 
 use draw::{Layout, button, draw_health_bar, draw_pips, draw_unit_token, label, panel, text_centered, unit_color};
 use model::{Model, Pose, RawModel};
 use scene::Ground;
-use settings::Settings;
+use settings::{Action, Settings};
+use theme::{Theme, ui};
 use sound::{Sfx, Sounds};
 use autoengine::replay::ReplayFile;
 
-const BG: Color = Color::new(0.07, 0.08, 0.11, 1.0);
-const PANEL: Color = Color::new(0.12, 0.14, 0.19, 1.0);
-const PANEL_LIGHT: Color = Color::new(0.18, 0.21, 0.28, 1.0);
-const TEXT: Color = Color::new(0.90, 0.92, 0.96, 1.0);
-const MUTED: Color = Color::new(0.58, 0.62, 0.70, 1.0);
-const GOLD_COLOR: Color = Color::new(0.98, 0.80, 0.25, 1.0);
-const GOOD: Color = Color::new(0.35, 0.82, 0.45, 1.0);
-const BAD: Color = Color::new(0.92, 0.33, 0.33, 1.0);
-const ACCENT: Color = Color::new(0.35, 0.62, 0.98, 1.0);
 
 #[derive(Clone)]
 struct Options {
@@ -72,6 +70,8 @@ struct Options {
     settings: PathBuf,
     /// A saved fight to watch instead of connecting to a server.
     replay: Option<PathBuf>,
+    /// A model file to open in the asset viewer.
+    view: Option<PathBuf>,
     /// Start with the menu open, or with the statistics overlay on.
     menu: bool,
     stats: bool,
@@ -88,13 +88,14 @@ struct Options {
 }
 
 fn parse_options() -> Result<Options, String> {
-    let usage = "usage: autoengine-client [--addr HOST:PORT] [--name NAME] [--spectate] [--assets DIR] [--settings FILE] [--replay FILE] [--autoplay] \
+    let usage = "usage: autoengine-client [--addr HOST:PORT] [--name NAME] [--spectate] [--assets DIR] [--settings FILE] [--replay FILE] [--view FILE] [--autoplay] \
                  [--no-ready] [--menu] [--stats] [--screenshot SECONDS:FILE]...";
     let mut o = Options {
         addr: None,
         name: None,
         settings: PathBuf::from("autoengine-client.ron"),
         replay: None,
+        view: None,
         menu: false,
         stats: false,
         spectate: false,
@@ -112,6 +113,7 @@ fn parse_options() -> Result<Options, String> {
             "--name" => o.name = Some(value()?),
             "--settings" => o.settings = PathBuf::from(value()?),
             "--replay" => o.replay = Some(PathBuf::from(value()?)),
+            "--view" => o.view = Some(PathBuf::from(value()?)),
             "--menu" => o.menu = true,
             "--stats" => o.stats = true,
             "--spectate" => o.spectate = true,
@@ -188,8 +190,46 @@ impl Show {
 
 /// Height of a unit at 100% scale, in hex radii.
 const UNIT_HEIGHT: f32 = 1.7;
-const FRIEND: Color = Color::new(0.35, 0.62, 0.98, 1.0);
-const ENEMY: Color = Color::new(0.92, 0.33, 0.33, 1.0);
+
+/// The asset viewer: one model file on a turntable.
+struct Viewer {
+    path: PathBuf,
+    model: Option<Rc<Model>>,
+    error: Option<String>,
+    seen: Option<std::time::SystemTime>,
+    reloads: u32,
+    /// The clip being played, and when it was started.
+    clip: Option<usize>,
+    clip_started: f64,
+    turning: bool,
+    angle: f32,
+}
+
+impl Viewer {
+    fn new(path: PathBuf) -> Self {
+        let mut viewer =
+            Viewer { path, model: None, error: None, seen: None, reloads: 0, clip: None, clip_started: 0.0, turning: true, angle: 0.6 };
+        viewer.load();
+        viewer.reloads = 0;
+        viewer
+    }
+
+    fn load(&mut self) {
+        self.seen = theme::modified(&self.path);
+        self.reloads += 1;
+        match model::load_geometry(&self.path) {
+            Ok(raw) => {
+                let model = Model::upload(raw);
+                // Keep playing the same clip if the new file still has it.
+                self.clip = self.clip.filter(|c| *c < model.info().clips.len());
+                self.model = Some(Rc::new(model));
+                self.error = None;
+            }
+            // Keep showing the last good version while the file is broken.
+            Err(e) => self.error = Some(e),
+        }
+    }
+}
 
 /// How to draw one kind of unit.
 #[derive(Clone)]
@@ -216,24 +256,69 @@ impl Look {
 /// that uses it comes on screen.
 struct Models {
     assets: PathBuf,
-    files: HashMap<String, Option<Rc<Model>>>,
+    /// Loaded files with the time each was last changed on disk.
+    files: HashMap<String, (Option<std::time::SystemTime>, Option<Rc<Model>>)>,
     figures: HashMap<String, Rc<Model>>,
 }
 
+/// Pictures for units and items: `icons/<id>.png` in the assets folder.
+/// Anything without a picture gets a drawn token instead.
+struct Icons {
+    assets: PathBuf,
+    cache: HashMap<String, (Option<std::time::SystemTime>, Option<Texture2D>)>,
+}
+
+impl Icons {
+    fn path(&self, id: &str) -> PathBuf {
+        self.assets.join("icons").join(format!("{id}.png"))
+    }
+
+    fn get(&mut self, id: &str) -> Option<Texture2D> {
+        if !self.cache.contains_key(id) {
+            let path = self.path(id);
+            let texture = std::fs::read(&path).ok().map(|bytes| {
+                let texture = Texture2D::from_file_with_format(&bytes, None);
+                texture.set_filter(FilterMode::Linear);
+                texture
+            });
+            self.cache.insert(id.to_string(), (theme::modified(&path), texture));
+        }
+        self.cache[id].1.clone()
+    }
+
+    /// Forgets pictures whose files changed, appeared or went away.
+    fn drop_changed(&mut self) {
+        let assets = self.assets.clone();
+        self.cache.retain(|id, (seen, _)| theme::modified(&assets.join("icons").join(format!("{id}.png"))) == *seen);
+    }
+}
+
 impl Models {
+    /// Forgets models whose files changed, so they load again when next
+    /// drawn. This is what lets an artist re-export and see the result.
+    fn drop_changed(&mut self) {
+        let assets = self.assets.clone();
+        self.files.retain(|file, (seen, _)| theme::modified(&assets.join(file)) == *seen);
+    }
+
     fn look(&mut self, def: Option<&UnitDef>, name: &str) -> Look {
         let wanted = def.and_then(|d| d.model.as_ref());
         let loaded = wanted.and_then(|m| {
             let assets = &self.assets;
             self.files
                 .entry(m.file.clone())
-                .or_insert_with(|| match model::load_geometry(&assets.join(&m.file)) {
-                    Ok(raw) => Some(Rc::new(Model::upload(raw))),
-                    Err(e) => {
-                        eprintln!("model {e}; drawing a stand-in");
-                        None
-                    }
+                .or_insert_with(|| {
+                    let path = assets.join(&m.file);
+                    let model = match model::load_geometry(&path) {
+                        Ok(raw) => Some(Rc::new(Model::upload(raw))),
+                        Err(e) => {
+                            eprintln!("model {e}; drawing a stand-in");
+                            None
+                        }
+                    };
+                    (theme::modified(&path), model)
                 })
+                .1
                 .clone()
         });
         let model = loaded.unwrap_or_else(|| {
@@ -272,11 +357,19 @@ struct App {
     camera_yaw: f32,
     camera_zoom: f32,
     settings: Settings,
+    theme: Theme,
+    /// When `theme.ron` was last changed, and when assets were last checked.
+    theme_seen: Option<std::time::SystemTime>,
+    assets_checked_at: f64,
+    icons: RefCell<Icons>,
     particles: fx::Particles,
     sounds: Sounds,
     menu_open: bool,
     /// A saved fight being watched instead of a live game.
     replay: Option<ReplayFile>,
+    viewer: Option<Viewer>,
+    /// The cheat console's input line while it is open.
+    console: Option<String>,
     /// Units and vertices drawn this frame, for the statistics overlay.
     drawn: Cell<(usize, usize)>,
     /// Recent frame times in milliseconds.
@@ -342,6 +435,52 @@ impl App {
         let (units, vertices) = self.drawn.get();
         self.drawn.set((units + 1, vertices + look.model.vertex_count()));
         look.model.draw(at, yaw + look.yaw, scale, tint, flash, pose);
+    }
+
+    /// Loads `theme.ron` and puts it into effect. A broken file keeps the
+    /// current look and says what is wrong.
+    fn load_theme(&mut self) {
+        self.theme_seen = theme::modified(&self.options.assets.join("theme.ron"));
+        match Theme::load(&self.options.assets) {
+            Ok(new) => {
+                if new.font != self.theme.font || self.assets_checked_at == 0.0 {
+                    let font = new.font.as_ref().and_then(|file| {
+                        let path = self.options.assets.join(file);
+                        let loaded = std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| load_ttf_font_from_bytes(&b).map_err(|e| e.to_string()));
+                        loaded.map_err(|e| self.connect_error = Some(format!("font {}: {e}", path.display()))).ok()
+                    });
+                    theme::set_font(font);
+                }
+                theme::set_palette(new.palette);
+                model::set_light(new.light.direction, new.light.ambient, new.light.diffuse);
+                self.theme = new;
+            }
+            Err(e) => self.connect_error = Some(e),
+        }
+    }
+
+    /// Picks up edits to the theme, models and icons, twice a second.
+    fn refresh_assets(&mut self) {
+        if get_time() - self.assets_checked_at < 0.5 {
+            return;
+        }
+        if let Some(viewer) = &mut self.viewer
+            && theme::modified(&viewer.path) != viewer.seen
+        {
+            viewer.load();
+        }
+        if theme::modified(&self.options.assets.join("theme.ron")) != self.theme_seen {
+            self.load_theme();
+        }
+        self.assets_checked_at = get_time();
+        self.models.borrow_mut().drop_changed();
+        self.icons.borrow_mut().drop_changed();
+    }
+
+    /// Whether the key bound to an action was pressed this frame. Typing
+    /// in the console does not set off other actions.
+    fn pressed(&self, action: Action) -> bool {
+        (self.console.is_none() || action == Action::Console) && is_key_pressed(self.settings.key(action))
     }
 
     fn play(&mut self, sfx: Sfx) {
@@ -529,9 +668,15 @@ async fn main() {
         None => None,
     };
     let mut app = App {
+        theme: Theme::default(),
+        theme_seen: None,
+        assets_checked_at: 0.0,
+        icons: RefCell::new(Icons { assets: options.assets.clone(), cache: HashMap::new() }),
         settings,
         particles: fx::Particles::default(),
-        sounds: Sounds::load().await,
+        sounds: Sounds::load(&options.assets).await,
+        viewer: options.view.clone().map(Viewer::new),
+        console: None,
         menu_open: options.menu,
         replay,
         drawn: Cell::new((0, 0)),
@@ -559,10 +704,11 @@ async fn main() {
                 return;
             }
         }
-    } else {
+    } else if app.viewer.is_none() {
         app.connect();
     }
     app.connect_error = app.connect_error.take().or(problem);
+    app.load_theme();
     // Room for a whole model part in one draw call.
     macroquad::window::gl_set_drawcall_buffer_capacity(model::MAX_PART_VERTICES + 16, model::MAX_PART_INDICES + 16);
 
@@ -571,23 +717,25 @@ async fn main() {
     let mut shots = shots.into_iter().peekable();
 
     loop {
-        if app.replay.is_none() {
+        if app.replay.is_none() && app.viewer.is_none() {
             app.pump_network();
             if app.options.autoplay {
                 app.autoplay();
             }
         }
-        clear_background(BG);
+        app.refresh_assets();
+        clear_background(ui().background);
         app.drawn.set((0, 0));
         app.frame_ms.push(get_frame_time() * 1000.0);
         if app.frame_ms.len() > 120 {
             app.frame_ms.remove(0);
         }
         app.particles.update(get_frame_time());
-        if is_key_pressed(KeyCode::Escape) {
+        if app.pressed(Action::Menu) {
             app.menu_open = !app.menu_open;
         }
-        if is_key_pressed(KeyCode::F3) {
+        update_console(&mut app);
+        if app.pressed(Action::Stats) {
             app.settings.show_stats = !app.settings.show_stats;
             app.save_settings();
         }
@@ -600,13 +748,15 @@ async fn main() {
         if wheel != 0.0 {
             app.camera_zoom = (app.camera_zoom - wheel.signum() * 0.08).clamp(0.55, 1.8);
         }
-        if is_key_pressed(KeyCode::Home) {
+        if app.pressed(Action::CameraReset) {
             (app.camera_yaw, app.camera_zoom) = (0.0, 1.0);
         }
         let layout = Layout::new(&app);
         if app.menu_open {
             // The game carries on underneath; the menu has the screen.
             draw_menu(&mut app);
+        } else if app.viewer.is_some() {
+            draw_asset_viewer(&mut app);
         } else if app.replay.is_some() {
             draw_replay_viewer(&mut app, &layout);
         } else if app.state.view.is_none() {
@@ -617,6 +767,7 @@ async fn main() {
         if app.settings.show_stats && !app.menu_open {
             draw_stats(&app, &layout);
         }
+        draw_console(&app, &layout);
         draw_banner(&app);
 
         if let Some((at, _)) = shots.peek()
@@ -639,27 +790,27 @@ fn draw_banner(app: &App) {
     if let Some(message) = message {
         let w = screen_width();
         draw_rectangle(w / 2.0 - 300.0, 50.0, 600.0, 34.0, Color::new(0.45, 0.12, 0.12, 0.95));
-        text_centered(message, w / 2.0, 72.0, 20.0, TEXT);
+        text_centered(message, w / 2.0, 72.0, 20.0, ui().text);
     }
 }
 
 fn draw_lobby(app: &mut App) {
     let (w, h) = (screen_width(), screen_height());
-    text_centered("AutoEngine", w / 2.0, h * 0.22, 64.0, TEXT);
+    text_centered("AutoEngine", w / 2.0, h * 0.22, 64.0, ui().text);
     if !app.state.welcomed {
         let line = if app.connect_error.is_some() { "Not connected" } else { "Connecting..." };
-        text_centered(line, w / 2.0, h * 0.32, 26.0, MUTED);
+        text_centered(line, w / 2.0, h * 0.32, 26.0, ui().muted);
         return;
     }
-    text_centered("Waiting for players", w / 2.0, h * 0.32, 26.0, MUTED);
+    text_centered("Waiting for players", w / 2.0, h * 0.32, 26.0, ui().muted);
     let seats = app.state.lobby.clone();
     for (i, seat) in seats.iter().enumerate() {
         let y = h * 0.40 + i as f32 * 34.0;
-        panel(w / 2.0 - 180.0, y, 360.0, 28.0, PANEL);
+        panel(w / 2.0 - 180.0, y, 360.0, 28.0, ui().panel);
         let mine = app.state.seat == Some(PlayerId(i as u8));
         match seat {
-            Some(name) => label(name, w / 2.0 - 168.0, y + 20.0, 20.0, if mine { GOLD_COLOR } else { TEXT }),
-            None => label("open seat (a bot will play it)", w / 2.0 - 168.0, y + 20.0, 20.0, MUTED),
+            Some(name) => label(name, w / 2.0 - 168.0, y + 20.0, 20.0, if mine { ui().gold } else { ui().text }),
+            None => label("open seat (a bot will play it)", w / 2.0 - 168.0, y + 20.0, 20.0, ui().muted),
         }
     }
     let y = h * 0.40 + seats.len() as f32 * 34.0 + 24.0;
@@ -668,7 +819,7 @@ fn draw_lobby(app: &mut App) {
             app.send(ClientMsg::Start);
         }
     } else {
-        text_centered("Spectating: waiting for the game to start", w / 2.0, y + 24.0, 20.0, MUTED);
+        text_centered("Spectating: waiting for the game to start", w / 2.0, y + 24.0, 20.0, ui().muted);
     }
 }
 
@@ -676,7 +827,7 @@ fn draw_lobby(app: &mut App) {
 /// been over for a moment or Space skips it.
 fn advance_show(app: &mut App) {
     let dt_ms = get_frame_time() * 1000.0;
-    let skip = is_key_pressed(KeyCode::Space);
+    let skip = app.pressed(Action::Skip);
     let mut finished = false;
     if let Some(show) = &mut app.show {
         show.time_ms += dt_ms;
@@ -701,18 +852,18 @@ fn draw_replay_viewer(app: &mut App, layout: &Layout) {
         app.show = Some(Show::new(Playback::new(&replay.record), false, title.clone()));
     }
     let (w, h) = (screen_width(), screen_height());
-    panel(0.0, 0.0, w, 44.0, PANEL);
-    label("Replay", 16.0, 29.0, 22.0, TEXT);
-    text_centered(&title, w / 2.0, 29.0, 22.0, ACCENT);
-    panel(0.0, 44.0, layout.left_w, h - 44.0, PANEL);
-    panel(w - layout.right_w, 44.0, layout.right_w, h - 44.0, PANEL);
+    panel(0.0, 0.0, w, 44.0, ui().panel);
+    label("Replay", 16.0, 29.0, 22.0, ui().text);
+    text_centered(&title, w / 2.0, 29.0, 22.0, ui().accent);
+    panel(0.0, 44.0, layout.left_w, h - 44.0, ui().panel);
+    panel(w - layout.right_w, 44.0, layout.right_w, h - 44.0, ui().panel);
     let x = w - layout.right_w + 14.0;
-    label("Saved fight", x, 74.0, 22.0, TEXT);
+    label("Saved fight", x, 74.0, 22.0, ui().text);
     let file = app.options.replay.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    draw::wrapped(&file, x, 86.0, layout.right_w - 28.0, 16.0, MUTED);
-    label(&format!("{events} events"), x, 150.0, 16.0, MUTED);
+    draw::wrapped(&file, x, 86.0, layout.right_w - 28.0, 16.0, ui().muted);
+    label(&format!("{events} events"), x, 150.0, 16.0, ui().muted);
     for (i, line) in ["Space: restart", "Right-drag: turn the camera", "Scroll: zoom", "Esc: menu", "F3: statistics"].iter().enumerate() {
-        label(line, x, 190.0 + i as f32 * 22.0, 16.0, MUTED);
+        label(line, x, 190.0 + i as f32 * 22.0, 16.0, ui().muted);
     }
     advance_show(app);
     draw_replay(app, layout);
@@ -722,11 +873,11 @@ fn draw_replay_viewer(app: &mut App, layout: &Layout) {
 fn draw_menu(app: &mut App) {
     let (w, h) = (screen_width(), screen_height());
     draw_rectangle(0.0, 0.0, w, h, Color::new(0.03, 0.04, 0.06, 0.82));
-    let (pw, ph) = (460.0, 470.0);
+    let (pw, ph) = (460.0, 530.0);
     let (x, y) = (w / 2.0 - pw / 2.0, h / 2.0 - ph / 2.0);
-    panel(x, y, pw, ph, PANEL);
-    draw_rectangle_lines(x, y, pw, ph, 1.0, MUTED);
-    text_centered("Menu", w / 2.0, y + 40.0, 30.0, TEXT);
+    panel(x, y, pw, ph, ui().panel);
+    draw_rectangle_lines(x, y, pw, ph, 1.0, ui().muted);
+    text_centered("Menu", w / 2.0, y + 40.0, 30.0, ui().text);
 
     let before = app.settings.clone();
     let on_off = |on: bool| if on { "On" } else { "Off" };
@@ -734,7 +885,7 @@ fn draw_menu(app: &mut App) {
     let mut toggle = |name: &str, value: &mut bool| {
         let ry = y + 70.0 + row * 46.0;
         row += 1.0;
-        label(name, x + 30.0, ry + 25.0, 20.0, TEXT);
+        label(name, x + 30.0, ry + 25.0, 20.0, ui().text);
         if button(on_off(*value), x + pw - 150.0, ry, 120.0, 36.0, true) {
             *value = !*value;
         }
@@ -747,9 +898,9 @@ fn draw_menu(app: &mut App) {
 
     let stepper = |name: &str, shown: String, row: f32| -> i32 {
         let ry = y + 70.0 + row * 46.0;
-        label(name, x + 30.0, ry + 25.0, 20.0, TEXT);
+        label(name, x + 30.0, ry + 25.0, 20.0, ui().text);
         let minus = button("-", x + pw - 150.0, ry, 36.0, 36.0, true);
-        text_centered(&shown, x + pw - 90.0, ry + 25.0, 20.0, TEXT);
+        text_centered(&shown, x + pw - 90.0, ry + 25.0, 20.0, ui().text);
         let plus = button("+", x + pw - 66.0, ry, 36.0, 36.0, true);
         plus as i32 - minus as i32
     };
@@ -768,12 +919,172 @@ fn draw_menu(app: &mut App) {
         }
         app.save_settings();
     }
+    // Keys are rebound in the settings file.
+    let keys: Vec<String> = Action::ALL.iter().map(|a| format!("{} {}", a.name().replace('_', " "), app.settings.key_name(*a))).collect();
+    draw::wrapped(&format!("Keys: {}", keys.join(", ")), x + 30.0, y + 398.0, pw - 60.0, 15.0, ui().muted);
     let by = y + ph - 58.0;
     if button("Resume", x + 30.0, by, 190.0, 40.0, true) {
         app.menu_open = false;
     }
     if button("Quit", x + pw - 220.0, by, 190.0, 40.0, true) {
         macroquad::miniquad::window::order_quit();
+    }
+}
+
+/// The cheat console: the bound key opens it, Enter sends the line to the
+/// server as a developer command, Escape or the key again closes it.
+fn update_console(app: &mut App) {
+    if app.pressed(Action::Console) {
+        app.console = if app.console.is_some() { None } else { Some(String::new()) };
+        while get_char_pressed().is_some() {}
+        return;
+    }
+    let Some(line) = &mut app.console else { return };
+    while let Some(c) = get_char_pressed() {
+        if (c.is_ascii_alphanumeric() || c == ' ' || c == '_' || c == '-') && line.len() < 60 {
+            line.push(c);
+        }
+    }
+    if is_key_pressed(KeyCode::Backspace) {
+        line.pop();
+    }
+    if is_key_pressed(KeyCode::Escape) {
+        app.console = None;
+        app.menu_open = false;
+    } else if is_key_pressed(KeyCode::Enter) {
+        let line = std::mem::take(line);
+        match DevCommand::parse(&line) {
+            Ok(command) => {
+                app.state.error = None;
+                app.send(ClientMsg::Dev(command));
+            }
+            Err(e) => app.state.error = Some(e),
+        }
+    }
+}
+
+fn draw_console(app: &App, layout: &Layout) {
+    let Some(line) = &app.console else { return };
+    let area = layout.view.area;
+    let y = area.y + area.h - 34.0;
+    draw_rectangle(area.x, y, area.w, 34.0, Color::new(0.0, 0.0, 0.0, 0.85));
+    let cursor = if (get_time() * 2.0) as i64 % 2 == 0 { "_" } else { " " };
+    label(&format!("> {line}{cursor}"), area.x + 10.0, y + 23.0, 20.0, ui().good);
+    let hint = "gold N   xp N   unit ID   item ID   augment ID   hurt N   skip";
+    label(hint, area.x + area.w - theme::text_width(hint, 14.0) - 10.0, y + 22.0, 14.0, ui().muted);
+}
+
+/// The asset viewer: a model on a turntable with its numbers beside it.
+fn draw_asset_viewer(app: &mut App) {
+    let (w, h) = (screen_width(), screen_height());
+    let side = 330.0;
+    let area = Rect::new(0.0, 44.0, w - side, h - 44.0);
+    let fit: Vec<Vec3> = [-1.3, 1.3]
+        .iter()
+        .flat_map(|x| [-1.3, 1.3].iter().flat_map(move |z| [0.0, UNIT_HEIGHT + 0.5].iter().map(move |y| vec3(*x, *y, *z))))
+        .collect();
+    let view = scene::View::fitted(area, vec3(0.0, UNIT_HEIGHT * 0.5, 0.0), &fit, app.camera_yaw, app.camera_zoom);
+
+    // Keys: digits pick a clip, T stops the turntable, letters fire effects.
+    let digits = [KeyCode::Key1, KeyCode::Key2, KeyCode::Key3, KeyCode::Key4, KeyCode::Key5, KeyCode::Key6, KeyCode::Key7, KeyCode::Key8, KeyCode::Key9];
+    let effects = app.theme.effects;
+    let chest = vec3(0.0, UNIT_HEIGHT * 0.6, 0.0);
+    let mut fired: Option<Sfx> = None;
+    for (key, burst, sfx) in [
+        (KeyCode::H, effects.hit_physical, Sfx::Hit),
+        (KeyCode::M, effects.hit_magic, Sfx::Hit),
+        (KeyCode::U, effects.hit_true, Sfx::Hit),
+        (KeyCode::E, effects.heal, Sfx::Heal),
+        (KeyCode::C, effects.cast, Sfx::Cast),
+        (KeyCode::D, effects.death, Sfx::Death),
+    ] {
+        if is_key_pressed(key) {
+            app.particles.burst(chest, burst);
+            fired = Some(sfx);
+        }
+    }
+    if is_key_pressed(KeyCode::B) {
+        app.particles.bolt(vec3(-3.0, chest.y, 0.0), chest, 0.25, effects.bolt);
+    }
+    if let Some(sfx) = fired {
+        app.play(sfx);
+    }
+    let animate = app.settings.animations;
+    let dt = get_frame_time();
+    let Some(viewer) = &mut app.viewer else { return };
+    if is_key_pressed(KeyCode::T) {
+        viewer.turning = !viewer.turning;
+    }
+    if viewer.turning {
+        viewer.angle += dt * 0.7;
+    }
+    let info = viewer.model.as_ref().map(|m| m.info()).unwrap_or_default();
+    if is_key_pressed(KeyCode::Key0) {
+        viewer.clip = None;
+    }
+    for (i, key) in digits.iter().enumerate() {
+        if is_key_pressed(*key) && i < info.clips.len() {
+            viewer.clip = Some(i);
+            viewer.clip_started = get_time();
+        }
+    }
+
+    view.begin();
+    let mut ground = Ground::default();
+    ground.hex_tile(Vec3::ZERO, 1.25, 0.22, ui().tile_own);
+    if app.settings.shadows {
+        ground.disc(RING_LIFT * 0.5, 0.48, ui().shadow);
+    }
+    ground.ring(RING_LIFT, 0.50, 0.62, ui().friend);
+    ground.draw();
+    if let Some(model) = &viewer.model {
+        let pose = viewer.clip.filter(|_| animate).map(|clip| Pose { clip, time: (get_time() - viewer.clip_started) as f32, looped: true });
+        model.draw(Vec3::ZERO, viewer.angle, UNIT_HEIGHT, [1.0; 3], 0.0, pose);
+        app.drawn.set((1, info.vertices));
+    }
+    app.particles.draw(&view.camera);
+    view.end();
+
+    panel(0.0, 0.0, w, 44.0, ui().panel);
+    label("Asset viewer", 16.0, 29.0, 22.0, ui().text);
+    let name = viewer.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    text_centered(&name, (w - side) / 2.0, 29.0, 22.0, ui().accent);
+    panel(w - side, 0.0, side, h, ui().panel);
+    let x = w - side + 16.0;
+    let y = Cell::new(40.0);
+    let line = |text: &str, size: f32, color: Color| {
+        label(text, x, y.get(), size, color);
+        y.set(y.get() + size + 6.0);
+    };
+    line("Model", 22.0, ui().text);
+    line(&format!("{} triangles, {} vertices", info.triangles, info.vertices), 16.0, ui().muted);
+    line(&format!("{} draw calls, {} textures", info.parts, info.textures), 16.0, ui().muted);
+    line(&format!("{} bones, {} nodes", info.bones, info.nodes), 16.0, ui().muted);
+    let status = if viewer.reloads > 0 { format!("reloaded {} times", viewer.reloads) } else { "watching the file for changes".to_string() };
+    line(&status, 16.0, ui().muted);
+    y.set(y.get() + 10.0);
+    line("Animation clips", 22.0, ui().text);
+    if info.clips.is_empty() {
+        line("none in this file", 16.0, ui().muted);
+    }
+    line("0  bind pose", 16.0, if viewer.clip.is_none() { ui().gold } else { ui().muted });
+    for (i, (clip, seconds)) in info.clips.iter().enumerate().take(9) {
+        let color = if viewer.clip == Some(i) { ui().gold } else { ui().muted };
+        line(&format!("{}  {clip}  ({seconds:.2}s)", i + 1), 16.0, color);
+    }
+    y.set(y.get() + 10.0);
+    line("Effects", 22.0, ui().text);
+    for hint in ["H  physical hit", "M  magic hit", "U  true hit", "E  heal", "C  cast", "D  death", "B  bolt"] {
+        line(hint, 16.0, ui().muted);
+    }
+    y.set(y.get() + 10.0);
+    line("View", 22.0, ui().text);
+    for hint in ["T  stop or start turning", "Right-drag  turn the camera", "Scroll  zoom"] {
+        line(hint, 16.0, ui().muted);
+    }
+    if let Some(error) = &viewer.error {
+        draw_rectangle(10.0, h - 70.0, w - side - 20.0, 60.0, Color::new(0.45, 0.12, 0.12, 0.95));
+        draw::wrapped(error, 20.0, h - 66.0, w - side - 40.0, 16.0, ui().text);
     }
 }
 
@@ -801,7 +1112,7 @@ fn draw_stats(app: &App, layout: &Layout) {
     let (x, y) = (layout.view.area.x + 8.0, layout.view.area.y + 8.0);
     draw_rectangle(x, y, 250.0, lines.len() as f32 * 18.0 + 10.0, Color::new(0.0, 0.0, 0.0, 0.6));
     for (i, line) in lines.iter().enumerate() {
-        label(line, x + 8.0, y + 20.0 + i as f32 * 18.0, 16.0, GOOD);
+        label(line, x + 8.0, y + 20.0 + i as f32 * 18.0, 16.0, ui().good);
     }
 }
 
@@ -823,8 +1134,8 @@ fn draw_game(app: &mut App, layout: &Layout) {
 fn draw_top_bar(app: &App) {
     let Some(view) = &app.state.view else { return };
     let w = screen_width();
-    draw_rectangle(0.0, 0.0, w, 44.0, PANEL);
-    label(&format!("Round {}  ({})", view.round_name, view.round_kind), 16.0, 29.0, 24.0, TEXT);
+    draw_rectangle(0.0, 0.0, w, 44.0, ui().panel);
+    label(&format!("Round {}  ({})", view.round_name, view.round_kind), 16.0, 29.0, 24.0, ui().text);
     let phase = match view.phase {
         ViewPhase::Lobby => "Lobby".to_string(),
         ViewPhase::Planning { .. } if app.show.is_some() => "Fight".to_string(),
@@ -835,7 +1146,7 @@ fn draw_top_bar(app: &App) {
         ViewPhase::Showing { .. } => "Fight".to_string(),
         ViewPhase::Over { .. } => "Game over".to_string(),
     };
-    text_centered(&phase, w / 2.0, 29.0, 24.0, ACCENT);
+    text_centered(&phase, w / 2.0, 29.0, 24.0, ui().accent);
     if let Some(me) = app.me() {
         let xp_needed = app
             .state
@@ -845,17 +1156,17 @@ fn draw_top_bar(app: &App) {
             .map(|l| l.xp_to_next)
             .unwrap_or(0);
         let x = w - 520.0;
-        label(&format!("Health {}", me.health.max(0)), x, 29.0, 22.0, if me.health > 30 { GOOD } else { BAD });
-        label(&format!("Gold {}", me.gold), x + 140.0, 29.0, 22.0, GOLD_COLOR);
-        label(&format!("Level {}  ({}/{} xp)", me.level, me.xp, xp_needed), x + 250.0, 29.0, 22.0, TEXT);
+        label(&format!("Health {}", me.health.max(0)), x, 29.0, 22.0, if me.health > 30 { ui().good } else { ui().bad });
+        label(&format!("Gold {}", me.gold), x + 140.0, 29.0, 22.0, ui().gold);
+        label(&format!("Level {}  ({}/{} xp)", me.level, me.xp, xp_needed), x + 250.0, 29.0, 22.0, ui().text);
     } else {
-        label("Spectating", w - 140.0, 29.0, 22.0, MUTED);
+        label("Spectating", w - 140.0, 29.0, 22.0, ui().muted);
     }
 }
 
 fn draw_traits(app: &App, layout: &Layout) {
-    panel(0.0, 44.0, layout.left_w, screen_height() - 44.0, PANEL);
-    label("Traits", 14.0, 74.0, 22.0, TEXT);
+    panel(0.0, 44.0, layout.left_w, screen_height() - 44.0, ui().panel);
+    label("Traits", 14.0, 74.0, 22.0, ui().text);
     let (Some(player), Some(content)) = (app.shown_player(), &app.state.content) else { return };
     let units: Vec<BoardUnit> = player.board_units();
     let Ok(mut traits) = content.active_traits(&units) else { return };
@@ -864,17 +1175,17 @@ fn draw_traits(app: &App, layout: &Layout) {
     for t in traits {
         let Some(def) = content.trait_def(&t.id) else { continue };
         let steps: Vec<String> = def.breakpoints.iter().map(|b| b.count.to_string()).collect();
-        let color = if t.tier.is_some() { GOLD_COLOR } else { MUTED };
+        let color = if t.tier.is_some() { ui().gold } else { ui().muted };
         label(&format!("{}  {}", t.count, def.name), 14.0, y, 20.0, color);
-        label(&format!("({})", steps.join(" / ")), 150.0, y, 16.0, MUTED);
+        label(&format!("({})", steps.join(" / ")), 150.0, y, 16.0, ui().muted);
         y += 26.0;
     }
     if !player.augments.is_empty() {
         y += 14.0;
-        label("Augments", 14.0, y, 22.0, TEXT);
+        label("Augments", 14.0, y, 22.0, ui().text);
         y += 28.0;
         for a in &player.augments {
-            label(&app.state.display_name(a), 14.0, y, 18.0, ACCENT);
+            label(&app.state.display_name(a), 14.0, y, 18.0, ui().accent);
             y += 22.0;
         }
     }
@@ -882,8 +1193,8 @@ fn draw_traits(app: &App, layout: &Layout) {
 
 fn draw_scoreboard(app: &mut App, layout: &Layout) {
     let x = screen_width() - layout.right_w;
-    panel(x, 44.0, layout.right_w, screen_height() - 44.0, PANEL);
-    label("Players", x + 14.0, 74.0, 22.0, TEXT);
+    panel(x, 44.0, layout.right_w, screen_height() - 44.0, ui().panel);
+    label("Players", x + 14.0, 74.0, 22.0, ui().text);
     let Some(view) = &app.state.view else { return };
     let mut players: Vec<&Player> = view.players.iter().collect();
     players.sort_by_key(|p| (!p.alive, std::cmp::Reverse(p.health), p.placement));
@@ -894,20 +1205,20 @@ fn draw_scoreboard(app: &mut App, layout: &Layout) {
         let me = app.state.seat == Some(p.id);
         let shown = app.shown_player().map(|s| s.id) == Some(p.id);
         let hover = mx >= x + 8.0 && mx <= x + layout.right_w - 8.0 && my >= y && my <= y + 34.0;
-        panel(x + 8.0, y, layout.right_w - 16.0, 34.0, if shown || hover { PANEL_LIGHT } else { PANEL });
-        let color = if !p.alive { MUTED } else if me { GOLD_COLOR } else { TEXT };
+        panel(x + 8.0, y, layout.right_w - 16.0, 34.0, if shown || hover { ui().panel_light } else { ui().panel });
+        let color = if !p.alive { ui().muted } else if me { ui().gold } else { ui().text };
         label(&p.name, x + 16.0, y + 16.0, 18.0, color);
         if p.alive {
             let frac = (p.health.max(0) as f32 / 100.0).min(1.0);
-            draw_rectangle(x + 16.0, y + 22.0, 150.0, 6.0, BG);
-            draw_rectangle(x + 16.0, y + 22.0, 150.0 * frac, 6.0, if p.health > 30 { GOOD } else { BAD });
-            label(&format!("{}", p.health.max(0)), x + 174.0, y + 30.0, 16.0, TEXT);
-            label(&format!("L{}", p.level), x + 206.0, y + 30.0, 16.0, MUTED);
+            draw_rectangle(x + 16.0, y + 22.0, 150.0, 6.0, ui().background);
+            draw_rectangle(x + 16.0, y + 22.0, 150.0 * frac, 6.0, if p.health > 30 { ui().good } else { ui().bad });
+            label(&format!("{}", p.health.max(0)), x + 174.0, y + 30.0, 16.0, ui().text);
+            label(&format!("L{}", p.level), x + 206.0, y + 30.0, 16.0, ui().muted);
             if p.ready {
-                label("ok", x + 174.0, y + 14.0, 14.0, GOOD);
+                label("ok", x + 174.0, y + 14.0, 14.0, ui().good);
             }
         } else if let Some(place) = p.placement {
-            label(&format!("out, place {place}"), x + 130.0, y + 16.0, 16.0, MUTED);
+            label(&format!("out, place {place}"), x + 130.0, y + 16.0, 16.0, ui().muted);
         }
         if hover && is_mouse_button_pressed(MouseButton::Left) {
             clicked = Some(p.id);
@@ -919,20 +1230,20 @@ fn draw_scoreboard(app: &mut App, layout: &Layout) {
     }
 
     y += 12.0;
-    label("Log", x + 14.0, y + 14.0, 22.0, TEXT);
+    label("Log", x + 14.0, y + 14.0, 22.0, ui().text);
     y += 24.0;
     let room = ((screen_height() - y - 8.0) / 18.0) as usize;
     let skip = app.state.log.len().saturating_sub(room);
     for line in app.state.log.iter().skip(skip) {
         let mut line = line.clone();
-        if measure_text(&line, None, 14, 1.0).width > layout.right_w - 24.0 {
-            while measure_text(&line, None, 14, 1.0).width > layout.right_w - 36.0 && line.len() > 4 {
+        if theme::text_width(&line, 14.0) > layout.right_w - 24.0 {
+            while theme::text_width(&line, 14.0) > layout.right_w - 36.0 && line.len() > 4 {
                 line.pop();
             }
             line.push_str("...");
         }
         y += 18.0;
-        label(&line, x + 14.0, y, 14.0, MUTED);
+        label(&line, x + 14.0, y, 14.0, ui().muted);
     }
 }
 
@@ -943,12 +1254,12 @@ fn board_tiles(ground: &mut Ground, layout: &Layout, own_half: bool, highlight: 
     for row in 0..layout.rows {
         for col in 0..layout.cols {
             let mine = own_half && row >= layout.rows / 2;
-            let mut fill = if mine { Color::new(0.24, 0.31, 0.43, 1.0) } else { Color::new(0.19, 0.22, 0.29, 1.0) };
+            let mut fill = if mine { ui().tile_own } else { ui().tile };
             if (col + row) % 2 == 0 {
                 fill = Color::new(fill.r * 0.93, fill.g * 0.93, fill.b * 0.93, 1.0);
             }
             if highlight == Some((col, row)) {
-                fill = Color::new(0.45, 0.62, 0.85, 1.0);
+                fill = ui().tile_highlight;
             }
             ground.hex_tile(layout.hex_world(col, row), 0.94, 0.22, fill);
         }
@@ -965,7 +1276,6 @@ fn star_scale(star: u8) -> f32 {
 }
 
 const RING_LIFT: Vec3 = Vec3::new(0.0, 0.03, 0.0);
-const SHADOW: Color = Color::new(0.0, 0.0, 0.0, 0.38);
 
 fn draw_planning(app: &mut App, layout: &Layout) {
     let Some(player) = app.shown_player().cloned() else { return };
@@ -998,14 +1308,14 @@ fn draw_planning(app: &mut App, layout: &Layout) {
     board_tiles(&mut ground, layout, true, drop_hex);
     let drop_bench = dragged_unit.and_then(|_| layout.bench_at(mouse));
     for i in 0..layout.bench_slots {
-        let fill = if drop_bench == Some(i) { Color::new(0.45, 0.62, 0.85, 1.0) } else { Color::new(0.16, 0.18, 0.24, 1.0) };
+        let fill = if drop_bench == Some(i) { ui().tile_highlight } else { ui().bench };
         ground.hex_tile(layout.bench_world(i), 0.72, 0.14, fill);
     }
     for (_, at, _) in &standing {
         if app.settings.shadows {
-            ground.disc(*at + RING_LIFT * 0.5, 0.48, SHADOW);
+            ground.disc(*at + RING_LIFT * 0.5, 0.48, ui().shadow);
         }
-        ground.ring(*at + RING_LIFT, 0.50, 0.62, FRIEND);
+        ground.ring(*at + RING_LIFT, 0.50, 0.62, ui().friend);
     }
     ground.draw();
     for (unit, at, yaw) in &standing {
@@ -1023,7 +1333,7 @@ fn draw_planning(app: &mut App, layout: &Layout) {
     view.end();
 
     if !own {
-        text_centered(&format!("{}'s board", player.name), layout.board_mid_x, view.area.y + 22.0, 20.0, MUTED);
+        text_centered(&format!("{}'s board", player.name), layout.board_mid_x, view.area.y + 22.0, 20.0, ui().muted);
     }
 
     // Flat markers on top of the scene, and what the mouse is over.
@@ -1042,7 +1352,7 @@ fn draw_planning(app: &mut App, layout: &Layout) {
     let pressed_unit = hovered.as_ref().filter(|_| is_mouse_button_pressed(MouseButton::Left)).map(|u| u.uid);
     if layout.bench_slots > 0 {
         let first = view.project(layout.bench_world(0) + vec3(-1.0, 0.0, 0.0));
-        label("Bench", (first.x - 50.0).max(layout.left_w + 6.0), first.y + 5.0, 18.0, MUTED);
+        label("Bench", (first.x - 50.0).max(layout.left_w + 6.0), first.y + 5.0, 18.0, ui().muted);
     }
 
     // Item inventory.
@@ -1058,7 +1368,7 @@ fn draw_planning(app: &mut App, layout: &Layout) {
         }
     }
     if !player.items.is_empty() {
-        label("Items", layout.item_slot(0).x - 62.0, layout.item_slot(0).y + 24.0, 18.0, MUTED);
+        label("Items", layout.item_slot(0).x - 62.0, layout.item_slot(0).y + 24.0, 18.0, ui().muted);
     }
 
     if own {
@@ -1098,8 +1408,13 @@ fn draw_planning(app: &mut App, layout: &Layout) {
 
 fn draw_item(app: &App, item: &str, r: Rect) {
     let name = app.state.display_name(item);
+    if let Some(icon) = app.icons.borrow_mut().get(item) {
+        draw_texture_ex(&icon, r.x, r.y, WHITE, DrawTextureParams { dest_size: Some(vec2(r.w, r.h)), ..Default::default() });
+        draw_rectangle_lines(r.x, r.y, r.w, r.h, 2.0, ui().gold);
+        return;
+    }
     draw_rectangle(r.x, r.y, r.w, r.h, unit_color(&name));
-    draw_rectangle_lines(r.x, r.y, r.w, r.h, 2.0, GOLD_COLOR);
+    draw_rectangle_lines(r.x, r.y, r.w, r.h, 2.0, ui().gold);
     let initials: String = name.split_whitespace().filter_map(|w| w.chars().next()).take(2).collect();
     text_centered(&initials, r.x + r.w / 2.0, r.y + r.h / 2.0 + 6.0, 18.0, WHITE);
 }
@@ -1118,14 +1433,14 @@ fn draw_unit_tooltip(app: &App, unit: &OwnedUnit, at: Vec2) {
     for item in &unit.items {
         lines.push(format!("Item: {}", app.state.display_name(item)));
     }
-    let width = lines.iter().map(|l| measure_text(l, None, 17, 1.0).width).fold(0.0, f32::max) + 20.0;
+    let width = lines.iter().map(|l| theme::text_width(l, 17.0)).fold(0.0, f32::max) + 20.0;
     let height = lines.len() as f32 * 20.0 + 12.0;
     let x = (at.x + 16.0).min(screen_width() - width - 4.0);
     let y = (at.y + 16.0).min(screen_height() - height - 4.0);
     draw_rectangle(x, y, width, height, Color::new(0.05, 0.06, 0.08, 0.95));
-    draw_rectangle_lines(x, y, width, height, 1.0, MUTED);
+    draw_rectangle_lines(x, y, width, height, 1.0, ui().muted);
     for (i, line) in lines.iter().enumerate() {
-        label(line, x + 10.0, y + 22.0 + i as f32 * 20.0, 17.0, if i == 0 { TEXT } else { MUTED });
+        label(line, x + 10.0, y + 22.0 + i as f32 * 20.0, 17.0, if i == 0 { ui().text } else { ui().muted });
     }
 }
 
@@ -1142,13 +1457,18 @@ fn draw_shop(app: &mut App, layout: &Layout, player: &Player) {
         };
         let affordable = player.gold >= def.cost as i64;
         let hover = r.contains(vec2(mx, my)) && app.drag.is_none();
-        panel(r.x, r.y, r.w, r.h, if hover { PANEL_LIGHT } else { PANEL });
+        panel(r.x, r.y, r.w, r.h, if hover { ui().panel_light } else { ui().panel });
         draw_rectangle(r.x, r.y, r.w, 5.0, unit_color(&def.name));
-        draw_unit_token(vec2(r.x + 28.0, r.y + 38.0), 18.0, &def.name, 1, 0, true, None);
-        label(&def.name, r.x + 8.0, r.y + 76.0, 16.0, if affordable { TEXT } else { MUTED });
+        if let Some(icon) = app.icons.borrow_mut().get(&def.id) {
+            let params = DrawTextureParams { dest_size: Some(vec2(44.0, 44.0)), ..Default::default() };
+            draw_texture_ex(&icon, r.x + 6.0, r.y + 16.0, WHITE, params);
+        } else {
+            draw_unit_token(vec2(r.x + 28.0, r.y + 38.0), 18.0, &def.name, 1, 0, true, None);
+        }
+        label(&def.name, r.x + 8.0, r.y + 76.0, 16.0, if affordable { ui().text } else { ui().muted });
         let traits: Vec<String> = def.traits.iter().map(|t| app.state.display_name(t)).collect();
-        label(&traits.join(", "), r.x + 8.0, r.y + 94.0, 14.0, MUTED);
-        label(&format!("{}g", def.cost), r.x + r.w - 30.0, r.y + 42.0, 20.0, GOLD_COLOR);
+        label(&traits.join(", "), r.x + 8.0, r.y + 94.0, 14.0, ui().muted);
+        label(&format!("{}g", def.cost), r.x + r.w - 30.0, r.y + 42.0, 20.0, ui().gold);
         if hover && is_mouse_button_pressed(MouseButton::Left) {
             buy = Some(i);
         }
@@ -1230,7 +1550,7 @@ fn draw_choice(app: &mut App, layout: &Layout) {
     let x0 = layout.board_mid_x - total_w / 2.0;
     let y0 = layout.view.area.y + 70.0;
     draw_rectangle(x0 - 16.0, y0 - 44.0, total_w + 32.0, rows * (ch + gap) + 56.0, Color::new(0.04, 0.05, 0.07, 0.94));
-    text_centered(&title, layout.board_mid_x, y0 - 14.0, 24.0, if my_turn { GOLD_COLOR } else { MUTED });
+    text_centered(&title, layout.board_mid_x, y0 - 14.0, 24.0, if my_turn { ui().gold } else { ui().muted });
     let (mx, my) = mouse_position();
     let mut pick = None;
     for (i, option) in options.iter().enumerate() {
@@ -1242,20 +1562,20 @@ fn draw_choice(app: &mut App, layout: &Layout) {
         );
         let Some(option) = option else {
             panel(r.x, r.y, r.w, r.h, Color::new(0.09, 0.10, 0.13, 1.0));
-            text_centered("taken", r.x + r.w / 2.0, r.y + r.h / 2.0, 18.0, MUTED);
+            text_centered("taken", r.x + r.w / 2.0, r.y + r.h / 2.0, 18.0, ui().muted);
             continue;
         };
         let hover = my_turn && r.contains(vec2(mx, my));
-        panel(r.x, r.y, r.w, r.h, if hover { PANEL_LIGHT } else { PANEL });
+        panel(r.x, r.y, r.w, r.h, if hover { ui().panel_light } else { ui().panel });
         let parts: Vec<&str> = option.split(" + ").collect();
         let name = app.state.display_name(parts[0]);
         draw_rectangle(r.x, r.y, r.w, 5.0, unit_color(&name));
-        label(&name, r.x + 10.0, r.y + 30.0, 18.0, TEXT);
+        label(&name, r.x + 10.0, r.y + 30.0, 18.0, ui().text);
         let content = app.state.content.as_ref();
         if let Some(item) = parts.get(1) {
-            label(&format!("with {}", app.state.display_name(item)), r.x + 10.0, r.y + 52.0, 15.0, GOLD_COLOR);
+            label(&format!("with {}", app.state.display_name(item)), r.x + 10.0, r.y + 52.0, 15.0, ui().gold);
         } else if let Some(aug) = content.and_then(|c| c.augment(parts[0])) {
-            draw::wrapped(&aug.description, r.x + 10.0, r.y + 52.0, r.w - 20.0, 15.0, MUTED);
+            draw::wrapped(&aug.description, r.x + 10.0, r.y + 52.0, r.w - 20.0, 15.0, ui().muted);
         }
         if hover && is_mouse_button_pressed(MouseButton::Left) {
             pick = Some(i);
@@ -1339,7 +1659,6 @@ fn draw_replay(app: &mut App, layout: &Layout) {
             continue;
         }
         use autoengine::effect::DamageKind;
-        use fx::Burst;
         let particles = app.settings.particles;
         match flash {
             Flash::Attack { source, target } => {
@@ -1347,40 +1666,40 @@ fn draw_replay(app: &mut App, layout: &Layout) {
                     && a.distance(b) > 2.2
                     && particles
                 {
-                    app.particles.bolt(a + chest, b + chest, 0.12, Color::new(1.0, 0.85, 0.45, 1.0));
+                    app.particles.bolt(a + chest, b + chest, 0.12, app.theme.effects.bolt);
                 }
             }
             Flash::Damage { target, amount, kind, crit, .. } => {
                 cues.push(Sfx::Hit);
                 if let Some(at) = world_of(&show.playback, *target).filter(|_| particles && *amount > 0) {
-                    let color = match kind {
-                        DamageKind::Physical => Color::new(1.0, 0.60, 0.25, 1.0),
-                        DamageKind::Magic => Color::new(0.50, 0.65, 1.0, 1.0),
-                        DamageKind::True => WHITE,
+                    let effects = app.theme.effects;
+                    let mut burst = match kind {
+                        DamageKind::Physical => effects.hit_physical,
+                        DamageKind::Magic => effects.hit_magic,
+                        DamageKind::True => effects.hit_true,
                     };
-                    let count = if *crit { 16 } else { 7 };
-                    app.particles.burst(at + chest, Burst { count, color, speed: 2.4, life: 0.45, size: 0.13, gravity: 6.0 });
+                    if *crit {
+                        burst.count = burst.count * effects.crit_percent as usize / 100;
+                    }
+                    app.particles.burst(at + chest, burst);
                 }
             }
             Flash::Heal { target, .. } => {
                 cues.push(Sfx::Heal);
                 if let Some(at) = world_of(&show.playback, *target).filter(|_| particles) {
-                    let color = Color::new(0.45, 1.0, 0.55, 1.0);
-                    app.particles.burst(at + chest * 0.5, Burst { count: 9, color, speed: 0.9, life: 0.9, size: 0.12, gravity: -2.5 });
+                    app.particles.burst(at + chest * 0.5, app.theme.effects.heal);
                 }
             }
             Flash::Cast { unit } => {
                 cues.push(Sfx::Cast);
                 if let Some(at) = world_of(&show.playback, *unit).filter(|_| particles) {
-                    let color = Color::new(0.50, 0.78, 1.0, 1.0);
-                    app.particles.burst(at + chest, Burst { count: 22, color, speed: 2.6, life: 0.6, size: 0.14, gravity: 0.0 });
+                    app.particles.burst(at + chest, app.theme.effects.cast);
                 }
             }
             Flash::Death { unit } => {
                 cues.push(Sfx::Death);
                 if let Some(at) = world_of(&show.playback, *unit).filter(|_| particles) {
-                    let color = Color::new(0.75, 0.75, 0.80, 0.9);
-                    app.particles.burst(at + chest * 0.6, Burst { count: 26, color, speed: 1.5, life: 0.9, size: 0.2, gravity: -0.8 });
+                    app.particles.burst(at + chest * 0.6, app.theme.effects.death);
                 }
             }
         }
@@ -1404,12 +1723,12 @@ fn draw_replay(app: &mut App, layout: &Layout) {
         let (q, r) = u.position_at(now);
         let at = place(q, r) + RING_LIFT;
         if app.settings.shadows {
-            ground.disc(at - RING_LIFT * 0.5, 0.48, SHADOW);
+            ground.disc(at - RING_LIFT * 0.5, 0.48, ui().shadow);
         }
-        ground.ring(at, 0.50, 0.62, if u.team.0 == my_team { FRIEND } else { ENEMY });
+        ground.ring(at, 0.50, 0.62, if u.team.0 == my_team { ui().friend } else { ui().enemy });
         if u.casting {
             let pulse = 0.72 + 0.06 * (now as f32 / 90.0).sin();
-            ground.ring(at, pulse, pulse + 0.10, ACCENT);
+            ground.ring(at, pulse, pulse + 0.10, ui().accent);
         }
     }
     for (age, flash) in show.playback.recent_flashes(450) {
@@ -1450,7 +1769,7 @@ fn draw_replay(app: &mut App, layout: &Layout) {
     view.end();
 
     // Flat markers on top: health, numbers, lines.
-    text_centered(&show.title, layout.board_mid_x, view.area.y + 24.0, 22.0, TEXT);
+    text_centered(&show.title, layout.board_mid_x, view.area.y + 24.0, 22.0, ui().text);
     let head_of = |playback: &Playback, id| {
         playback.unit(id).zip(world_of(playback, id)).map(|(u, at)| {
             let height = app.look_of_name(&u.name).height();
@@ -1462,7 +1781,7 @@ fn draw_replay(app: &mut App, layout: &Layout) {
         let full = u.max_health.max(1) as f32;
         draw_health_bar(head, (size * 1.1).clamp(28.0, 70.0), u.health as f32 / full, u.shield as f32 / full, u.team.0 == my_team);
         if u.stunned_until_ms > now {
-            text_centered("stun", head.x, head.y - 8.0, 14.0, GOLD_COLOR);
+            text_centered("stun", head.x, head.y - 8.0, 14.0, ui().gold);
         }
     }
 
@@ -1522,9 +1841,9 @@ fn draw_replay(app: &mut App, layout: &Layout) {
             Some(_) => "Defeat".to_string(),
             None => "Draw".to_string(),
         };
-        text_centered(&result, layout.board_mid_x, footer_y, 36.0, GOLD_COLOR);
+        text_centered(&result, layout.board_mid_x, footer_y, 36.0, ui().gold);
     } else {
-        text_centered(&format!("{secs:.1}s   (Space to skip)"), layout.board_mid_x, footer_y, 18.0, MUTED);
+        text_centered(&format!("{secs:.1}s   (Space to skip)"), layout.board_mid_x, footer_y, 18.0, ui().muted);
     }
     app.show = Some(show);
 }
@@ -1542,15 +1861,15 @@ fn draw_game_over(app: &App) {
         Some(id) => format!("{} wins", app.state.player_name(id)),
         None => "Game over".to_string(),
     };
-    text_centered(&title, w / 2.0, h / 2.0 - 150.0, 40.0, GOLD_COLOR);
+    text_centered(&title, w / 2.0, h / 2.0 - 150.0, 40.0, ui().gold);
     let mut players: Vec<&Player> = view.players.iter().collect();
     players.sort_by_key(|p| p.placement.unwrap_or(u32::MAX));
     for (i, p) in players.iter().enumerate() {
         let y = h / 2.0 - 100.0 + i as f32 * 30.0;
-        let color = if Some(p.id) == app.state.seat { GOLD_COLOR } else { TEXT };
-        label(&format!("{}.", p.placement.unwrap_or(0)), w / 2.0 - 180.0, y, 22.0, MUTED);
+        let color = if Some(p.id) == app.state.seat { ui().gold } else { ui().text };
+        label(&format!("{}.", p.placement.unwrap_or(0)), w / 2.0 - 180.0, y, 22.0, ui().muted);
         label(&p.name, w / 2.0 - 140.0, y, 22.0, color);
-        label(&format!("level {}", p.level), w / 2.0 + 80.0, y, 18.0, MUTED);
+        label(&format!("level {}", p.level), w / 2.0 + 80.0, y, 18.0, ui().muted);
     }
 }
 

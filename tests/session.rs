@@ -324,6 +324,8 @@ fn a_client_can_play_over_tcp() {
     assert!(fights >= 3);
 
     drop(ana);
+    // Give the server a moment to see the closed socket before stopping it.
+    std::thread::sleep(Duration::from_millis(500));
     stop.store(true, Ordering::Relaxed);
     let session = server.join().unwrap();
     assert!(session.has_started());
@@ -360,4 +362,36 @@ fn recorded_fights_can_be_loaded_and_verified() {
     replay.record.teams.clear();
     assert_eq!(replay.verify(), Err(ReplayError::NoTeams));
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn developer_commands_need_the_server_to_allow_them() {
+    use autoengine::protocol::DevCommand;
+    assert_eq!(DevCommand::parse("gold 50"), Ok(DevCommand::Gold(50)));
+    assert_eq!(DevCommand::parse("  unit ashen_hound "), Ok(DevCommand::Unit("ashen_hound".into())));
+    assert_eq!(DevCommand::parse("skip"), Ok(DevCommand::Skip));
+    assert!(DevCommand::parse("gold lots").is_err() && DevCommand::parse("fly").is_err() && DevCommand::parse("").is_err());
+
+    let errors = |s: &mut Session| s.drain_outbox().into_iter().filter(|(_, m)| matches!(m, ServerMsg::Error { .. })).count();
+    let mut s = session(2);
+    s.handle(1, ClientMsg::Join { name: "Ana".into(), version: PROTOCOL_VERSION, token: None }, 0);
+    s.handle(1, ClientMsg::Start, 0);
+    s.drain_outbox();
+    let gold = s.game().unwrap().players()[0].gold;
+    s.handle(1, ClientMsg::Dev(DevCommand::Gold(50)), 1);
+    assert_eq!(errors(&mut s), 1, "off by default");
+    assert_eq!(s.game().unwrap().players()[0].gold, gold);
+
+    s.allow_dev(true);
+    s.handle(1, ClientMsg::Dev(DevCommand::Gold(50)), 2);
+    s.handle(1, ClientMsg::Dev(DevCommand::Unit("ashen_hound".into())), 3);
+    assert_eq!(errors(&mut s), 0);
+    let me = &s.game().unwrap().players()[0];
+    assert_eq!(me.gold, gold + 50);
+    assert!(me.units().any(|u| u.unit == "ashen_hound"));
+    s.handle(1, ClientMsg::Dev(DevCommand::Item("no_such_item".into())), 4);
+    assert_eq!(errors(&mut s), 1);
+    let round = s.game().unwrap().round_index();
+    s.handle(1, ClientMsg::Dev(DevCommand::Skip), 5);
+    assert!(s.game().unwrap().round_index() > round || !s.game().unwrap().in_round());
 }
