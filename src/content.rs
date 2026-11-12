@@ -436,6 +436,31 @@ impl std::fmt::Display for ContentError {
 
 impl std::error::Error for ContentError {}
 
+/// " (did you mean `x`?)" for the known id closest to a mistyped one, or
+/// nothing if none is close.
+fn suggestion<'a>(wrong: &str, known: impl Iterator<Item = &'a String>) -> String {
+    fn distance(a: &str, b: &str) -> usize {
+        let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+        let mut row: Vec<usize> = (0..=b.len()).collect();
+        for i in 1..=a.len() {
+            let mut previous = row[0];
+            row[0] = i;
+            for j in 1..=b.len() {
+                let swap = previous + usize::from(a[i - 1] != b[j - 1]);
+                previous = row[j];
+                row[j] = swap.min(row[j] + 1).min(row[j - 1] + 1);
+            }
+        }
+        row[b.len()]
+    }
+    let limit = (wrong.chars().count() / 3).max(1);
+    known
+        .map(|id| (distance(wrong, id), id))
+        .filter(|(d, _)| *d <= limit)
+        .min()
+        .map_or(String::new(), |(_, id)| format!(" (did you mean `{id}`?)"))
+}
+
 fn invalid<T>(message: String) -> Result<T, ContentError> {
     Err(ContentError::Invalid(message))
 }
@@ -488,8 +513,16 @@ impl ContentSet {
     /// Adds scripts, given as name and source, after checking that they
     /// compile. A script named `x` defines the round kind `x`.
     pub fn with_scripts(mut self, scripts: BTreeMap<String, String>) -> Result<Self, ContentError> {
+        #[cfg(feature = "scripting")]
         crate::script::ScriptHost::compile(&scripts)
             .map_err(|e| ContentError::Parse { file: format!("scripts/{}.rhai", e.script), message: e.message })?;
+        #[cfg(not(feature = "scripting"))]
+        if let Some(name) = scripts.keys().next() {
+            return Err(ContentError::Parse {
+                file: format!("scripts/{name}.rhai"),
+                message: "this build of the engine has scripting turned off (the `scripting` cargo feature)".into(),
+            });
+        }
         self.scripts = scripts;
         Ok(self)
     }
@@ -607,7 +640,7 @@ impl ContentSet {
             if self.traits.contains_key(id) {
                 Ok(())
             } else {
-                invalid(format!("{owner} refers to unknown trait `{id}`"))
+                invalid(format!("{owner} refers to unknown trait `{id}`{}", suggestion(id, self.traits.keys())))
             }
         };
         let check_effects = |owner: &str, effects: &[EffectSpec]| {
@@ -615,7 +648,7 @@ impl ContentSet {
                 if let Effect::Summon { unit, .. } = &spec.effect
                     && !self.units.contains_key(unit)
                 {
-                    return invalid(format!("{owner} summons unknown unit `{unit}`"));
+                    return invalid(format!("{owner} summons unknown unit `{unit}`{}", suggestion(unit, self.units.keys())));
                 }
                 if let Effect::ApplyStatus { status: StatusKind::StatMods(mods), .. } = &spec.effect
                     && mods.is_empty()
@@ -663,7 +696,7 @@ impl ContentSet {
             if let Some((a, b)) = &i.recipe {
                 for part in [a, b] {
                     if !self.items.contains_key(part) {
-                        return invalid(format!("{owner} is built from unknown item `{part}`"));
+                        return invalid(format!("{owner} is built from unknown item `{part}`{}", suggestion(part, self.items.keys())));
                     }
                 }
             }
@@ -744,11 +777,11 @@ impl ContentSet {
     // ----- building teams -------------------------------------------------
 
     fn unit_def(&self, id: &str) -> Result<&UnitDef, ContentError> {
-        self.units.get(id).ok_or_else(|| ContentError::Invalid(format!("unknown unit `{id}`")))
+        self.units.get(id).ok_or_else(|| ContentError::Invalid(format!("unknown unit `{id}`{}", suggestion(id, self.units.keys()))))
     }
 
     fn item_def(&self, id: &str) -> Result<&ItemDef, ContentError> {
-        self.items.get(id).ok_or_else(|| ContentError::Invalid(format!("unknown item `{id}`")))
+        self.items.get(id).ok_or_else(|| ContentError::Invalid(format!("unknown item `{id}`{}", suggestion(id, self.items.keys()))))
     }
 
     /// The traits a board unit counts as having: its own plus any granted

@@ -1,3 +1,4 @@
+#![cfg(feature = "scripting")]
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -186,4 +187,46 @@ fn rust_hooks_see_every_event_including_their_own() {
     assert_eq!(seen.first().map(String::as_str), Some("1-1"));
     assert!(seen.iter().any(|s| s == "gold"));
     assert!(g.player(P0).gold > gold);
+}
+
+#[test]
+fn the_script_reference_matches_the_engine() {
+    use autoengine::script::{API, EVENTS};
+
+    // Every documented function can be called: a script that calls them all
+    // runs without a "not found" error.
+    let mut body = String::new();
+    for (signature, _) in API {
+        let call = signature.replace("(p", "(0").replace(", n)", ", 1)").replace("(n)", "(1)");
+        body.push_str(&format!("    game.{call};\n"));
+    }
+    let source = format!("fn finish(game) {{\n{body}}}\n");
+    let content = sample().with_scripts([("everything".to_string(), source)].into()).unwrap();
+    let custom = RoundDef {
+        name: "all".into(),
+        stage: 1,
+        kind: RoundKindDef::Custom { kind: "everything".into(), params: Default::default() },
+    };
+    let content = content.with_schedule(Schedule { rounds: vec![custom], repeat_from: 0 }).unwrap();
+    let mut game = Game::new(content, 1, &["A", "B"]);
+    game.begin_round().unwrap();
+    game.finish_round().unwrap();
+    for event in game.drain_events() {
+        if let GameEvent::Script { message, .. } = event {
+            assert!(!message.contains("not found"), "{message}");
+        }
+    }
+
+    // Every event is documented with the fields it really has.
+    let source = include_str!("../src/game.rs");
+    let start = source.find("pub enum GameEvent {").unwrap();
+    let block = &source[start..start + source[start..].find("\n}").unwrap()];
+    let mut real = Vec::new();
+    for line in block.lines().skip(1).map(str::trim).filter(|l| !l.starts_with("//")) {
+        let (name, rest) = line.split_once(" {").expect("every event has fields");
+        let fields: Vec<&str> = rest.trim_end_matches("},").split(',').filter_map(|f| f.split(':').next()).map(str::trim).filter(|f| !f.is_empty()).collect();
+        real.push((name.to_string(), fields.join(", ")));
+    }
+    let documented: Vec<(String, String)> = EVENTS.iter().map(|(k, f)| (k.to_string(), f.to_string())).collect();
+    assert_eq!(documented, real);
 }

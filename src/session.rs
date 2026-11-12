@@ -21,6 +21,9 @@ use crate::protocol::DevCommand;
 use crate::protocol::{ClientMsg, ContentInfo, GameView, PROTOCOL_VERSION, ServerMsg, ViewPhase, visible_to};
 use crate::rng::Rng;
 
+/// Something to run on a game when it starts.
+type Setup = Box<dyn FnMut(&mut Game) + Send>;
+
 /// Identifies a connection to the transport.
 pub type ConnId = u64;
 
@@ -76,6 +79,8 @@ pub struct Session {
     /// Where to save every fight as a replay file, if anywhere.
     record_dir: Option<std::path::PathBuf>,
     dev: bool,
+    /// Run on the game when it starts; see [`Session::on_start`].
+    setup: Option<Setup>,
     phase: Phase,
     bot_rng: Rng,
     /// Source of seat tokens; seeded from the clock, never from the game seed.
@@ -122,6 +127,14 @@ impl Session {
         self.broadcast(now);
     }
 
+    /// Runs `setup` on the game when it starts, before the first round.
+    /// This is where a game written in Rust adds its own round types
+    /// ([`Game::register_round_type`]) and hooks ([`Game::add_hook`]) to a
+    /// hosted game.
+    pub fn on_start(&mut self, setup: impl FnMut(&mut Game) + Send + 'static) {
+        self.setup = Some(Box::new(setup));
+    }
+
     /// Saves every fight from now on as a replay file in `dir`.
     pub fn record_to(&mut self, dir: impl Into<std::path::PathBuf>) {
         self.record_dir = Some(dir.into());
@@ -136,6 +149,7 @@ impl Session {
             game: None,
             record_dir: None,
             dev: false,
+            setup: None,
             phase: Phase::Lobby,
             bot_rng: Rng::new(config.seed ^ 0xB075),
             token_rng: Rng::new(
@@ -336,7 +350,11 @@ impl Session {
             }
         }
         let names: Vec<&str> = self.seats.iter().map(|s| s.name.as_deref().unwrap()).collect();
-        self.game = Some(Game::new(self.content.clone(), self.config.seed, &names));
+        let mut game = Game::new(self.content.clone(), self.config.seed, &names);
+        if let Some(setup) = &mut self.setup {
+            setup(&mut game);
+        }
+        self.game = Some(game);
         self.phase = Phase::Showing { until: now };
         self.send_lobby();
         self.next_round(now);

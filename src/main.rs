@@ -1,32 +1,124 @@
-//! Headless command-line runner.
-//!
-//! * `autoengine fight [seed] [--quiet] [--content DIR] [--match FILE]` runs
-//!   one fight described in data files and prints its event log.
-//! * `autoengine lobby [seed] [--players N] [--quiet] [--content DIR]` plays
-//!   a whole game between bots and prints what happens each round.
-//!
-//! With no subcommand, `fight` is assumed.
+//! The `autoengine` command-line tool: everything a game's developers do
+//! without opening the client. Run `autoengine help` for the list of
+//! commands; each one is a small function in this file built on the
+//! library's public API, so it doubles as an example of using it.
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use autoengine::bot;
 use autoengine::combat::{Combat, EventKind, Team, UnitId};
-use autoengine::game::{Game, GameEvent, Opponent, PlayerId};
-use autoengine::rng::Rng;
 use autoengine::content::{ContentSet, MatchSetup, parse_ron};
 use autoengine::effect::StatusKind;
+use autoengine::game::{Game, GameEvent, Opponent, PlayerId};
+use autoengine::rng::Rng;
 use autoengine::stats::Stat;
-
-const USAGE: &str = "usage: autoengine fight [seed] [--quiet] [--content DIR] [--match FILE]
-       autoengine lobby [seed] [--players N] [--quiet] [--content DIR]
-       autoengine replay FILE...
-       autoengine check [DIR]
-       autoengine sim [--games N] [--players N] [--seed N] [--content DIR]";
+use autoengine::tools;
 
 const BOT_NAMES: [&str; 8] = ["Aldra", "Brask", "Cyrene", "Dovik", "Elowen", "Fenn", "Garrick", "Hesper"];
 
+/// One subcommand: its name, its arguments, what it does and the function
+/// that runs it.
+struct Command {
+    name: &'static str,
+    args: &'static str,
+    about: &'static str,
+    run: fn(&mut Args) -> Result<(), String>,
+}
+
+const COMMANDS: &[Command] = &[
+    Command { name: "new", args: "DIR", about: "write a small starter game to build on", run: new },
+    Command { name: "check", args: "[DIR] [--watch]", about: "look for mistakes in a content folder", run: check },
+    Command { name: "test", args: "[DIR] [--filter TEXT]", about: "run the fights in tests.ron and check their results", run: test },
+    Command { name: "fight", args: "[SEED] [--quiet] [--content DIR] [--match FILE | --test NAME]", about: "run one fight and print what happens", run: fight },
+    Command { name: "lobby", args: "[SEED] [--players N] [--quiet] [--content DIR]", about: "bots play a whole game", run: lobby },
+    Command { name: "sim", args: "[--games N] [--players N] [--seed N] [--content DIR] [--json]", about: "bots play many games; prints a balance table", run: sim },
+    Command { name: "bench", args: "[--fights N] [--games N] [--content DIR]", about: "measure how fast fights and games run", run: bench },
+    Command { name: "replay", args: "FILE...", about: "fight saved replays again and report any that changed", run: replay },
+    Command { name: "api", args: "", about: "print what scripts can do", run: api },
+];
+
+fn help() -> String {
+    let mut out = String::from("usage: autoengine COMMAND [ARGS]\n\n");
+    for c in COMMANDS {
+        out.push_str(&format!("  {:<7} {}\n          autoengine {} {}\n", c.name, c.about, c.name, c.args));
+    }
+    out.push_str("\nDIR and --content default to ./content.");
+    out
+}
+
+/// The arguments after the subcommand. Commands take out the flags they
+/// know; anything left over is a mistake.
+struct Args {
+    command: &'static Command,
+    rest: Vec<String>,
+}
+
+impl Args {
+    fn usage(&self) -> String {
+        format!("usage: autoengine {} {}", self.command.name, self.command.args)
+    }
+
+    /// Whether a flag such as `--quiet` was given.
+    fn flag(&mut self, name: &str) -> bool {
+        let found = self.rest.iter().position(|a| a == name);
+        found.map(|i| self.rest.remove(i)).is_some()
+    }
+
+    /// The value after a flag such as `--content DIR`.
+    fn value(&mut self, name: &str) -> Result<Option<String>, String> {
+        let Some(i) = self.rest.iter().position(|a| a == name) else { return Ok(None) };
+        if i + 1 >= self.rest.len() {
+            return Err(format!("{name} needs a value\n{}", self.usage()));
+        }
+        self.rest.remove(i);
+        Ok(Some(self.rest.remove(i)))
+    }
+
+    fn number(&mut self, name: &str, default: u64, range: std::ops::RangeInclusive<u64>) -> Result<u64, String> {
+        match self.value(name)? {
+            None => Ok(default),
+            Some(text) => text
+                .parse()
+                .ok()
+                .filter(|n| range.contains(n))
+                .ok_or(format!("{name} must be a number from {} to {}", range.start(), range.end())),
+        }
+    }
+
+    /// The next argument that is not a flag.
+    fn positional(&mut self) -> Option<String> {
+        let i = self.rest.iter().position(|a| !a.starts_with("--"))?;
+        Some(self.rest.remove(i))
+    }
+
+    fn content_dir(&mut self) -> Result<String, String> {
+        Ok(self.value("--content")?.unwrap_or_else(|| "content".to_string()))
+    }
+
+    /// Fails if anything was not understood.
+    fn done(&self) -> Result<(), String> {
+        match self.rest.first() {
+            None => Ok(()),
+            Some(extra) => Err(format!("did not understand \"{extra}\"\n{}", self.usage())),
+        }
+    }
+}
+
 fn main() -> ExitCode {
-    match run() {
+    let mut args = std::env::args().skip(1);
+    let name = args.next().unwrap_or_else(|| "help".to_string());
+    if matches!(name.as_str(), "help" | "--help" | "-h") {
+        println!("{}", help());
+        return ExitCode::SUCCESS;
+    }
+    let Some(command) = COMMANDS.iter().find(|c| c.name == name) else {
+        eprintln!("there is no command called \"{name}\"\n\n{}", help());
+        return ExitCode::from(2);
+    };
+    let mut args = Args { command, rest: args.collect() };
+    match (command.run)(&mut args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("{message}");
@@ -35,9 +127,32 @@ fn main() -> ExitCode {
     }
 }
 
-/// Loads a content folder and reports errors and likely mistakes.
-fn check_content(dir: &str) -> Result<(), String> {
-    let content = ContentSet::load_dir(dir).map_err(|e| format!("error: {e}"))?;
+fn load(dir: &str) -> Result<ContentSet, String> {
+    ContentSet::load_dir(dir).map_err(|e| format!("error: {e}"))
+}
+
+fn new(args: &mut Args) -> Result<(), String> {
+    let dir = args.positional().ok_or_else(|| args.usage())?;
+    args.done()?;
+    let written = tools::scaffold::write_starter(Path::new(&dir))?;
+    println!("created {dir} with {} files:", written.len());
+    for file in &written {
+        println!("  {file}");
+    }
+    println!("\nNext: read {dir}/README.md, then try\n  autoengine check {dir}\n  autoengine test {dir}");
+    Ok(())
+}
+
+/// Loads a folder and prints errors and likely mistakes. Returns whether it
+/// was clean.
+fn check_once(dir: &str) -> bool {
+    let content = match load(dir) {
+        Ok(content) => content,
+        Err(message) => {
+            println!("{message}");
+            return false;
+        }
+    };
     println!(
         "{dir}: {} units, {} traits, {} items, {} augments, {} rounds, {} scripts",
         content.units().count(),
@@ -47,43 +162,162 @@ fn check_content(dir: &str) -> Result<(), String> {
         content.schedule().rounds.len(),
         content.scripts().len()
     );
-    let warnings = autoengine::tools::lint(&content, Some(std::path::Path::new(dir)));
+    let warnings = tools::lint(&content, Some(Path::new(dir)));
     for warning in &warnings {
         println!("warning: {warning}");
     }
     println!("{}", if warnings.is_empty() { "no problems found".to_string() } else { format!("{} warnings", warnings.len()) });
+    warnings.is_empty()
+}
+
+/// The newest change time of anything in a folder, for `--watch`.
+fn newest_change(dir: &Path) -> Option<std::time::SystemTime> {
+    let mut newest = None;
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(folder) = pending.pop() {
+        for entry in std::fs::read_dir(&folder).ok()?.flatten() {
+            let path: PathBuf = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if let Ok(time) = entry.metadata().and_then(|m| m.modified()) {
+                newest = newest.max(Some(time));
+            }
+        }
+    }
+    newest
+}
+
+fn check(args: &mut Args) -> Result<(), String> {
+    let watch = args.flag("--watch");
+    let dir = args.positional().unwrap_or_else(|| "content".to_string());
+    args.done()?;
+    if !watch {
+        // Mistakes that stop the content loading are errors; warnings are not.
+        load(&dir)?;
+        check_once(&dir);
+        return Ok(());
+    }
+    // Check again, and run the tests, every time a file is saved.
+    let mut seen = None;
+    loop {
+        let newest = newest_change(Path::new(&dir));
+        if newest != seen {
+            seen = newest;
+            println!("\n--- checking {dir} ---");
+            if check_once(&dir) || load(&dir).is_ok() {
+                let _ = run_tests(&dir, None);
+            }
+            println!("watching {dir} for changes (Ctrl+C to stop)");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+}
+
+/// Runs the fights in a folder's tests.ron. `Ok(true)` means all passed.
+fn run_tests(dir: &str, filter: Option<&str>) -> Result<bool, String> {
+    let content = load(dir)?;
+    let file = format!("{dir}/tests.ron");
+    let Ok(text) = std::fs::read_to_string(&file) else {
+        println!("{file} does not exist, so there are no tests to run");
+        return Ok(true);
+    };
+    let mut scenarios = tools::scenario::ScenarioFile::parse(&file, &text).map_err(|e| format!("error: {e}"))?;
+    if let Some(filter) = filter {
+        scenarios.tests.retain(|t| t.name.contains(filter));
+    }
+    let results = tools::scenario::run_all(&content, &scenarios);
+    for result in &results {
+        println!("{}  {} ({} runs)", if result.passed() { "ok    " } else { "FAILED" }, result.name, result.runs);
+        for failure in &result.failures {
+            println!("          {failure}");
+        }
+    }
+    let failed = results.iter().filter(|r| !r.passed()).count();
+    println!("{} tests, {} passed, {failed} failed", results.len(), results.len() - failed);
+    Ok(failed == 0)
+}
+
+fn test(args: &mut Args) -> Result<(), String> {
+    let filter = args.value("--filter")?;
+    let dir = args.positional().unwrap_or_else(|| "content".to_string());
+    args.done()?;
+    if run_tests(&dir, filter.as_deref())? { Ok(()) } else { Err("some tests failed".to_string()) }
+}
+
+fn sim(args: &mut Args) -> Result<(), String> {
+    let games = args.number("--games", 50, 1..=100_000)? as u32;
+    let players = args.number("--players", 8, 2..=8)? as usize;
+    let seed = args.number("--seed", 1, 0..=u64::MAX)?;
+    let json = args.flag("--json");
+    let dir = args.content_dir()?;
+    args.done()?;
+    let content = Arc::new(load(&dir)?);
+    let report = tools::simulate(content.clone(), games, players, seed);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?);
+    } else {
+        print!("{}", report.to_text(&content));
+    }
     Ok(())
 }
 
-/// Plays bot games and prints how units and traits did.
-fn run_sim(args: Vec<String>) -> Result<(), String> {
-    let (mut games, mut players, mut seed, mut dir) = (50u32, 8usize, 1u64, "content".to_string());
-    let mut args = args.into_iter();
-    while let Some(arg) = args.next() {
-        let mut number = || args.next().and_then(|v| v.parse::<u64>().ok()).ok_or(USAGE.to_string());
-        match arg.as_str() {
-            "--games" => games = number()?.clamp(1, 100_000) as u32,
-            "--players" => players = number()?.clamp(2, 8) as usize,
-            "--seed" => seed = number()?,
-            "--content" => dir = args.next().ok_or(USAGE)?,
-            _ => return Err(USAGE.to_string()),
-        }
+fn bench(args: &mut Args) -> Result<(), String> {
+    let fights = args.number("--fights", 200, 1..=1_000_000)? as u32;
+    let games = args.number("--games", 5, 0..=10_000)? as u32;
+    let dir = args.content_dir()?;
+    args.done()?;
+    let content = Arc::new(load(&dir)?);
+    if cfg!(debug_assertions) {
+        println!("note: this is a debug build; use `cargo run --release -- bench` for real numbers");
     }
-    let content = std::sync::Arc::new(ContentSet::load_dir(&dir).map_err(|e| e.to_string())?);
-    let report = autoengine::tools::simulate(content.clone(), games, players, seed);
-    print!("{}", report.to_text(&content));
+    let file = format!("{dir}/sample_match.ron");
+    match std::fs::read_to_string(&file) {
+        Ok(text) => {
+            let setup: MatchSetup = parse_ron(&file, &text).map_err(|e| e.to_string())?;
+            let t = tools::bench::fights(&content, &setup, fights)?;
+            println!(
+                "fights: {} in {:.2}s, {:.0} per second, {} microseconds each, {} ticks each",
+                t.count,
+                t.elapsed.as_secs_f64(),
+                t.per_second(),
+                t.micros_each(),
+                t.steps / t.count.max(1) as u64
+            );
+        }
+        Err(_) => println!("fights: skipped, {file} does not exist"),
+    }
+    if games > 0 {
+        let t = tools::bench::games(content, games, 8);
+        println!(
+            "games:  {} in {:.2}s, {:.1} per second, {} rounds each",
+            t.count,
+            t.elapsed.as_secs_f64(),
+            t.per_second(),
+            t.steps / t.count.max(1) as u64
+        );
+    }
+    Ok(())
+}
+
+fn api(args: &mut Args) -> Result<(), String> {
+    args.done()?;
+    #[cfg(feature = "scripting")]
+    print!("{}", autoengine::script::api_reference());
+    #[cfg(not(feature = "scripting"))]
+    println!("this build of the engine has scripting turned off");
     Ok(())
 }
 
 /// Re-runs saved fights and reports whether the engine still plays them
 /// out exactly as recorded.
-fn check_replays(files: Vec<String>) -> Result<(), String> {
+fn replay(args: &mut Args) -> Result<(), String> {
+    let files = std::mem::take(&mut args.rest);
     if files.is_empty() {
-        return Err(USAGE.to_string());
+        return Err(args.usage());
     }
     let mut failed = 0;
     for file in &files {
-        let replay = autoengine::replay::ReplayFile::load(std::path::Path::new(file))?;
+        let replay = autoengine::replay::ReplayFile::load(Path::new(file))?;
         let record = &replay.record;
         let result = match record.winner {
             Some(team) => format!("team {} wins", team.0 + 1),
@@ -107,54 +341,48 @@ fn check_replays(files: Vec<String>) -> Result<(), String> {
     if failed > 0 { Err(format!("{failed} of {} replays no longer match", files.len())) } else { Ok(()) }
 }
 
-fn run() -> Result<(), String> {
-    let mut seed = 1u64;
-    let mut quiet = false;
-    let mut content_dir = "content".to_string();
-    let mut match_file: Option<String> = None;
-    let mut players = 8usize;
-    let mut lobby = false;
-    let mut args = std::env::args().skip(1).peekable();
-    match args.peek().map(String::as_str) {
-        Some("lobby") => {
-            lobby = true;
-            args.next();
-        }
-        Some("fight") => {
-            args.next();
-        }
-        Some("replay") => {
-            args.next();
-            return check_replays(args.collect());
-        }
-        Some("check") => {
-            args.next();
-            return check_content(&args.next().unwrap_or_else(|| "content".to_string()));
-        }
-        Some("sim") => {
-            args.next();
-            return run_sim(args.collect());
-        }
-        _ => {}
+fn lobby(args: &mut Args) -> Result<(), String> {
+    let quiet = args.flag("--quiet");
+    let players = args.number("--players", 8, 2..=8)? as usize;
+    let dir = args.content_dir()?;
+    let seed = seed_argument(args)?;
+    args.done()?;
+    play_lobby(load(&dir)?, seed, players, quiet)
+}
+
+/// An optional seed given as a bare number.
+fn seed_argument(args: &mut Args) -> Result<u64, String> {
+    match args.positional() {
+        None => Ok(1),
+        Some(text) => text.parse().map_err(|_| format!("the seed must be a number, not \"{text}\"")),
     }
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--quiet" => quiet = true,
-            "--players" => {
-                players = args.next().and_then(|n| n.parse().ok()).filter(|n| (2..=8).contains(n)).ok_or(USAGE)?
-            }
-            "--content" => content_dir = args.next().ok_or(USAGE)?,
-            "--match" => match_file = Some(args.next().ok_or(USAGE)?),
-            other => seed = other.parse().map_err(|_| USAGE.to_string())?,
+}
+
+fn fight(args: &mut Args) -> Result<(), String> {
+    let quiet = args.flag("--quiet");
+    let content_dir = args.content_dir()?;
+    let match_file = args.value("--match")?;
+    let test_name = args.value("--test")?;
+    let seed = seed_argument(args)?;
+    args.done()?;
+    let content = load(&content_dir)?;
+    let setup = match test_name {
+        // Watch the fight of one of the tests in tests.ron.
+        Some(name) => {
+            let file = format!("{content_dir}/tests.ron");
+            let text = std::fs::read_to_string(&file).map_err(|e| format!("cannot read {file}: {e}"))?;
+            let tests = tools::scenario::ScenarioFile::parse(&file, &text).map_err(|e| e.to_string())?.tests;
+            let found = tests.into_iter().find(|t| t.name.contains(&name));
+            let scenario = found.ok_or(format!("no test in {file} has \"{name}\" in its name"))?;
+            println!("test: {}", scenario.name);
+            MatchSetup { teams: scenario.teams }
         }
-    }
-    let content = ContentSet::load_dir(&content_dir).map_err(|e| e.to_string())?;
-    if lobby {
-        return run_lobby(content, seed, players, quiet);
-    }
-    let match_file = match_file.unwrap_or_else(|| format!("{content_dir}/sample_match.ron"));
-    let text = std::fs::read_to_string(&match_file).map_err(|e| format!("cannot read {match_file}: {e}"))?;
-    let setup: MatchSetup = parse_ron(&match_file, &text).map_err(|e| e.to_string())?;
+        None => {
+            let file = match_file.unwrap_or_else(|| format!("{content_dir}/sample_match.ron"));
+            let text = std::fs::read_to_string(&file).map_err(|e| format!("cannot read {file}: {e}"))?;
+            parse_ron(&file, &text).map_err(|e| e.to_string())?
+        }
+    };
 
     for (i, team) in setup.teams.iter().enumerate() {
         let traits = content.active_traits(&team.units).map_err(|e| e.to_string())?;
@@ -197,7 +425,7 @@ fn run() -> Result<(), String> {
 }
 
 /// Plays a full game between bots, printing a summary of every round.
-fn run_lobby(content: ContentSet, seed: u64, players: usize, quiet: bool) -> Result<(), String> {
+fn play_lobby(content: ContentSet, seed: u64, players: usize, quiet: bool) -> Result<(), String> {
     let mut game = Game::new(content, seed, &BOT_NAMES[..players]);
     let mut bot_rng = Rng::new(seed ^ 0xB07);
     let name = |game: &Game, id: PlayerId| game.player(id).name.clone();

@@ -19,8 +19,16 @@ path = "src/main.rs"
 name = "autoengine-server"
 path = "src/bin/server.rs"
 
+[features]
+default = ["scripting"]
+# Round types and rules written as Rhai scripts (the `script` module). Turn
+# it off with `default-features = false` to build the engine without the
+# script interpreter; content folders that contain scripts then fail to load
+# with a message saying why.
+scripting = ["dep:rhai"]
+
 [dependencies]
 ron = "0.12.3"
 serde = { version = "1.0.229", features = ["derive", "rc"] }
-rhai = { version = "1.27", features = ["sync", "only_i64", "no_float"] }
+rhai = { version = "1.27", features = ["sync", "only_i64", "no_float"], optional = true }
 serde_json = "1.0.154"

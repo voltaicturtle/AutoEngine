@@ -1,0 +1,16 @@
+// Augments: lasting bonuses a player picks in a Choice round.
+[
+    (id: "deep_pockets", name: "Deep Pockets", description: "Gain 10 gold now.", gold: 10),
+    (
+        id: "drilled",
+        name: "Drilled",
+        description: "Your team gains 15 armor.",
+        bonuses: [(scope: Team, mods: [(stat: Armor, flat: 15)])],
+    ),
+    (
+        id: "keen_eyes",
+        name: "Keen Eyes",
+        description: "Your team gains 10 attack damage.",
+        bonuses: [(scope: Team, mods: [(stat: AttackDamage, flat: 10)])],
+    ),
+]

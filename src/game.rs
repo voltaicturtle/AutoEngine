@@ -356,7 +356,9 @@ impl Game {
                 ready: false,
             })
             .collect();
+        #[cfg(feature = "scripting")]
         let scripts = content.scripts().clone();
+        #[cfg_attr(not(feature = "scripting"), allow(unused_mut))]
         let mut game = Game {
             content,
             rng: Rng::new(seed),
@@ -375,6 +377,7 @@ impl Game {
             hooks: Vec::new(),
             hooks_seen: 0,
         };
+        #[cfg(feature = "scripting")]
         if !scripts.is_empty() {
             // Content is checked when it is built, so this only fails for
             // scripts that never went through that check.

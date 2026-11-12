@@ -1,95 +1,16 @@
-//! Tools for people making a game: a content checker and a balance
-//! simulator. Both are plain functions so they can run from the command
-//! line (`autoengine check`, `autoengine sim`) or from a game's own tests.
+//! The balance simulator behind `autoengine sim`.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::Arc;
 
 use crate::bot;
 use crate::combat::Team;
-use crate::content::{ContentSet, RoundKindDef};
+use crate::content::ContentSet;
 use crate::game::{Game, Opponent};
 use crate::rng::Rng;
 
-/// Something in the content that loads but is probably a mistake.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Warning {
-    /// What the warning is about, such as `unit ashen_hound`.
-    pub subject: String,
-    pub message: String,
-}
-
-impl std::fmt::Display for Warning {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.subject, self.message)
-    }
-}
-
-/// Looks for likely mistakes in content that passed validation: things that
-/// can never be reached, files that are missing, rounds nothing implements.
-/// `assets` is the folder model files are looked up in, if they should be
-/// checked.
-pub fn lint(content: &ContentSet, assets: Option<&Path>) -> Vec<Warning> {
-    let mut warnings = Vec::new();
-    let mut warn = |subject: String, message: String| warnings.push(Warning { subject, message });
-    let rules = content.rules();
-
-    for unit in content.units() {
-        let subject = format!("unit {}", unit.id);
-        if unit.in_shop {
-            let cost = unit.cost as usize;
-            let offered = cost >= 1 && rules.levels.iter().any(|l| l.shop_odds.get(cost - 1).is_some_and(|w| *w > 0));
-            if !offered {
-                warn(subject.clone(), format!("costs {} but no player level has shop odds for that cost, so it never appears", unit.cost));
-            }
-            if unit.traits.is_empty() {
-                warn(subject.clone(), "is sold in the shop but has no traits".into());
-            }
-        }
-        match (&unit.model, assets) {
-            (Some(model), Some(dir)) if !dir.join(&model.file).is_file() => {
-                warn(subject.clone(), format!("model file {} is missing; clients will draw a stand-in", model.file));
-            }
-            (None, Some(_)) => warn(subject.clone(), "has no model; clients will draw a stand-in".into()),
-            _ => {}
-        }
-    }
-
-    for def in content.traits() {
-        let subject = format!("trait {}", def.id);
-        let members = content.units().filter(|u| u.in_shop && u.traits.contains(&def.id)).count() as u32;
-        let granted = content.items().filter(|i| i.grants_traits.contains(&def.id)).count() as u32;
-        if members == 0 {
-            warn(subject.clone(), "no unit in the shop has it".into());
-        }
-        // Each item can add the trait to one more unit.
-        for breakpoint in &def.breakpoints {
-            if breakpoint.count > members + granted {
-                warn(
-                    subject.clone(),
-                    format!("the breakpoint at {} cannot be reached: only {members} shop units have the trait", breakpoint.count),
-                );
-            }
-        }
-    }
-
-    let scripted: Vec<&String> = content.scripts().keys().collect();
-    for round in &content.schedule().rounds {
-        if let RoundKindDef::Custom { kind, .. } = &round.kind
-            && !scripted.contains(&kind)
-        {
-            warn(
-                format!("round {}", round.name),
-                format!("uses the custom kind \"{kind}\", which no script defines; the game's code must register it"),
-            );
-        }
-    }
-    warnings
-}
-
 /// How one unit did across simulated games.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct UnitRecord {
     /// Player-versus-player fights the unit was on the board for.
     pub fights: u32,
@@ -112,7 +33,7 @@ impl UnitRecord {
 }
 
 /// The result of [`simulate`].
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct SimReport {
     pub games: u32,
     /// Games that did not finish within the round limit.

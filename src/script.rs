@@ -5,14 +5,14 @@
 //! engine, in two ways:
 //!
 //! - A script with a `finish(game)` function is a **round type**, named
-//!   after the file. `Custom(kind: "windfall")` in `rounds.ron` runs
-//!   `scripts/windfall.rhai`: `begin(game)` when the round starts (optional)
+//!   after the file. `Custom(kind: "payday")` in `rounds.ron` runs
+//!   `scripts/payday.rhai`: `begin(game)` when the round starts (optional)
 //!   and `finish(game)` when it ends.
 //! - A script with an `on_event(game, event)` function is called for every
 //!   [`GameEvent`], so it can react to anything that happens in the lobby.
 //!
-//! Scripts see the game through the `game` object (see [`register_api`] for
-//! the full list of functions). They cannot touch files, the network or the
+//! Scripts see the game through the `game` object (see [`API`] for the full
+//! list of functions, or run `autoengine api`). They cannot touch files, the network or the
 //! clock, numbers are integers, and randomness comes from the game's seeded
 //! generator, so a scripted game is as reproducible as any other. A script
 //! that fails or runs too long is stopped and reported as a
@@ -110,21 +110,88 @@ impl ScriptGame {
     }
 }
 
-/// Registers everything scripts can call on `game`.
-///
-/// Reading: `players()` (ids of living players), `all_players()`,
-/// `name(p)`, `gold(p)`, `health(p)`, `level(p)`, `is_alive(p)`,
-/// `unit_count(p)`, `item_count(p)`, `streak(p)` (wins positive, losses
-/// negative), `stage()`, `round()`, `round_name()`, `param("name")` (a
-/// number from the round's `params` in `rounds.ron`, or 0).
-///
-/// Acting: `give_gold(p, n)`, `give_xp(p, n)`, `give_item(p, "id")`,
-/// `give_random_item(p)`, `give_unit(p, "id")`, `give_augment(p, "id")`,
-/// `damage(p, n)`, `log("text")` (shown in every client's log) and
-/// `fight_all()` (pair everyone up and fight, as a PvP round does).
-///
-/// Also: `random(n)` (0 to n-1, from the game's seed) and `get("key")` /
-/// `set("key", n)`, numbers a game's scripts share and keep between calls.
+/// Everything scripts can call on `game`, as signature and description.
+/// This is what `autoengine api` prints; a test keeps it in step with
+/// the functions the engine registers.
+pub const API: &[(&str, &str)] = &[
+    ("players()", "ids of the players still alive"),
+    ("all_players()", "ids of every player, including eliminated ones"),
+    ("name(p)", "a player's name"),
+    ("gold(p)", "a player's gold"),
+    ("health(p)", "a player's health"),
+    ("level(p)", "a player's level"),
+    ("is_alive(p)", "whether a player is still in the game"),
+    ("unit_count(p)", "how many units a player owns, board and bench"),
+    ("item_count(p)", "how many unequipped items a player holds"),
+    ("streak(p)", "a player's streak: wins are positive, losses negative"),
+    ("stage()", "the current stage number"),
+    ("round()", "the current round, counting from 0"),
+    ("round_name()", "the current round's name from rounds.ron"),
+    ("param(\"name\")", "a number from the round's `params` in rounds.ron, or 0"),
+    ("random(n)", "a number from 0 to n-1, from the game's seed"),
+    ("get(\"key\")", "a number saved with `set`, or 0"),
+    ("set(\"key\", n)", "saves a number for the rest of the game, shared by all scripts"),
+    ("give_gold(p, n)", "gives a player gold (negative takes it away)"),
+    ("give_xp(p, n)", "gives a player experience"),
+    ("give_item(p, \"id\")", "gives a player an item"),
+    ("give_random_item(p)", "gives a player a random component item"),
+    ("give_unit(p, \"id\")", "puts a unit on a player's bench, if there is room"),
+    ("give_augment(p, \"id\")", "gives a player an augment"),
+    ("damage(p, n)", "takes health from a player"),
+    ("log(\"text\")", "shows a line in every client's log"),
+    ("fight_all()", "pairs everyone up to fight, as a Pvp round does"),
+];
+
+/// The events `on_event` receives: `event.kind` and the other fields the
+/// event carries. A test keeps this in step with [`GameEvent`].
+pub const EVENTS: &[(&str, &str)] = &[
+    ("RoundStarted", "index, name, kind, stage"),
+    ("RoundFinished", "index"),
+    ("ShopRolled", "player, offers"),
+    ("GoldChanged", "player, gold"),
+    ("XpChanged", "player, level, xp"),
+    ("UnitGained", "player, uid, unit"),
+    ("UnitSold", "player, uid, unit"),
+    ("UnitUpgraded", "player, uid, unit, star"),
+    ("UnitMoved", "player, uid, to"),
+    ("ItemGained", "player, item"),
+    ("ItemEquipped", "player, uid, item"),
+    ("ItemCombined", "player, uid, item"),
+    ("ChoiceOffered", "player, options"),
+    ("ChoiceMade", "player, option, choice"),
+    ("AugmentGained", "player, augment"),
+    ("PlayerReady", "player"),
+    ("CombatFinished", "combat, home, away, winner"),
+    ("PlayerDamaged", "player, amount, health"),
+    ("PlayerEliminated", "player, placement"),
+    ("GameOver", "winner"),
+    ("Script", "script, message"),
+];
+
+/// The scripting reference as text, printed by `autoengine api`.
+pub fn api_reference() -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    out.push_str(
+        "Scripts are .rhai files in a content folder's scripts/ directory.\n\n\
+         A script can define any of these functions:\n  \
+         begin(game)            runs when a round of this script's kind starts\n  \
+         finish(game)           runs when it ends; makes the script a round kind named after its file\n  \
+         on_event(game, event)  runs for everything that happens in the game\n\n\
+         Functions on `game` (p is a player id):\n",
+    );
+    for (signature, description) in API {
+        let _ = writeln!(out, "  game.{signature:<24} {description}");
+    }
+    out.push_str("\nEvents passed to on_event, as event.kind and its other fields:\n");
+    for (kind, fields) in EVENTS {
+        let _ = writeln!(out, "  {kind:<18} {fields}");
+    }
+    out.push_str("\nNumbers are whole numbers. Players in events are their ids.\n");
+    out
+}
+
+/// Registers everything scripts can call on `game`: see [`API`].
 fn register_api(engine: &mut Engine) {
     engine.register_type_with_name::<ScriptGame>("Game");
     engine.register_fn("players", |g: &mut ScriptGame| -> Array {

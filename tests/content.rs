@@ -274,3 +274,13 @@ fn sample_units_name_model_files_that_exist() {
     }
     assert!(with_model > 0);
 }
+
+#[test]
+fn a_mistyped_id_gets_a_suggestion() {
+    let err = sample().setup_combat(1, &[TeamSetup { units: vec![unit("ironbark_wardn", (3, 4))], bonuses: vec![] }]);
+    let message = err.err().expect("the unit does not exist").to_string();
+    assert!(message.contains("unknown unit `ironbark_wardn` (did you mean `ironbark_warden`?)"), "{message}");
+    // Nothing is suggested when nothing is close.
+    let err = sample().setup_combat(1, &[TeamSetup { units: vec![unit("zzz", (3, 4))], bonuses: vec![] }]);
+    assert!(!err.err().unwrap().to_string().contains("did you mean"));
+}
