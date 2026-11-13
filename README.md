@@ -28,6 +28,7 @@ cargo run -p autoengine-client -- --name You     # terminal 2: play it
 | write scripts or build on the library in Rust | [docs/programming.md](docs/programming.md) and `examples/` |
 | make it look and sound like your game | [docs/art.md](docs/art.md) |
 | play, host, or change the client | [docs/client.md](docs/client.md) |
+| host games, write a client, or tune the server | [docs/networking.md](docs/networking.md) |
 | look up a type or function | `cargo doc --open` |
 
 ## Tools
@@ -55,7 +56,7 @@ the theme, models and icons.
 - **Fights**: tick-based combat on a hex board with targeting, movement, mana and abilities, shields, statuses, triggered passives and summons. Abilities, trait bonuses and item effects are data built from the same blocks.
 - **The game around them**: shared unit pool, shop odds by level, gold with interest and streaks, bench and board, star upgrades, item recipes, augments, elimination and placements.
 - **Rounds**: player fights, neutral fights, a shared draft, choice rounds, and your own kinds from scripts or Rust, in whatever order `rounds.ron` says.
-- **Hosting**: a headless server with bots for empty seats, reconnecting, spectators and per-player hiding of private information. Clients hold no game rules.
+- **Hosting**: a headless server with bots for empty seats, reconnecting, spectators and per-player hiding of private information. Clients hold no game rules. Only changes are sent, fights travel as a seed the client replays, and slow, silent or flooding connections are dropped without affecting anyone else.
 - **A 3D client**: models through Assimp, skeletal animation, particles, sound, settings, and everything visual driven by data files.
 - **Determinism**: integer math and seeded dice, so the same seed always gives the same fight and the same game. Replays, content tests and the simulator rest on this.
 

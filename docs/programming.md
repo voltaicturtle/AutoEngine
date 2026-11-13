@@ -47,6 +47,7 @@ step with the engine.
 | a round type | `RoundType` and `Game::register_round_type` | `examples/custom_rules.rs` |
 | a rule that reacts to events | `GameHook` and `Game::add_hook` | `examples/custom_rules.rs` |
 | either of those on a hosted game | `Session::on_start` | `examples/host_a_game.rs` |
+| a networked game | `Server` and `GameClient` (see [networking.md](networking.md)) | `examples/network_game.rs` |
 | another transport than TCP | drive `Session` yourself | `examples/host_a_game.rs` |
 | another front end | `ClientState` and `Playback` | the `client/` crate |
 

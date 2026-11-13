@@ -26,10 +26,10 @@ pub(crate) fn update_console(app: &mut App) {
         let line = std::mem::take(line);
         match DevCommand::parse(&line) {
             Ok(command) => {
-                app.state.error = None;
+                app.net.state.error = None;
                 app.send(ClientMsg::Dev(command));
             }
-            Err(e) => app.state.error = Some(e),
+            Err(e) => app.net.state.error = Some(e),
         }
     }
 }

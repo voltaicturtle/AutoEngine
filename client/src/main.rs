@@ -52,15 +52,14 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
-use autoengine::client::ClientState;
 use autoengine::combat::UnitId;
 use autoengine::content::{BoardUnit, UnitDef};
 use autoengine::game::{Command, Opponent, OwnedUnit, Player, PlayerId, Slot};
 use autoengine::hex::Hex;
-use autoengine::net::Connection;
+use autoengine::net::{GameClient, Status};
 use autoengine::playback::{Flash, Playback};
 use autoengine::protocol::DevCommand;
-use autoengine::protocol::{ClientMsg, PROTOCOL_VERSION, ViewPhase};
+use autoengine::protocol::{ClientMsg, ViewPhase};
 use macroquad::prelude::*;
 
 use draw::{Layout, button, draw_health_bar, draw_pips, draw_unit_token, label, panel, text_centered, unit_color};
@@ -178,8 +177,8 @@ fn window_conf() -> Conf {
 
 struct App {
     options: Options,
-    conn: Option<Connection>,
-    state: ClientState,
+    /// The connection to the server and everything it has told us.
+    net: GameClient,
     drag: Option<Drag>,
     show: Option<Show>,
     /// Whose board is on screen; `None` means our own.
@@ -188,7 +187,6 @@ struct App {
     autoplay_step: (Option<usize>, u8, f64),
     connect_error: Option<String>,
     error_shown_at: f64,
-    last_reconnect_at: f64,
     /// Time left in the current phase as last reported, and when that was.
     countdown: (u64, f64),
     models: RefCell<Models>,
@@ -218,43 +216,23 @@ struct App {
 
 impl App {
     fn send(&mut self, message: ClientMsg) {
-        if let Some(conn) = &mut self.conn
-            && conn.send(&message).is_err()
-        {
-            self.connect_error = Some("lost the connection to the server".into());
-        }
+        self.net.send(message);
     }
 
-    /// Connects and introduces ourselves; on a reconnect the token from the
-    /// first welcome gets our seat back.
+    /// Starts connecting. The client joins by itself, and after a lost
+    /// connection reconnects into the same seat.
     fn connect(&mut self) {
-        self.last_reconnect_at = get_time();
         let addr = self.options.addr.clone().unwrap_or_else(|| self.settings.addr.clone());
-        match Connection::connect(&addr) {
-            Ok(conn) => {
-                self.conn = Some(conn);
-                self.connect_error = None;
-                let hello = if self.options.spectate {
-                    ClientMsg::Spectate { version: PROTOCOL_VERSION }
-                } else {
-                    ClientMsg::Join {
-                        name: self.options.name.clone().unwrap_or_else(|| self.settings.name.clone()),
-                        version: PROTOCOL_VERSION,
-                        token: self.state.token.clone(),
-                    }
-                };
-                self.send(hello);
-            }
-            Err(e) => {
-                self.conn = None;
-                self.connect_error = Some(format!("cannot reach the server at {addr}: {e}"));
-            }
-        }
+        self.net = if self.options.spectate {
+            GameClient::spectate(addr)
+        } else {
+            GameClient::join(addr, self.options.name.clone().unwrap_or_else(|| self.settings.name.clone()))
+        };
     }
 
     /// The look of a unit given its content id.
     fn look_of(&self, unit_id: &str) -> Look {
-        let def = self.state.content.as_ref().and_then(|c| c.unit(unit_id));
+        let def = self.net.state.content.as_ref().and_then(|c| c.unit(unit_id));
         let name = def.map_or(unit_id, |d| d.name.as_str());
         let mut look = self.models.borrow_mut().look(def, name);
         look.animate = self.settings.animations;
@@ -263,7 +241,7 @@ impl App {
 
     /// The look of a unit given the name fights report it under.
     fn look_of_name(&self, name: &str) -> Look {
-        let def = self.state.content.as_ref().and_then(|c| c.units().find(|u| u.name == name));
+        let def = self.net.state.content.as_ref().and_then(|c| c.units().find(|u| u.name == name));
         let mut look = self.models.borrow_mut().look(def, name);
         look.animate = self.settings.animations;
         look
@@ -339,36 +317,23 @@ impl App {
     }
 
     fn me(&self) -> Option<&Player> {
-        self.state.me()
+        self.net.state.me()
     }
 
     /// The player whose board is on screen.
     fn shown_player(&self) -> Option<&Player> {
-        let view = self.state.view.as_ref()?;
-        let id = self.viewing.or(self.state.seat).or_else(|| view.players.iter().find(|p| p.alive).map(|p| p.id))?;
+        let view = self.net.state.view.as_ref()?;
+        let id = self.viewing.or(self.net.state.seat).or_else(|| view.players.iter().find(|p| p.alive).map(|p| p.id))?;
         view.players.get(id.0 as usize)
     }
 
     fn viewing_self(&self) -> bool {
-        self.state.seat.is_some() && (self.viewing.is_none() || self.viewing == self.state.seat)
+        self.net.state.seat.is_some() && (self.viewing.is_none() || self.viewing == self.net.state.seat)
     }
 
     fn pump_network(&mut self) {
-        let lost = self.conn.as_ref().is_none_or(|c| c.is_closed()) || self.connect_error.is_some();
-        if lost {
-            // Keep trying to get back in.
-            if self.connect_error.is_none() {
-                self.connect_error = Some("lost the connection to the server; retrying".into());
-            }
-            if get_time() - self.last_reconnect_at > 2.0 {
-                self.connect();
-            }
-        }
-        let Some(conn) = &mut self.conn else { return };
-        for message in conn.poll() {
-            self.state.apply(message);
-        }
-        if let Some(view) = &self.state.view {
+        self.net.update();
+        if let Some(view) = &self.net.state.view {
             let remaining = match view.phase {
                 ViewPhase::Planning { remaining_ms } | ViewPhase::Showing { remaining_ms } => remaining_ms,
                 _ => 0,
@@ -377,44 +342,44 @@ impl App {
                 self.countdown = (remaining, get_time());
             }
         }
-        if self.state.error.is_some() && self.error_shown_at == 0.0 {
+        if self.net.state.error.is_some() && self.error_shown_at == 0.0 {
             self.error_shown_at = get_time();
         }
-        if self.state.error.is_some() && get_time() - self.error_shown_at > 4.0 {
-            self.state.error = None;
+        if self.net.state.error.is_some() && get_time() - self.error_shown_at > 4.0 {
+            self.net.state.error = None;
             self.error_shown_at = 0.0;
         }
 
         // Start the next replay once the current one is over.
         if self.show.is_none()
-            && let Some(record) = self.state.combats.pop_front()
+            && let Some(record) = self.net.state.combats.pop_front()
         {
             // Spectators receive every fight of the round; show the first.
-            if self.state.seat.is_none() {
-                self.state.combats.clear();
+            if self.net.state.seat.is_none() {
+                self.net.state.combats.clear();
             }
-            let me = self.state.seat;
+            let me = self.net.state.seat;
             let flipped = me.is_some() && record.away == Opponent::Player(me.unwrap());
             let away = match &record.away {
-                Opponent::Player(p) => self.state.player_name(*p),
-                Opponent::Ghost(p) => format!("a copy of {}", self.state.player_name(*p)),
+                Opponent::Player(p) => self.net.state.player_name(*p),
+                Opponent::Ghost(p) => format!("a copy of {}", self.net.state.player_name(*p)),
                 Opponent::Neutral => "the neutral camp".to_string(),
             };
-            let title = format!("{} vs {}", self.state.player_name(record.home), away);
+            let title = format!("{} vs {}", self.net.state.player_name(record.home), away);
             self.show = Some(Show::new(Playback::new(&record), flipped, title));
         }
     }
 
     /// A small built-in autopilot, for demos and for testing the client.
     fn autoplay(&mut self) {
-        let Some(view) = &self.state.view else {
-            if self.state.welcomed && !self.state.started && self.state.seat.is_some() && get_time() > 1.0 {
+        let Some(view) = &self.net.state.view else {
+            if self.net.state.welcomed && !self.net.state.started && self.net.state.seat.is_some() && get_time() > 1.0 {
                 self.send(ClientMsg::Start);
-                self.state.started = true;
+                self.net.state.started = true;
             }
             return;
         };
-        let (Some(me), Some(content)) = (self.me().cloned(), &self.state.content) else { return };
+        let (Some(me), Some(content)) = (self.me().cloned(), &self.net.state.content) else { return };
         if !matches!(view.phase, ViewPhase::Planning { .. }) || self.show.is_some() {
             return;
         }
@@ -521,15 +486,13 @@ async fn main() {
         replay,
         drawn: Cell::new((0, 0)),
         frame_ms: Vec::new(),
-        conn: None,
-        state: ClientState::new(),
+        net: GameClient::offline(),
         drag: None,
         show: None,
         viewing: None,
         autoplay_step: (None, 0, 0.0),
         connect_error: None,
         error_shown_at: 0.0,
-        last_reconnect_at: 0.0,
         countdown: (0, 0.0),
         models: RefCell::new(Models { assets: options.assets.clone(), files: HashMap::new(), figures: HashMap::new() }),
         camera_yaw: 0.0,
@@ -538,7 +501,7 @@ async fn main() {
     };
     if let Some(replay) = &app.replay {
         match replay.content.clone().into_content() {
-            Ok(content) => app.state.content = Some(content),
+            Ok(content) => app.net.state.content = Some(content),
             Err(e) => {
                 eprintln!("the replay's content is invalid: {e:?}");
                 return;
@@ -599,7 +562,7 @@ async fn main() {
             draw_asset_viewer(&mut app);
         } else if app.replay.is_some() {
             draw_replay_viewer(&mut app, &layout);
-        } else if app.state.view.is_none() {
+        } else if app.net.state.view.is_none() {
             draw_lobby(&mut app);
         } else {
             draw_game(&mut app, &layout);
@@ -626,10 +589,16 @@ async fn main() {
 
 /// Errors from the server or the connection, across the top of the screen.
 fn draw_banner(app: &App) {
-    let message = app.connect_error.as_ref().or(app.state.error.as_ref());
+    let offline = app.replay.is_some() || app.viewer.is_some();
+    let link = match app.net.status() {
+        Status::Reconnecting { reason, .. } if !offline => Some(reason),
+        _ => None,
+    };
+    let message = app.connect_error.as_ref().or(link).or(app.net.state.error.as_ref());
     if let Some(message) = message {
         let w = screen_width();
-        draw_rectangle(w / 2.0 - 300.0, 50.0, 600.0, 34.0, Color::new(0.45, 0.12, 0.12, 0.95));
+        let width = (theme::text_width(message, 20.0) + 40.0).clamp(600.0, w - 20.0);
+        draw_rectangle(w / 2.0 - width / 2.0, 50.0, width, 34.0, Color::new(0.45, 0.12, 0.12, 0.95));
         text_centered(message, w / 2.0, 72.0, 20.0, ui().text);
     }
 }
@@ -637,24 +606,24 @@ fn draw_banner(app: &App) {
 fn draw_lobby(app: &mut App) {
     let (w, h) = (screen_width(), screen_height());
     text_centered("AutoEngine", w / 2.0, h * 0.22, 64.0, ui().text);
-    if !app.state.welcomed {
-        let line = if app.connect_error.is_some() { "Not connected" } else { "Connecting..." };
+    if !app.net.state.welcomed {
+        let line = if app.net.is_connected() || *app.net.status() == Status::Connecting { "Connecting..." } else { "Not connected" };
         text_centered(line, w / 2.0, h * 0.32, 26.0, ui().muted);
         return;
     }
     text_centered("Waiting for players", w / 2.0, h * 0.32, 26.0, ui().muted);
-    let seats = app.state.lobby.clone();
+    let seats = app.net.state.lobby.clone();
     for (i, seat) in seats.iter().enumerate() {
         let y = h * 0.40 + i as f32 * 34.0;
         panel(w / 2.0 - 180.0, y, 360.0, 28.0, ui().panel);
-        let mine = app.state.seat == Some(PlayerId(i as u8));
+        let mine = app.net.state.seat == Some(PlayerId(i as u8));
         match seat {
             Some(name) => label(name, w / 2.0 - 168.0, y + 20.0, 20.0, if mine { ui().gold } else { ui().text }),
             None => label("open seat (a bot will play it)", w / 2.0 - 168.0, y + 20.0, 20.0, ui().muted),
         }
     }
     let y = h * 0.40 + seats.len() as f32 * 34.0 + 24.0;
-    if app.state.seat.is_some() {
+    if app.net.state.seat.is_some() {
         if button("Start game", w / 2.0 - 90.0, y, 180.0, 44.0, true) {
             app.send(ClientMsg::Start);
         }
@@ -679,7 +648,7 @@ fn draw_game(app: &mut App, layout: &Layout) {
 }
 
 fn draw_top_bar(app: &App) {
-    let Some(view) = &app.state.view else { return };
+    let Some(view) = &app.net.state.view else { return };
     let w = screen_width();
     draw_rectangle(0.0, 0.0, w, 44.0, ui().panel);
     label(&format!("Round {}  ({})", view.round_name, view.round_kind), 16.0, 29.0, 24.0, ui().text);
@@ -696,7 +665,7 @@ fn draw_top_bar(app: &App) {
     text_centered(&phase, w / 2.0, 29.0, 24.0, ui().accent);
     if let Some(me) = app.me() {
         let xp_needed = app
-            .state
+            .net.state
             .content
             .as_ref()
             .and_then(|c| c.rules().levels.get(me.level as usize - 1))
@@ -714,7 +683,7 @@ fn draw_top_bar(app: &App) {
 fn draw_traits(app: &App, layout: &Layout) {
     panel(0.0, 44.0, layout.left_w, screen_height() - 44.0, ui().panel);
     label("Traits", 14.0, 74.0, 22.0, ui().text);
-    let (Some(player), Some(content)) = (app.shown_player(), &app.state.content) else { return };
+    let (Some(player), Some(content)) = (app.shown_player(), &app.net.state.content) else { return };
     let units: Vec<BoardUnit> = player.board_units();
     let Ok(mut traits) = content.active_traits(&units) else { return };
     traits.sort_by_key(|t| (t.tier.is_none(), std::cmp::Reverse(t.count)));
@@ -732,7 +701,7 @@ fn draw_traits(app: &App, layout: &Layout) {
         label("Augments", 14.0, y, 22.0, ui().text);
         y += 28.0;
         for a in &player.augments {
-            label(&app.state.display_name(a), 14.0, y, 18.0, ui().accent);
+            label(&app.net.state.display_name(a), 14.0, y, 18.0, ui().accent);
             y += 22.0;
         }
     }
@@ -742,14 +711,14 @@ fn draw_scoreboard(app: &mut App, layout: &Layout) {
     let x = screen_width() - layout.right_w;
     panel(x, 44.0, layout.right_w, screen_height() - 44.0, ui().panel);
     label("Players", x + 14.0, 74.0, 22.0, ui().text);
-    let Some(view) = &app.state.view else { return };
+    let Some(view) = &app.net.state.view else { return };
     let mut players: Vec<&Player> = view.players.iter().collect();
     players.sort_by_key(|p| (!p.alive, std::cmp::Reverse(p.health), p.placement));
     let mut y = 88.0;
     let mut clicked = None;
     let (mx, my) = mouse_position();
     for p in players {
-        let me = app.state.seat == Some(p.id);
+        let me = app.net.state.seat == Some(p.id);
         let shown = app.shown_player().map(|s| s.id) == Some(p.id);
         let hover = mx >= x + 8.0 && mx <= x + layout.right_w - 8.0 && my >= y && my <= y + 34.0;
         panel(x + 8.0, y, layout.right_w - 16.0, 34.0, if shown || hover { ui().panel_light } else { ui().panel });
@@ -773,15 +742,15 @@ fn draw_scoreboard(app: &mut App, layout: &Layout) {
         y += 38.0;
     }
     if let Some(id) = clicked {
-        app.viewing = if Some(id) == app.state.seat { None } else { Some(id) };
+        app.viewing = if Some(id) == app.net.state.seat { None } else { Some(id) };
     }
 
     y += 12.0;
     label("Log", x + 14.0, y + 14.0, 22.0, ui().text);
     y += 24.0;
     let room = ((screen_height() - y - 8.0) / 18.0) as usize;
-    let skip = app.state.log.len().saturating_sub(room);
-    for line in app.state.log.iter().skip(skip) {
+    let skip = app.net.state.log.len().saturating_sub(room);
+    for line in app.net.state.log.iter().skip(skip) {
         let mut line = line.clone();
         if theme::text_width(&line, 14.0) > layout.right_w - 24.0 {
             while theme::text_width(&line, 14.0) > layout.right_w - 36.0 && line.len() > 4 {
@@ -814,7 +783,7 @@ fn board_tiles(ground: &mut Ground, layout: &Layout, own_half: bool, highlight: 
 }
 
 fn unit_label(app: &App, unit: &OwnedUnit) -> String {
-    app.state.display_name(&unit.unit)
+    app.net.state.display_name(&unit.unit)
 }
 
 /// Stars make a unit a little bigger.
@@ -825,7 +794,7 @@ fn star_scale(star: u8) -> f32 {
 const RING_LIFT: Vec3 = Vec3::new(0.0, 0.03, 0.0);
 
 fn draw_game_over(app: &App) {
-    let Some(view) = &app.state.view else { return };
+    let Some(view) = &app.net.state.view else { return };
     let ViewPhase::Over { winner } = view.phase else { return };
     if app.show.is_some() {
         return;
@@ -833,8 +802,8 @@ fn draw_game_over(app: &App) {
     let (w, h) = (screen_width(), screen_height());
     draw_rectangle(w / 2.0 - 240.0, h / 2.0 - 200.0, 480.0, 400.0, Color::new(0.04, 0.05, 0.07, 0.96));
     let title = match winner {
-        Some(id) if Some(id) == app.state.seat => "You win!".to_string(),
-        Some(id) => format!("{} wins", app.state.player_name(id)),
+        Some(id) if Some(id) == app.net.state.seat => "You win!".to_string(),
+        Some(id) => format!("{} wins", app.net.state.player_name(id)),
         None => "Game over".to_string(),
     };
     text_centered(&title, w / 2.0, h / 2.0 - 150.0, 40.0, ui().gold);
@@ -842,7 +811,7 @@ fn draw_game_over(app: &App) {
     players.sort_by_key(|p| p.placement.unwrap_or(u32::MAX));
     for (i, p) in players.iter().enumerate() {
         let y = h / 2.0 - 100.0 + i as f32 * 30.0;
-        let color = if Some(p.id) == app.state.seat { ui().gold } else { ui().text };
+        let color = if Some(p.id) == app.net.state.seat { ui().gold } else { ui().text };
         label(&format!("{}.", p.placement.unwrap_or(0)), w / 2.0 - 180.0, y, 22.0, ui().muted);
         label(&p.name, w / 2.0 - 140.0, y, 22.0, color);
         label(&format!("level {}", p.level), w / 2.0 + 80.0, y, 18.0, ui().muted);

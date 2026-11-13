@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::combat::Event;
+use crate::content::ContentSet;
 use crate::game::CombatRecord;
 use crate::protocol::ContentInfo;
 
@@ -95,6 +97,24 @@ impl ReplayFile {
         }
         Ok(())
     }
+}
+
+/// Fights a recorded fight again from its teams and seed and returns its
+/// events. With the same content and engine the result is always the same,
+/// which is how clients turn a [`ServerMsg::CombatSeed`](crate::protocol::ServerMsg::CombatSeed)
+/// back into a full record. Fails if the result does not match what the
+/// record says about the fight.
+pub fn fight_again(content: &ContentSet, record: &CombatRecord, expected_events: usize) -> Result<Vec<Event>, String> {
+    if record.teams.len() < 2 {
+        return Err("the record does not say who fought".into());
+    }
+    let mut combat = content.setup_combat(record.seed, &record.teams).map_err(|e| e.to_string())?;
+    let outcome = combat.run().clone();
+    let events = combat.drain_events();
+    if outcome.winner != record.winner || outcome.duration_ms != record.duration_ms || events.len() != expected_events {
+        return Err("the fight played out differently here".into());
+    }
+    Ok(events)
 }
 
 /// A file name for a fight: round number, then the title made safe.

@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use crate::combat::Team;
 use crate::content::ContentSet;
 use crate::game::{CombatRecord, GameEvent, Opponent, Player, PlayerId};
-use crate::protocol::{GameView, ServerMsg};
+use crate::protocol::{ClientMsg, GameView, ServerMsg};
 
 /// Lines kept in the event log.
 const LOG_LINES: usize = 50;
@@ -34,6 +34,10 @@ pub struct ClientState {
     pub log: VecDeque<String>,
     /// The last refusal from the server, until the client clears it.
     pub error: Option<String>,
+    /// Messages this state wants sent to the server, oldest first. Whoever
+    /// owns the connection drains them ([`GameClient`](crate::net::GameClient)
+    /// does it by itself).
+    pub requests: Vec<ClientMsg>,
 }
 
 impl ClientState {
@@ -58,6 +62,28 @@ impl ClientState {
                 self.started = started;
             }
             ServerMsg::State(view) => self.view = Some(view),
+            ServerMsg::Update(update) => {
+                if let Some(view) = &mut self.view {
+                    view.patch(update);
+                }
+            }
+            ServerMsg::CombatSeed { id, events, mut record } => {
+                // Fights are deterministic: fight it again here instead of
+                // downloading every event. If that is not possible, or the
+                // result differs, ask for the whole log.
+                let fought = match &self.content {
+                    Some(content) => crate::replay::fight_again(content, &record, events as usize),
+                    None => Err("no content yet".into()),
+                };
+                match fought {
+                    Ok(events) => {
+                        record.events = events;
+                        self.combats.push_back(record);
+                    }
+                    Err(_) => self.requests.push(ClientMsg::ResendCombat { id }),
+                }
+            }
+            ServerMsg::Ping | ServerMsg::Pong => {}
             ServerMsg::Events(events) => {
                 for event in &events {
                     if let Some(line) = self.describe(event) {

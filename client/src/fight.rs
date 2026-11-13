@@ -190,7 +190,7 @@ pub(crate) fn draw_replay(app: &mut App, layout: &Layout) {
     }
     if show.playback.is_finished() && !show.announced {
         show.announced = true;
-        if app.state.seat.is_some() {
+        if app.net.state.seat.is_some() {
             cues.push(if show.playback.winner().is_some_and(|t| t.0 == my_team) { Sfx::Victory } else { Sfx::Defeat });
         }
     }
@@ -320,7 +320,7 @@ pub(crate) fn draw_replay(app: &mut App, layout: &Layout) {
     let footer_y = layout.scene_bottom() - 14.0;
     if show.playback.is_finished() {
         let result = match show.playback.winner() {
-            Some(team) if app.state.seat.is_none() => format!("Team {} wins", team.0 + 1),
+            Some(team) if app.net.state.seat.is_none() => format!("Team {} wins", team.0 + 1),
             Some(team) if team.0 == my_team => "Victory".to_string(),
             Some(_) => "Defeat".to_string(),
             None => "Draw".to_string(),

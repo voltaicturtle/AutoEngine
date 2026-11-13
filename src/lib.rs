@@ -23,7 +23,8 @@
 //! ```
 //!
 //! The `examples/` folder has longer ones: a whole game played by bots, a
-//! round type and a rule written in Rust, and a game hosted in-process.
+//! round type and a rule written in Rust, a game hosted in-process, and a
+//! server with two players over TCP.
 //!
 //! # Layers
 //!
@@ -50,6 +51,7 @@
 //! | a round type in Rust | [`round::RoundType`] and [`game::Game::register_round_type`] |
 //! | a rule that reacts to events in Rust | [`game::GameHook`] and [`game::Game::add_hook`] |
 //! | either of those on a hosted game | [`session::Session::on_start`] |
+//! | a networked game | [`net::Server`] and [`net::GameClient`] |
 //! | another transport than TCP | drive [`session::Session`] yourself: `handle`, `tick`, `drain_outbox` |
 //! | another front end | [`client::ClientState`] and [`playback::Playback`] |
 //!
@@ -87,6 +89,7 @@ pub mod prelude {
     pub use crate::hex::Hex;
     pub use crate::rng::Rng;
     pub use crate::round::RoundType;
+    pub use crate::net::{GameClient, Server, ServerConfig};
     pub use crate::session::{Session, SessionConfig};
     pub use crate::stats::Stat;
 }

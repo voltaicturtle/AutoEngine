@@ -139,7 +139,7 @@ pub(crate) fn draw_planning(app: &mut App, layout: &Layout) {
 }
 
 pub(crate) fn draw_item(app: &App, item: &str, r: Rect) {
-    let name = app.state.display_name(item);
+    let name = app.net.state.display_name(item);
     if let Some(icon) = app.icons.borrow_mut().get(item) {
         draw_texture_ex(&icon, r.x, r.y, WHITE, DrawTextureParams { dest_size: Some(vec2(r.w, r.h)), ..Default::default() });
         draw_rectangle_lines(r.x, r.y, r.w, r.h, 2.0, ui().gold);
@@ -152,10 +152,10 @@ pub(crate) fn draw_item(app: &App, item: &str, r: Rect) {
 }
 
 pub(crate) fn draw_unit_tooltip(app: &App, unit: &OwnedUnit, at: Vec2) {
-    let Some(content) = &app.state.content else { return };
+    let Some(content) = &app.net.state.content else { return };
     let Some(def) = content.unit(&unit.unit) else { return };
     let mut lines = vec![format!("{}  ({} star, cost {})", def.name, unit.star, def.cost)];
-    let traits: Vec<String> = def.traits.iter().map(|t| app.state.display_name(t)).collect();
+    let traits: Vec<String> = def.traits.iter().map(|t| app.net.state.display_name(t)).collect();
     if !traits.is_empty() {
         lines.push(traits.join(", "));
     }
@@ -163,7 +163,7 @@ pub(crate) fn draw_unit_tooltip(app: &App, unit: &OwnedUnit, at: Vec2) {
         lines.push(format!("Ability: {}", a.name));
     }
     for item in &unit.items {
-        lines.push(format!("Item: {}", app.state.display_name(item)));
+        lines.push(format!("Item: {}", app.net.state.display_name(item)));
     }
     let width = lines.iter().map(|l| theme::text_width(l, 17.0)).fold(0.0, f32::max) + 20.0;
     let height = lines.len() as f32 * 20.0 + 12.0;
@@ -177,7 +177,7 @@ pub(crate) fn draw_unit_tooltip(app: &App, unit: &OwnedUnit, at: Vec2) {
 }
 
 pub(crate) fn draw_shop(app: &mut App, layout: &Layout, player: &Player) {
-    let Some(content) = &app.state.content else { return };
+    let Some(content) = &app.net.state.content else { return };
     let economy = content.rules().economy.clone();
     let mut buy = None;
     let (mx, my) = mouse_position();
@@ -198,7 +198,7 @@ pub(crate) fn draw_shop(app: &mut App, layout: &Layout, player: &Player) {
             draw_unit_token(vec2(r.x + 28.0, r.y + 38.0), 18.0, &def.name, 1, 0, true, None);
         }
         label(&def.name, r.x + 8.0, r.y + 76.0, 16.0, if affordable { ui().text } else { ui().muted });
-        let traits: Vec<String> = def.traits.iter().map(|t| app.state.display_name(t)).collect();
+        let traits: Vec<String> = def.traits.iter().map(|t| app.net.state.display_name(t)).collect();
         label(&traits.join(", "), r.x + 8.0, r.y + 94.0, 14.0, ui().muted);
         label(&format!("{}g", def.cost), r.x + r.w - 30.0, r.y + 42.0, 20.0, ui().gold);
         if hover && is_mouse_button_pressed(MouseButton::Left) {
@@ -254,11 +254,11 @@ pub(crate) fn handle_drop(app: &mut App, layout: &Layout, player: &Player, mouse
 
 /// Options offered by draft and choice rounds.
 pub(crate) fn draw_choice(app: &mut App, layout: &Layout) {
-    let Some(view) = &app.state.view else { return };
+    let Some(view) = &app.net.state.view else { return };
     if view.options.is_empty() || !matches!(view.phase, ViewPhase::Planning { .. }) {
         return;
     }
-    let Some(me) = app.state.seat else { return };
+    let Some(me) = app.net.state.seat else { return };
     let my_turn = view.awaiting.contains(&me);
     // In a draft the options stay up while others pick; in a private choice
     // they disappear once we have chosen.
@@ -270,7 +270,7 @@ pub(crate) fn draw_choice(app: &mut App, layout: &Layout) {
         "Choose one".to_string()
     } else {
         match view.awaiting.first() {
-            Some(p) => format!("Waiting for {} to choose", app.state.player_name(*p)),
+            Some(p) => format!("Waiting for {} to choose", app.net.state.player_name(*p)),
             None => return,
         }
     };
@@ -300,12 +300,12 @@ pub(crate) fn draw_choice(app: &mut App, layout: &Layout) {
         let hover = my_turn && r.contains(vec2(mx, my));
         panel(r.x, r.y, r.w, r.h, if hover { ui().panel_light } else { ui().panel });
         let parts: Vec<&str> = option.split(" + ").collect();
-        let name = app.state.display_name(parts[0]);
+        let name = app.net.state.display_name(parts[0]);
         draw_rectangle(r.x, r.y, r.w, 5.0, unit_color(&name));
         label(&name, r.x + 10.0, r.y + 30.0, 18.0, ui().text);
-        let content = app.state.content.as_ref();
+        let content = app.net.state.content.as_ref();
         if let Some(item) = parts.get(1) {
-            label(&format!("with {}", app.state.display_name(item)), r.x + 10.0, r.y + 52.0, 15.0, ui().gold);
+            label(&format!("with {}", app.net.state.display_name(item)), r.x + 10.0, r.y + 52.0, 15.0, ui().gold);
         } else if let Some(aug) = content.and_then(|c| c.augment(parts[0])) {
             draw::wrapped(&aug.description, r.x + 10.0, r.y + 52.0, r.w - 20.0, 15.0, ui().muted);
         }

@@ -5,18 +5,20 @@
 //! end. It has no graphics; clients connect over TCP to play or watch.
 //!
 //! Usage: `autoengine-server [--port 7777] [--bind ADDR] [--seats 8] [--seed N]
-//!         [--planning-secs 30] [--content DIR]`
+//!         [--planning-secs 30] [--content DIR] [--record DIR] [--dev]
+//!         [--max-connections 64] [--idle-secs 30] [--stats-secs N]`
+//!
+//! `--stats-secs N` prints connection and traffic counters every N seconds.
 
-use std::net::TcpListener;
 use std::process::ExitCode;
-use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use autoengine::content::ContentSet;
-use autoengine::net::serve;
+use autoengine::net::{Server, ServerConfig};
 use autoengine::session::{Session, SessionConfig};
 
 const USAGE: &str = "usage: autoengine-server [--port 7777] [--bind ADDR] [--seats 8] [--seed N] \
-[--planning-secs 30] [--content DIR] [--record DIR] [--dev]";
+[--planning-secs 30] [--content DIR] [--record DIR] [--dev] [--max-connections 64] [--idle-secs 30] [--stats-secs N]";
 
 fn main() -> ExitCode {
     match run() {
@@ -43,6 +45,8 @@ fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let mut record: Option<String> = None;
     let mut dev = false;
+    let mut net = ServerConfig::default();
+    let mut stats_secs = 0u64;
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(USAGE.to_string());
         match arg.as_str() {
@@ -50,6 +54,13 @@ fn run() -> Result<(), String> {
             "--bind" => bind = value()?,
             "--record" => record = Some(value()?),
             "--dev" => dev = true,
+            "--max-connections" => net.max_connections = value()?.parse().ok().filter(|n| *n >= 1).ok_or(USAGE)?,
+            "--idle-secs" => {
+                let secs = value()?.parse::<u64>().ok().filter(|n| *n >= 2).ok_or(USAGE)?;
+                net.idle_timeout = Duration::from_secs(secs);
+                net.ping_interval = Duration::from_secs((secs / 4).max(1)).min(net.ping_interval);
+            }
+            "--stats-secs" => stats_secs = value()?.parse().map_err(|_| USAGE)?,
             "--seats" => {
                 config.seats = value()?.parse().ok().filter(|n| (2..=8).contains(n)).ok_or(USAGE)?;
             }
@@ -61,14 +72,15 @@ fn run() -> Result<(), String> {
     }
 
     let content = ContentSet::load_dir(&content_dir).map_err(|e| e.to_string())?;
-    let listener = TcpListener::bind((bind.as_str(), port)).map_err(|e| format!("cannot listen on {bind}:{port}: {e}"))?;
+    let server = Server::bind((bind.as_str(), port))
+        .map_err(|e| format!("cannot listen on {bind}:{port}: {e}"))?
+        .with_config(net);
     println!(
         "autoengine-server listening on {bind}:{port} ({} seats, seed {}, {}s planning)",
         config.seats,
         config.seed,
         config.planning_ms / 1000
     );
-    let stop = AtomicBool::new(false);
     let mut session = Session::new(content, config);
     if dev {
         println!("developer commands are on");
@@ -78,6 +90,25 @@ fn run() -> Result<(), String> {
         println!("saving every fight as a replay in {dir}");
         session.record_to(dir);
     }
-    serve(listener, session, &stop).map_err(|e| e.to_string())?;
-    Ok(())
+    let server = server.spawn(session);
+    // The game runs on the server's own thread; this one only reports.
+    let mut last = server.stats();
+    loop {
+        std::thread::sleep(Duration::from_secs(stats_secs.max(1)));
+        let stats = server.stats();
+        if stats_secs > 0 && stats != last {
+            println!(
+                "{} connected ({} accepted, {} refused, {} dropped), in {} messages / {} bytes, out {} messages / {} bytes",
+                stats.connections,
+                stats.accepted,
+                stats.refused,
+                stats.dropped_slow + stats.dropped_idle + stats.dropped_flood,
+                stats.messages_in,
+                stats.bytes_in,
+                stats.messages_out,
+                stats.bytes_out
+            );
+            last = stats;
+        }
+    }
 }

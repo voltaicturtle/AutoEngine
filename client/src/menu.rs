@@ -72,7 +72,7 @@ pub(crate) fn draw_stats(app: &App, layout: &Layout) {
     let (units, vertices) = app.drawn.get();
     let link = if app.replay.is_some() {
         "replay file"
-    } else if app.conn.as_ref().is_some_and(|c| !c.is_closed()) {
+    } else if app.net.is_connected() {
         "connected"
     } else {
         "not connected"

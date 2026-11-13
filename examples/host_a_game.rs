@@ -9,7 +9,7 @@
 //! connected client itself.
 
 use autoengine::prelude::*;
-use autoengine::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg, ViewPhase};
+use autoengine::protocol::{ClientMsg, GameView, PROTOCOL_VERSION, ServerMsg, ViewPhase, ViewUpdate};
 
 fn main() {
     let content = ContentSet::load_dir("content").expect("run this from the repository root");
@@ -34,16 +34,20 @@ fn main() {
         for (conn, message) in session.drain_outbox() {
             assert_eq!(conn, ME);
             match message {
-                // The state is what this player may see: their own shop, and
-                // everyone's boards.
-                ServerMsg::State(view) => {
-                    if let ViewPhase::Planning { .. } = view.phase {
+                // The first `State` is the whole game as this player may see
+                // it (their own shop, everyone's boards). After that come
+                // `Update`s with only what changed; `ClientState::apply`
+                // folds both. Here only the phase matters.
+                ServerMsg::State(GameView { phase, .. }) | ServerMsg::Update(ViewUpdate { phase, .. }) => {
+                    if let ViewPhase::Planning { .. } = phase {
                         // Skip the planning timer by readying up straight away.
                         // (Ana never buys a unit, so do not expect her to win.)
                         session.handle(ME, ClientMsg::Command(Command::Ready), now);
                     }
                 }
-                ServerMsg::Combat(record) => {
+                // Fights come as teams and a seed; `ClientState::apply`
+                // fights them again to get the events.
+                ServerMsg::CombatSeed { record, .. } => {
                     fights += 1;
                     if fights <= 5 {
                         println!("fight {fights}: {:?} wins in {} ms", record.winner, record.duration_ms);

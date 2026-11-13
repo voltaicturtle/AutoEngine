@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::bot;
 use crate::content::ContentSet;
-use crate::game::{Game, Opponent, PlayerId};
+use crate::game::{CombatRecord, Game, Opponent, PlayerId};
 use crate::replay::ReplayFile;
 use crate::protocol::DevCommand;
 use crate::protocol::{ClientMsg, ContentInfo, GameView, PROTOCOL_VERSION, ServerMsg, ViewPhase, visible_to};
@@ -86,6 +86,13 @@ pub struct Session {
     /// Source of seat tokens; seeded from the clock, never from the game seed.
     token_rng: Rng,
     events_sent: usize,
+    /// The view each connection was last sent, so only changes go out.
+    views: BTreeMap<ConnId, GameView>,
+    /// Connections that asked for fights with their whole event log.
+    full_fights: std::collections::BTreeSet<ConnId>,
+    /// The fights of the round last resolved, kept for
+    /// [`ClientMsg::ResendCombat`], and that round's number.
+    shown: (u32, Vec<CombatRecord>),
     outbox: Vec<(ConnId, ServerMsg)>,
 }
 
@@ -160,6 +167,9 @@ impl Session {
                     ^ (std::process::id() as u64) << 32,
             ),
             events_sent: 0,
+            views: BTreeMap::new(),
+            full_fights: Default::default(),
+            shown: (0, Vec::new()),
             outbox: Vec::new(),
             config,
         }
@@ -203,8 +213,11 @@ impl Session {
     pub fn handle(&mut self, conn: ConnId, message: ClientMsg, now: u64) {
         match message {
             ClientMsg::Join { name, version, token } => {
-                if !self.check_version(conn, version) || self.conns.contains_key(&conn) {
+                if !self.check_version(conn, version) {
                     return;
+                }
+                if self.conns.contains_key(&conn) {
+                    return self.send(conn, ServerMsg::Error { message: "this connection has already joined".into() });
                 }
                 let name = name.trim().chars().take(24).collect::<String>();
                 if name.is_empty() {
@@ -248,6 +261,26 @@ impl Session {
                 }
             }
             ClientMsg::Dev(command) => self.dev_command(conn, command, now),
+            ClientMsg::Options { full_fights } => {
+                if full_fights {
+                    self.full_fights.insert(conn);
+                } else {
+                    self.full_fights.remove(&conn);
+                }
+            }
+            ClientMsg::ResendCombat { id } => {
+                let (round, index) = (id >> 8, (id & 0xff) as usize);
+                match self.shown.1.get(index).filter(|_| round == self.shown.0 && self.conns.contains_key(&conn)) {
+                    Some(record) => {
+                        let record = record.clone();
+                        self.send(conn, ServerMsg::Combat(record));
+                    }
+                    None => self.send(conn, ServerMsg::Error { message: "that fight is no longer kept".into() }),
+                }
+            }
+            // The transport answers pings; nothing here depends on them.
+            ClientMsg::Ping => self.send(conn, ServerMsg::Pong),
+            ClientMsg::Pong => {}
             ClientMsg::Command(command) => {
                 let Some(seat) = self.seat_of(conn) else {
                     return self.send(conn, ServerMsg::Error { message: "spectators cannot act".into() });
@@ -272,6 +305,8 @@ impl Session {
 
     /// Call when a connection closes.
     pub fn disconnect(&mut self, conn: ConnId, now: u64) {
+        self.views.remove(&conn);
+        self.full_fights.remove(&conn);
         let Some(role) = self.conns.remove(&conn) else { return };
         let Role::Seat(seat) = role else { return };
         if !self.has_started() {
@@ -331,6 +366,7 @@ impl Session {
         self.send_lobby();
         if self.game.is_some() {
             let view = self.view(seat, now);
+            self.views.insert(conn, view.clone());
             self.send(conn, ServerMsg::State(view));
         }
     }
@@ -431,8 +467,23 @@ impl Session {
             }
         }
         // Fights first, so a client has them before the state says to show them.
+        // A fight goes out as its teams and seed unless the client asked for
+        // the whole log: fights are deterministic, so the client fights it
+        // again. That is a few hundred bytes instead of a few hundred
+        // thousand.
+        let round = round_played as u32 & 0x00ff_ffff;
+        let seeds: Vec<ServerMsg> = combats
+            .iter()
+            .take(256)
+            .enumerate()
+            .map(|(index, record)| ServerMsg::CombatSeed {
+                id: round << 8 | index as u32,
+                events: record.events.len() as u32,
+                record: CombatRecord { events: Vec::new(), ..record.clone() },
+            })
+            .collect();
         for (conn, role) in self.conns.clone() {
-            for record in &combats {
+            for (index, record) in combats.iter().enumerate() {
                 let involved = match role {
                     Role::Spectator => true,
                     Role::Seat(i) => {
@@ -440,11 +491,16 @@ impl Session {
                         record.home == me || record.away == Opponent::Player(me)
                     }
                 };
-                if involved {
-                    self.send(conn, ServerMsg::Combat(record.clone()));
+                if !involved {
+                    continue;
+                }
+                match seeds.get(index).filter(|_| !self.full_fights.contains(&conn)) {
+                    Some(seed) => self.send(conn, seed.clone()),
+                    None => self.send(conn, ServerMsg::Combat(record.clone())),
                 }
             }
         }
+        self.shown = (round, combats);
         self.broadcast(now);
     }
 
@@ -462,8 +518,17 @@ impl Session {
             if !events.is_empty() {
                 self.send(conn, ServerMsg::Events(events));
             }
+            // Only what changed since the view this connection has.
             let view = self.view(viewer, now);
-            self.send(conn, ServerMsg::State(view));
+            match self.views.get(&conn) {
+                Some(last) => {
+                    if let Some(update) = last.diff(&view) {
+                        self.send(conn, ServerMsg::Update(update));
+                    }
+                }
+                None => self.send(conn, ServerMsg::State(view.clone())),
+            }
+            self.views.insert(conn, view);
         }
     }
 

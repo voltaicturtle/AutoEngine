@@ -30,11 +30,36 @@ fn inbox_of(all: &[(ConnId, ServerMsg)], conn: ConnId) -> Vec<ServerMsg> {
     all.iter().filter(|(c, _)| *c == conn).map(|(_, m)| m.clone()).collect()
 }
 
-fn last_state(messages: &[ServerMsg]) -> Option<&GameView> {
-    messages.iter().rev().find_map(|m| match m {
-        ServerMsg::State(v) => Some(v),
-        _ => None,
-    })
+/// The view a client would hold after these messages: the last whole
+/// state with every later update applied.
+fn last_state(messages: &[ServerMsg]) -> Option<GameView> {
+    let mut view: Option<GameView> = None;
+    for m in messages {
+        match m {
+            ServerMsg::State(v) => view = Some(v.clone()),
+            ServerMsg::Update(u) => {
+                // Tests that threw the first state away still get the header.
+                let base = view.get_or_insert_with(|| GameView {
+                    phase: u.phase,
+                    round_index: 0,
+                    round_name: String::new(),
+                    round_kind: String::new(),
+                    stage: 0,
+                    you: None,
+                    players: Vec::new(),
+                    awaiting: Vec::new(),
+                    options: Vec::new(),
+                });
+                base.patch(u.clone());
+            }
+            _ => {}
+        }
+    }
+    view
+}
+
+fn is_fight(message: &ServerMsg) -> bool {
+    matches!(message, ServerMsg::Combat(_) | ServerMsg::CombatSeed { .. })
 }
 
 fn errors(messages: &[ServerMsg]) -> Vec<&str> {
@@ -75,7 +100,8 @@ fn messages_survive_the_wire_format() {
             break;
         }
     }
-    assert!(all.iter().any(|m| matches!(m, ServerMsg::Combat(_))));
+    assert!(all.iter().any(is_fight));
+    assert!(all.iter().any(|m| matches!(m, ServerMsg::Update(_))));
     for m in &all {
         assert_eq!(&decode::<ServerMsg>(&encode(m)).unwrap(), m);
     }
@@ -156,7 +182,7 @@ fn rounds_advance_on_ready_or_when_time_runs_out() {
     // Everyone ready: the round resolves immediately.
     s.handle(1, ClientMsg::Command(Command::Ready), 100);
     let msgs = inbox(&mut s, 1);
-    assert_eq!(msgs.iter().filter(|m| matches!(m, ServerMsg::Combat(_))).count(), 1, "your own fight only");
+    assert_eq!(msgs.iter().filter(|m| is_fight(m)).count(), 1, "your own fight only");
     assert!(matches!(last_state(&msgs).unwrap().phase, ViewPhase::Showing { .. }));
     assert_eq!(s.game().unwrap().round_index(), 1);
 
@@ -239,10 +265,13 @@ fn spectators_see_every_fight_but_no_private_information() {
     s.handle(1, ClientMsg::Command(Command::Ready), 0);
     let all = s.drain_outbox();
     let watch: Vec<&ServerMsg> = all.iter().filter(|(c, _)| *c == 5).map(|(_, m)| m).collect();
-    assert_eq!(watch.iter().filter(|m| matches!(m, ServerMsg::Combat(_))).count(), 4, "one neutral fight per player");
+    assert_eq!(watch.iter().filter(|m| is_fight(m)).count(), 4, "one neutral fight per player");
     for m in &watch {
         if let ServerMsg::State(v) = m {
             assert!(v.players.iter().all(|p| p.shop.is_empty()));
+        }
+        if let ServerMsg::Update(u) = m {
+            assert!(u.players.iter().all(|p| p.shop.is_empty()));
         }
         if let ServerMsg::Events(events) = m {
             assert!(!events.iter().any(|e| matches!(e, GameEvent::ShopRolled { .. })));
@@ -304,21 +333,23 @@ fn a_client_can_play_over_tcp() {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while rounds_seen.len() < 4 {
         assert!(std::time::Instant::now() < deadline, "timed out waiting for rounds");
-        match ana.recv_timeout(wait).expect("the server keeps talking") {
-            ServerMsg::State(view) => {
-                if matches!(view.phase, ViewPhase::Planning { .. }) {
-                    rounds_seen.insert(view.round_index);
-                    if readied_for != Some(view.round_index) {
-                        readied_for = Some(view.round_index);
-                        ana.send(&ClientMsg::Command(Command::Ready)).unwrap();
-                    }
-                }
+        let message = ana.recv_timeout(wait).expect("the server keeps talking");
+        let header = match &message {
+            ServerMsg::State(view) => Some((view.phase, view.round_index)),
+            ServerMsg::Update(update) => Some((update.phase, update.round_index)),
+            _ => None,
+        };
+        if let Some((ViewPhase::Planning { .. }, round)) = header {
+            rounds_seen.insert(round);
+            if readied_for != Some(round) {
+                readied_for = Some(round);
+                ana.send(&ClientMsg::Command(Command::Ready)).unwrap();
             }
-            ServerMsg::Combat(record) => {
-                assert_eq!(record.home, PlayerId(0));
-                fights += 1;
-            }
-            _ => {}
+        }
+        if let ServerMsg::CombatSeed { record, .. } = message {
+            assert_eq!(record.home, PlayerId(0));
+            assert!(record.events.is_empty(), "the log is left out; the client fights it again");
+            fights += 1;
         }
     }
     assert!(fights >= 3);

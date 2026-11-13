@@ -31,7 +31,7 @@ const BENCH_SPACING: f32 = 1.55;
 
 impl Layout {
     pub fn new(app: &App) -> Self {
-        let rules = app.state.content.as_ref().map(|c| c.rules().clone()).unwrap_or_default();
+        let rules = app.net.state.content.as_ref().map(|c| c.rules().clone()).unwrap_or_default();
         let (cols, rows) = (rules.board_cols as i32, rules.board_rows as i32);
         let (left_w, right_w) = (210.0, 300.0);
         let (w, h) = (screen_width(), screen_height());
