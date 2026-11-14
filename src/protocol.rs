@@ -8,7 +8,7 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::content::{AugmentDef, ContentSet, GameRules, ItemDef, TraitDef, UnitDef};
+use crate::content::{ActiveTrait, AugmentDef, ContentSet, GameRules, ItemDef, TraitDef, UnitDef};
 use crate::game::{CombatRecord, Command, GameEvent, Player, PlayerId};
 
 /// Bumped whenever the messages change incompatibly.
@@ -127,6 +127,20 @@ pub enum ViewPhase {
     Over { winner: Option<PlayerId> },
 }
 
+/// Figures about a player that follow from the rules. The server works them
+/// out and sends them, so clients show exactly what the server will use and
+/// never compute game values themselves.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlayerStatus {
+    pub player: PlayerId,
+    /// Units the player may have on the board at their level.
+    pub board_limit: usize,
+    /// Experience needed for the next level, or `None` at the top level.
+    pub xp_to_next: Option<u32>,
+    /// Every trait on the player's board, with the breakpoint reached.
+    pub traits: Vec<ActiveTrait>,
+}
+
 /// A snapshot of the game as one client is allowed to see it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameView {
@@ -143,6 +157,16 @@ pub struct GameView {
     pub awaiting: Vec<PlayerId>,
     /// What the round offers the viewer; `None` entries are taken.
     pub options: Vec<Option<String>>,
+    /// One per player, in seat order.
+    #[serde(default)]
+    pub status: Vec<PlayerStatus>,
+}
+
+impl GameView {
+    /// The server's figures for one player.
+    pub fn status_of(&self, player: PlayerId) -> Option<&PlayerStatus> {
+        self.status.iter().find(|s| s.player == player)
+    }
 }
 
 /// What changed in a [`GameView`] since the last one the client was sent.
@@ -157,6 +181,9 @@ pub struct ViewUpdate {
     pub players: Vec<Player>,
     pub awaiting: Vec<PlayerId>,
     pub options: Vec<Option<String>>,
+    /// Only the statuses that changed.
+    #[serde(default)]
+    pub status: Vec<PlayerStatus>,
 }
 
 impl GameView {
@@ -169,9 +196,12 @@ impl GameView {
             .filter(|p| self.players.get(p.id.0 as usize) != Some(p))
             .cloned()
             .collect();
+        let status: Vec<PlayerStatus> =
+            newer.status.iter().filter(|s| self.status_of(s.player) != Some(s)).cloned().collect();
         let same_phase = std::mem::discriminant(&self.phase) == std::mem::discriminant(&newer.phase)
             && !matches!(newer.phase, ViewPhase::Over { .. });
         let unchanged = players.is_empty()
+            && status.is_empty()
             && same_phase
             && self.round_index == newer.round_index
             && self.round_name == newer.round_name
@@ -191,6 +221,7 @@ impl GameView {
             players,
             awaiting: newer.awaiting.clone(),
             options: newer.options.clone(),
+            status,
         })
     }
 
@@ -208,6 +239,12 @@ impl GameView {
             match self.players.get_mut(seat) {
                 Some(slot) => *slot = player,
                 None => self.players.push(player),
+            }
+        }
+        for status in update.status {
+            match self.status.iter_mut().find(|s| s.player == status.player) {
+                Some(slot) => *slot = status,
+                None => self.status.push(status),
             }
         }
     }
@@ -234,7 +271,9 @@ pub enum ServerMsg {
     /// `Welcome` gives the same `events` events. A client that cannot do
     /// that, or gets a different fight, asks with
     /// [`ClientMsg::ResendCombat`] (or opts out with [`ClientMsg::Options`]).
-    CombatSeed { id: u32, events: u32, record: CombatRecord },
+    /// `checksum` is [`events_checksum`] of the server's events: a client
+    /// shows its own result only if every event matches.
+    CombatSeed { id: u32, events: u32, checksum: u64, record: CombatRecord },
     /// "Are you there?" The other end answers [`ClientMsg::Pong`].
     Ping,
     /// The answer to [`ClientMsg::Ping`].
@@ -251,6 +290,17 @@ pub fn visible_to(event: &GameEvent, viewer: Option<PlayerId>) -> bool {
         GameEvent::ChoiceOffered { player: Some(player), .. } => Some(*player) == viewer,
         _ => true,
     }
+}
+
+/// A fingerprint of a fight's events (FNV-1a over their JSON), so a client
+/// that fought a fight again can check it got exactly the server's events.
+pub fn events_checksum(events: &[crate::combat::Event]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in encode(&events).bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// Encodes a message as one line of JSON, without the newline.

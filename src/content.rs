@@ -399,7 +399,7 @@ pub struct MatchSetup {
 }
 
 /// The state of one trait for a given board.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveTrait {
     pub id: String,
     /// Distinct units on the board with this trait.

@@ -18,8 +18,21 @@ use crate::content::ContentSet;
 use crate::game::{CombatRecord, Game, Opponent, PlayerId};
 use crate::replay::ReplayFile;
 use crate::protocol::DevCommand;
-use crate::protocol::{ClientMsg, ContentInfo, GameView, PROTOCOL_VERSION, ServerMsg, ViewPhase, visible_to};
+use crate::protocol::{
+    ClientMsg, ContentInfo, GameView, PROTOCOL_VERSION, PlayerStatus, ServerMsg, ViewPhase, events_checksum, visible_to,
+};
 use crate::rng::Rng;
+
+/// Whether a viewer is sent a fight: players see their own, spectators all.
+fn may_see(role: Role, record: &CombatRecord) -> bool {
+    match role {
+        Role::Spectator => true,
+        Role::Seat(i) => {
+            let me = PlayerId(i as u8);
+            record.home == me || record.away == Opponent::Player(me)
+        }
+    }
+}
 
 /// Something to run on a game when it starts.
 type Setup = Box<dyn FnMut(&mut Game) + Send>;
@@ -270,7 +283,11 @@ impl Session {
             }
             ClientMsg::ResendCombat { id } => {
                 let (round, index) = (id >> 8, (id & 0xff) as usize);
-                match self.shown.1.get(index).filter(|_| round == self.shown.0 && self.conns.contains_key(&conn)) {
+                let role = self.conns.get(&conn).copied();
+                let visible = self.shown.1.get(index).filter(|record| {
+                    round == self.shown.0 && role.is_some_and(|role| may_see(role, record))
+                });
+                match visible {
                     Some(record) => {
                         let record = record.clone();
                         self.send(conn, ServerMsg::Combat(record));
@@ -479,19 +496,13 @@ impl Session {
             .map(|(index, record)| ServerMsg::CombatSeed {
                 id: round << 8 | index as u32,
                 events: record.events.len() as u32,
+                checksum: events_checksum(&record.events),
                 record: CombatRecord { events: Vec::new(), ..record.clone() },
             })
             .collect();
         for (conn, role) in self.conns.clone() {
             for (index, record) in combats.iter().enumerate() {
-                let involved = match role {
-                    Role::Spectator => true,
-                    Role::Seat(i) => {
-                        let me = PlayerId(i as u8);
-                        record.home == me || record.away == Opponent::Player(me)
-                    }
-                };
-                if !involved {
+                if !may_see(role, record) {
                     continue;
                 }
                 match seeds.get(index).filter(|_| !self.full_fights.contains(&conn)) {
@@ -561,11 +572,26 @@ impl Session {
             players,
             awaiting: game.awaiting(),
             options: viewer.map(|id| game.options(id)).unwrap_or_default(),
+            status: game.players().iter().map(|p| status(game, p.id)).collect(),
         }
     }
 
     /// Whether a seat is currently played by a bot.
     pub fn seat_is_bot(&self, seat: usize) -> bool {
         self.is_bot(seat)
+    }
+}
+
+/// The server's figures for one player (see [`PlayerStatus`]).
+fn status(game: &Game, id: PlayerId) -> PlayerStatus {
+    let levels = &game.content().rules().levels;
+    let level = game.player(id).level as usize;
+    PlayerStatus {
+        player: id,
+        board_limit: game.board_limit(id),
+        xp_to_next: levels.get(level.saturating_sub(1)).filter(|_| level < levels.len()).map(|l| l.xp_to_next),
+        // Content is checked when it is loaded, so this cannot fail for a
+        // board the game itself built.
+        traits: game.content().active_traits(&game.team_setup(id).units).unwrap_or_default(),
     }
 }

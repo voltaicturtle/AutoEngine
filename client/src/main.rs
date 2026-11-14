@@ -53,7 +53,7 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 
 use autoengine::combat::UnitId;
-use autoengine::content::{BoardUnit, UnitDef};
+use autoengine::content::UnitDef;
 use autoengine::game::{Command, Opponent, OwnedUnit, Player, PlayerId, Slot};
 use autoengine::hex::Hex;
 use autoengine::net::{GameClient, Status};
@@ -396,8 +396,10 @@ impl App {
             self.autoplay_step = (Some(view.round_index), 0, now);
         }
         let (_, step, since) = self.autoplay_step;
+        // Board size is static content from the server; how many units fit
+        // is the server's figure.
         let rules = content.rules().clone();
-        let limit = rules.levels[(me.level as usize - 1).min(rules.levels.len() - 1)].board_size;
+        let Some(limit) = view.status_of(me.id).map(|s| s.board_limit) else { return };
         let mut commands = Vec::new();
         if step == 0 {
             let mut gold = me.gold;
@@ -664,17 +666,16 @@ fn draw_top_bar(app: &App) {
     };
     text_centered(&phase, w / 2.0, 29.0, 24.0, ui().accent);
     if let Some(me) = app.me() {
-        let xp_needed = app
-            .net.state
-            .content
-            .as_ref()
-            .and_then(|c| c.rules().levels.get(me.level as usize - 1))
-            .map(|l| l.xp_to_next)
-            .unwrap_or(0);
+        // Figures that follow from the rules come from the server.
+        let status = app.net.state.view.as_ref().and_then(|v| v.status_of(me.id));
+        let xp = match status.and_then(|s| s.xp_to_next) {
+            Some(needed) => format!("{}/{} xp", me.xp, needed),
+            None => "max".to_string(),
+        };
         let x = w - 520.0;
         label(&format!("Health {}", me.health.max(0)), x, 29.0, 22.0, if me.health > 30 { ui().good } else { ui().bad });
         label(&format!("Gold {}", me.gold), x + 140.0, 29.0, 22.0, ui().gold);
-        label(&format!("Level {}  ({}/{} xp)", me.level, me.xp, xp_needed), x + 250.0, 29.0, 22.0, ui().text);
+        label(&format!("Level {}  ({xp})", me.level), x + 250.0, 29.0, 22.0, ui().text);
     } else {
         label("Spectating", w - 140.0, 29.0, 22.0, ui().muted);
     }
@@ -684,8 +685,9 @@ fn draw_traits(app: &App, layout: &Layout) {
     panel(0.0, 44.0, layout.left_w, screen_height() - 44.0, ui().panel);
     label("Traits", 14.0, 74.0, 22.0, ui().text);
     let (Some(player), Some(content)) = (app.shown_player(), &app.net.state.content) else { return };
-    let units: Vec<BoardUnit> = player.board_units();
-    let Ok(mut traits) = content.active_traits(&units) else { return };
+    // The server works out which traits are active; this only draws them.
+    let Some(status) = app.net.state.view.as_ref().and_then(|v| v.status_of(player.id)) else { return };
+    let mut traits = status.traits.clone();
     traits.sort_by_key(|t| (t.tier.is_none(), std::cmp::Reverse(t.count)));
     let mut y = 104.0;
     for t in traits {

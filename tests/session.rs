@@ -49,6 +49,7 @@ fn last_state(messages: &[ServerMsg]) -> Option<GameView> {
                     players: Vec::new(),
                     awaiting: Vec::new(),
                     options: Vec::new(),
+                    status: Vec::new(),
                 });
                 base.patch(u.clone());
             }

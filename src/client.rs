@@ -67,7 +67,7 @@ impl ClientState {
                     view.patch(update);
                 }
             }
-            ServerMsg::CombatSeed { id, events, mut record } => {
+            ServerMsg::CombatSeed { id, events, checksum, mut record } => {
                 // Fights are deterministic: fight it again here instead of
                 // downloading every event. If that is not possible, or the
                 // result differs, ask for the whole log.
@@ -75,7 +75,14 @@ impl ClientState {
                     Some(content) => crate::replay::fight_again(content, &record, events as usize),
                     None => Err("no content yet".into()),
                 };
-                match fought {
+                // Shown only if every event is the server's.
+                match fought.and_then(|events| {
+                    if crate::protocol::events_checksum(&events) == checksum {
+                        Ok(events)
+                    } else {
+                        Err("the events differ from the server's".to_string())
+                    }
+                }) {
                     Ok(events) => {
                         record.events = events;
                         self.combats.push_back(record);

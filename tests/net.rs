@@ -192,9 +192,12 @@ fn a_fight_that_plays_out_differently_is_asked_for_in_full() {
     s.handle(1, ClientMsg::Command(Command::Ready), 1);
     let mut state = ClientState::new();
     for (_, message) in s.drain_outbox() {
-        // A client whose engine disagrees: pretend the seed says something else.
+        // A client whose engine disagrees on one event somewhere: same
+        // winner, same length, same number of events, different checksum.
         let message = match message {
-            ServerMsg::CombatSeed { id, events, record } => ServerMsg::CombatSeed { id, events: events + 1, record },
+            ServerMsg::CombatSeed { id, events, checksum, record } => {
+                ServerMsg::CombatSeed { id, events, checksum: checksum ^ 1, record }
+            }
             other => other,
         };
         state.apply(message);

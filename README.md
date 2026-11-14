@@ -56,7 +56,7 @@ the theme, models and icons.
 - **Fights**: tick-based combat on a hex board with targeting, movement, mana and abilities, shields, statuses, triggered passives and summons. Abilities, trait bonuses and item effects are data built from the same blocks.
 - **The game around them**: shared unit pool, shop odds by level, gold with interest and streaks, bench and board, star upgrades, item recipes, augments, elimination and placements.
 - **Rounds**: player fights, neutral fights, a shared draft, choice rounds, and your own kinds from scripts or Rust, in whatever order `rounds.ron` says.
-- **Hosting**: a headless server with bots for empty seats, reconnecting, spectators and per-player hiding of private information. Clients hold no game rules. Only changes are sent, fights travel as a seed the client replays, and slow, silent or flooding connections are dropped without affecting anyone else.
+- **Hosting**: a headless server with bots for empty seats, reconnecting, spectators and per-player hiding of private information. The server decides every result and clients only send intents. Only changes are sent, fights travel as a seed the client replays, and slow, silent or flooding connections are dropped without affecting anyone else.
 - **A 3D client**: models through Assimp, skeletal animation, particles, sound, settings, and everything visual driven by data files.
 - **Determinism**: integer math and seeded dice, so the same seed always gives the same fight and the same game. Replays, content tests and the simulator rest on this.
 
