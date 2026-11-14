@@ -1,0 +1,12 @@
+// Items. An item with a `recipe` is made by putting its two components on
+// the same unit.
+[
+    (id: "iron_ingot", name: "Iron Ingot", mods: [(stat: Armor, flat: 20)]),
+    (id: "sharp_flint", name: "Sharp Flint", mods: [(stat: AttackDamage, flat: 15)]),
+    (
+        id: "spiked_plate",
+        name: "Spiked Plate",
+        recipe: ("iron_ingot", "sharp_flint"),
+        mods: [(stat: Armor, flat: 40), (stat: AttackDamage, flat: 25)],
+    ),
+]

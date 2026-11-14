@@ -1,0 +1,22 @@
+[package]
+name = "autoengine-client"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# Sound playback. Off by default: it needs the system audio library (ALSA
+# development files on Linux) to build and a sound device to run.
+audio = ["macroquad/audio"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+ron = "0.12"
+autoengine = { path = "..", package = "AutoEngine" }
+# OpenGL windowing, drawing and input. Audio is left out so the client
+# builds without extra system libraries.
+macroquad = { version = "0.4", default-features = false }
+# Assimp bindings for model loading. "prebuilt" downloads a ready-made
+# Assimp shared library at build time, so none has to be installed. `cargo
+# run` finds it by itself; to run the executable directly, keep the library
+# next to it (see build.rs). Drop the feature to link a system Assimp.
+russimp = { version = "3.2", features = ["prebuilt"] }

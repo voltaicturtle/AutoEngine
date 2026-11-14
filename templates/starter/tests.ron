@@ -1,0 +1,28 @@
+// Fights with an expected result, run by `autoengine test`. Use them to pin
+// down what your content is supposed to do, so a later change that breaks
+// it is caught.
+//
+// Each test is fought `runs` times with different dice. Positions are
+// (column, row) from each team's own side: row 4 is the front line and
+// row 7 the back.
+(
+    tests: [
+        (
+            name: "two guards beat one",
+            runs: 5,
+            teams: [
+                (units: [(unit: "shield_bearer", pos: (3, 4)), (unit: "field_medic", pos: (3, 6))]),
+                (units: [(unit: "shield_bearer", pos: (3, 4))]),
+            ],
+            expect: [Winner(0), Survives(0, "shield_bearer"), LastsAtMost(seconds: 40)],
+        ),
+        (
+            name: "a longbow gets its shot off",
+            teams: [
+                (units: [(unit: "longbow", pos: (3, 7))]),
+                (units: [(unit: "training_dummy", pos: (3, 4))]),
+            ],
+            expect: [Casts(0, "longbow"), Dies(1, "training_dummy")],
+        ),
+    ],
+)

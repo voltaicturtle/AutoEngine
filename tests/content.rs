@@ -35,7 +35,7 @@ fn expect_invalid(result: Result<ContentSet, ContentError>, needle: &str) {
 #[test]
 fn sample_content_loads_and_is_indexed() {
     let c = sample();
-    assert_eq!(c.units().count(), 8);
+    assert_eq!(c.units().count(), 9);
     assert_eq!(c.traits().count(), 5);
     assert_eq!(c.items().count(), 6);
     assert_eq!(c.board().len(), 56);
@@ -258,4 +258,29 @@ fn summons_and_trait_passives_work_from_data() {
     let wisps = combat.units().iter().filter(|u| u.name() == "Grave Wisp").count();
     assert_eq!(wisps, 2, "the keeper's death summons two wisps from the content set");
     assert!(combat.units().iter().filter(|u| u.name() == "Grave Wisp").all(|u| u.team().0 == 0));
+}
+
+#[test]
+fn sample_units_name_model_files_that_exist() {
+    let content = sample();
+    let mut with_model = 0;
+    for unit in content.units() {
+        if let Some(model) = &unit.model {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("content").join(&model.file);
+            assert!(path.is_file(), "{} names a missing model: {}", unit.id, model.file);
+            assert!(model.scale_percent > 0);
+            with_model += 1;
+        }
+    }
+    assert!(with_model > 0);
+}
+
+#[test]
+fn a_mistyped_id_gets_a_suggestion() {
+    let err = sample().setup_combat(1, &[TeamSetup { units: vec![unit("ironbark_wardn", (3, 4))], bonuses: vec![] }]);
+    let message = err.err().expect("the unit does not exist").to_string();
+    assert!(message.contains("unknown unit `ironbark_wardn` (did you mean `ironbark_warden`?)"), "{message}");
+    // Nothing is suggested when nothing is close.
+    let err = sample().setup_combat(1, &[TeamSetup { units: vec![unit("zzz", (3, 4))], bonuses: vec![] }]);
+    assert!(!err.err().unwrap().to_string().contains("did you mean"));
 }

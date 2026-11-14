@@ -1,0 +1,9 @@
+newmtl bark
+Kd 0.360 0.250 0.160
+
+newmtl leaf
+Kd 0.250 0.550 0.240
+
+newmtl iron
+Kd 0.620 0.650 0.700
+

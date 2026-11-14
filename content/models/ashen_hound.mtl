@@ -1,0 +1,9 @@
+newmtl fur
+Kd 0.300 0.290 0.310
+
+newmtl eye
+Kd 1.000 0.900 0.400
+
+newmtl ember
+Kd 0.950 0.420 0.140
+

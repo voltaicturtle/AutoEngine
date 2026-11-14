@@ -20,6 +20,8 @@
         id: "cinder_blade",
         name: "Cinder Blade",
         recipe: ("whetstone", "ember_core"),
+        // The third Cinder unit has to be made with this blade.
+        grants_traits: ["cinder"],
         mods: [(stat: AttackDamage, flat: 25), (stat: AttackSpeed, permille: 150)],
         passives: [
             (

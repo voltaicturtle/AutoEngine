@@ -1,0 +1,9 @@
+newmtl robe
+Kd 0.160 0.400 0.660
+
+newmtl skin
+Kd 0.800 0.900 0.950
+
+newmtl orb
+Kd 0.550 0.950 1.000
+

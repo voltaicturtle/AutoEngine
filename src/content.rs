@@ -49,6 +49,30 @@ pub struct UnitDef {
     /// to `false`.
     #[serde(default = "default_true")]
     pub in_shop: bool,
+    /// How graphical clients should draw the unit. The engine itself never
+    /// looks at this.
+    #[serde(default)]
+    pub model: Option<ModelRef>,
+}
+
+/// A 3D model for a unit: display-only data that travels with the content
+/// so every client draws the same thing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRef {
+    /// Model file, relative to the client's assets directory. Any format
+    /// the client's importer understands (OBJ, glTF, FBX, PLY, ...).
+    pub file: String,
+    /// Height on the board as a percentage of the standard unit height.
+    #[serde(default = "default_hundred")]
+    pub scale_percent: u32,
+    /// Turn applied to the model so that it faces forward, for files
+    /// authored facing another way.
+    #[serde(default)]
+    pub yaw_degrees: i32,
+}
+
+fn default_hundred() -> u32 {
+    100
 }
 
 /// Who receives a bonus.
@@ -108,6 +132,58 @@ pub struct ItemDef {
     pub recipe: Option<(String, String)>,
 }
 
+/// Gold and experience rules.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EconomyRules {
+    pub starting_gold: i64,
+    /// Gold every player receives at the start of each round after the first.
+    pub round_income: i64,
+    /// One extra gold per this much gold held...
+    pub interest_per: i64,
+    /// ...up to this much.
+    pub interest_cap: i64,
+    /// Gold for winning a fight against another player.
+    pub win_bonus: i64,
+    /// `(streak length, gold)` pairs; the longest streak reached applies to
+    /// both win and loss streaks.
+    pub streak_bonuses: Vec<(u32, i64)>,
+    pub reroll_cost: i64,
+    pub xp_cost: i64,
+    pub xp_per_purchase: u32,
+    /// Experience every player gains each round.
+    pub xp_per_round: u32,
+}
+
+impl Default for EconomyRules {
+    fn default() -> Self {
+        EconomyRules {
+            starting_gold: 4,
+            round_income: 5,
+            interest_per: 10,
+            interest_cap: 5,
+            win_bonus: 1,
+            streak_bonuses: vec![(2, 1), (4, 2), (6, 3)],
+            reroll_cost: 2,
+            xp_cost: 4,
+            xp_per_purchase: 4,
+            xp_per_round: 2,
+        }
+    }
+}
+
+/// What one player level means.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LevelRule {
+    /// Experience needed to reach the next level. Ignored on the last level.
+    pub xp_to_next: u32,
+    /// How many units the player may field.
+    pub board_size: usize,
+    /// Relative chance of each unit cost appearing in the shop, starting at
+    /// cost 1.
+    pub shop_odds: Vec<u32>,
+}
+
 /// Global rules, authored in `rules.ron`. Every field has a default.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -117,10 +193,32 @@ pub struct GameRules {
     pub max_items_per_unit: usize,
     /// Stat modifiers for each star level; the first entry is one star.
     pub star_levels: Vec<Vec<StatMod>>,
+    /// Copies of a unit at the same star level that merge into the next.
+    pub copies_to_upgrade: u32,
+    pub shop_size: usize,
+    pub bench_size: usize,
+    pub starting_health: i64,
+    pub economy: EconomyRules,
+    /// One entry per player level, starting at level 1.
+    pub levels: Vec<LevelRule>,
+    /// Copies of each unit in the shared pool, by unit cost.
+    pub pool_sizes: BTreeMap<u32, u32>,
+    /// Pool size for costs not listed in `pool_sizes`.
+    pub default_pool_size: u32,
+    /// Damage a player takes for losing a fight, by stage (starting at
+    /// stage 1). Later stages reuse the last entry plus one per extra stage.
+    pub base_damage_by_stage: Vec<i64>,
+    /// Extra damage per enemy unit left standing.
+    pub damage_per_survivor: i64,
 }
 
 impl Default for GameRules {
     fn default() -> Self {
+        let level = |xp_to_next, board_size, shop_odds: [u32; 5]| LevelRule {
+            xp_to_next,
+            board_size,
+            shop_odds: shop_odds.to_vec(),
+        };
         GameRules {
             board_cols: 7,
             board_rows: 8,
@@ -138,7 +236,132 @@ impl Default for GameRules {
                     StatMod::percent(Stat::AbilityPower, 1250),
                 ],
             ],
+            copies_to_upgrade: 3,
+            shop_size: 5,
+            bench_size: 9,
+            starting_health: 100,
+            economy: EconomyRules::default(),
+            levels: vec![
+                level(2, 1, [100, 0, 0, 0, 0]),
+                level(2, 2, [100, 0, 0, 0, 0]),
+                level(6, 3, [75, 25, 0, 0, 0]),
+                level(10, 4, [55, 30, 15, 0, 0]),
+                level(20, 5, [45, 33, 20, 2, 0]),
+                level(36, 6, [30, 40, 25, 5, 0]),
+                level(56, 7, [19, 30, 35, 15, 1]),
+                level(0, 8, [15, 20, 35, 25, 5]),
+            ],
+            pool_sizes: BTreeMap::from([(1, 29), (2, 22), (3, 18), (4, 12), (5, 10)]),
+            default_pool_size: 10,
+            base_damage_by_stage: vec![2, 3, 5, 8, 12, 17],
+            damage_per_survivor: 1,
         }
+    }
+}
+
+/// An augment-style modifier a player can pick up: team-wide bonuses for the
+/// rest of the game, optionally with some gold up front.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AugmentDef {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub bonuses: Vec<Bonus>,
+    #[serde(default)]
+    pub gold: i64,
+}
+
+/// What a choice round offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ChoiceOffer {
+    #[default]
+    Augments,
+    Items,
+}
+
+/// The kind of a round and its settings. The built-in kinds cover fights and
+/// non-combat rounds; `Custom` names a round type registered by the game
+/// built on the engine.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoundKindDef {
+    /// Players are paired off and fight each other.
+    Pvp,
+    /// Every player fights the same neutral board. Winning grants the rewards.
+    Pve {
+        enemies: Vec<BoardUnit>,
+        #[serde(default)]
+        gold: i64,
+        /// Number of random component items.
+        #[serde(default)]
+        items: u32,
+    },
+    /// A shared draft: one pool of units is offered to everyone and players
+    /// pick in turn, lowest health first.
+    Draft {
+        /// Offers beyond one per player.
+        #[serde(default)]
+        extra: u32,
+        #[serde(default)]
+        max_cost: Option<u32>,
+    },
+    /// Each player privately picks one of several options. No combat.
+    Choice {
+        options: u32,
+        #[serde(default)]
+        offer: ChoiceOffer,
+    },
+    /// A round type supplied by the game, looked up by name.
+    Custom {
+        kind: String,
+        #[serde(default)]
+        params: BTreeMap<String, i64>,
+    },
+}
+
+fn default_stage() -> u32 {
+    1
+}
+
+/// One entry of the round schedule.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundDef {
+    pub name: String,
+    #[serde(default = "default_stage")]
+    pub stage: u32,
+    pub kind: RoundKindDef,
+}
+
+/// The order of rounds in a game, authored in `rounds.ron`. When the list
+/// runs out it loops back to `repeat_from`, one stage higher each time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Schedule {
+    pub rounds: Vec<RoundDef>,
+    #[serde(default)]
+    pub repeat_from: usize,
+}
+
+impl Default for Schedule {
+    fn default() -> Self {
+        Schedule {
+            rounds: vec![RoundDef { name: "Fight".into(), stage: 1, kind: RoundKindDef::Pvp }],
+            repeat_from: 0,
+        }
+    }
+}
+
+impl Schedule {
+    /// The round at a position in the game, with its effective stage.
+    pub fn round(&self, index: usize) -> (&RoundDef, u32) {
+        if index < self.rounds.len() {
+            let def = &self.rounds[index];
+            return (def, def.stage);
+        }
+        let cycle = self.rounds.len() - self.repeat_from;
+        let past = index - self.rounds.len();
+        let def = &self.rounds[self.repeat_from + past % cycle];
+        (def, def.stage + 1 + (past / cycle) as u32)
     }
 }
 
@@ -176,7 +399,7 @@ pub struct MatchSetup {
 }
 
 /// The state of one trait for a given board.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveTrait {
     pub id: String,
     /// Distinct units on the board with this trait.
@@ -213,6 +436,31 @@ impl std::fmt::Display for ContentError {
 
 impl std::error::Error for ContentError {}
 
+/// " (did you mean `x`?)" for the known id closest to a mistyped one, or
+/// nothing if none is close.
+fn suggestion<'a>(wrong: &str, known: impl Iterator<Item = &'a String>) -> String {
+    fn distance(a: &str, b: &str) -> usize {
+        let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+        let mut row: Vec<usize> = (0..=b.len()).collect();
+        for i in 1..=a.len() {
+            let mut previous = row[0];
+            row[0] = i;
+            for j in 1..=b.len() {
+                let swap = previous + usize::from(a[i - 1] != b[j - 1]);
+                previous = row[j];
+                row[j] = swap.min(row[j] + 1).min(row[j - 1] + 1);
+            }
+        }
+        row[b.len()]
+    }
+    let limit = (wrong.chars().count() / 3).max(1);
+    known
+        .map(|id| (distance(wrong, id), id))
+        .filter(|(d, _)| *d <= limit)
+        .min()
+        .map_or(String::new(), |(_, id)| format!(" (did you mean `{id}`?)"))
+}
+
 fn invalid<T>(message: String) -> Result<T, ContentError> {
     Err(ContentError::Invalid(message))
 }
@@ -230,16 +478,59 @@ fn read(path: &Path) -> Result<String, ContentError> {
         .map_err(|e| ContentError::Io { path: path.display().to_string(), message: e.to_string() })
 }
 
+fn index<T>(
+    kind: &str,
+    defs: Vec<T>,
+    id: impl Fn(&T) -> &str,
+) -> Result<BTreeMap<String, T>, ContentError> {
+    let mut map = BTreeMap::new();
+    for def in defs {
+        let key = id(&def).to_string();
+        if key.is_empty() {
+            return invalid(format!("a {kind} has an empty id"));
+        }
+        if map.insert(key.clone(), def).is_some() {
+            return invalid(format!("duplicate {kind} id `{key}`"));
+        }
+    }
+    Ok(map)
+}
+
 /// All the content of a game, validated and indexed by id.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ContentSet {
     units: BTreeMap<String, UnitDef>,
     traits: BTreeMap<String, TraitDef>,
     items: BTreeMap<String, ItemDef>,
+    augments: BTreeMap<String, AugmentDef>,
+    schedule: Schedule,
     rules: GameRules,
+    /// Script sources by name (see the `script` module).
+    scripts: BTreeMap<String, String>,
 }
 
 impl ContentSet {
+    /// Adds scripts, given as name and source, after checking that they
+    /// compile. A script named `x` defines the round kind `x`.
+    pub fn with_scripts(mut self, scripts: BTreeMap<String, String>) -> Result<Self, ContentError> {
+        #[cfg(feature = "scripting")]
+        crate::script::ScriptHost::compile(&scripts)
+            .map_err(|e| ContentError::Parse { file: format!("scripts/{}.rhai", e.script), message: e.message })?;
+        #[cfg(not(feature = "scripting"))]
+        if let Some(name) = scripts.keys().next() {
+            return Err(ContentError::Parse {
+                file: format!("scripts/{name}.rhai"),
+                message: "this build of the engine has scripting turned off (the `scripting` cargo feature)".into(),
+            });
+        }
+        self.scripts = scripts;
+        Ok(self)
+    }
+
+    pub fn scripts(&self) -> &BTreeMap<String, String> {
+        &self.scripts
+    }
+
     /// Builds and validates a content set from already-parsed definitions.
     pub fn new(
         units: Vec<UnitDef>,
@@ -247,31 +538,31 @@ impl ContentSet {
         items: Vec<ItemDef>,
         rules: GameRules,
     ) -> Result<Self, ContentError> {
-        fn index<T>(
-            kind: &str,
-            defs: Vec<T>,
-            id: impl Fn(&T) -> &str,
-        ) -> Result<BTreeMap<String, T>, ContentError> {
-            let mut map = BTreeMap::new();
-            for def in defs {
-                let key = id(&def).to_string();
-                if key.is_empty() {
-                    return invalid(format!("a {kind} has an empty id"));
-                }
-                if map.insert(key.clone(), def).is_some() {
-                    return invalid(format!("duplicate {kind} id `{key}`"));
-                }
-            }
-            Ok(map)
-        }
         let set = ContentSet {
             units: index("unit", units, |u| &u.id)?,
             traits: index("trait", traits, |t| &t.id)?,
             items: index("item", items, |i| &i.id)?,
+            augments: BTreeMap::new(),
+            schedule: Schedule::default(),
             rules,
+            scripts: BTreeMap::new(),
         };
         set.validate()?;
         Ok(set)
+    }
+
+    /// Adds augments and re-validates.
+    pub fn with_augments(mut self, augments: Vec<AugmentDef>) -> Result<Self, ContentError> {
+        self.augments = index("augment", augments, |a| &a.id)?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Replaces the round schedule and re-validates.
+    pub fn with_schedule(mut self, schedule: Schedule) -> Result<Self, ContentError> {
+        self.schedule = schedule;
+        self.validate()?;
+        Ok(self)
     }
 
     /// Parses content from RON text. `items` and `rules` may be `None`.
@@ -289,8 +580,8 @@ impl ContentSet {
         )
     }
 
-    /// Loads `units.ron` and `traits.ron`, plus `items.ron` and `rules.ron`
-    /// if present, from a directory.
+    /// Loads `units.ron` and `traits.ron`, plus `items.ron`, `rules.ron`,
+    /// `augments.ron` and `rounds.ron` if present, from a directory.
     pub fn load_dir(dir: impl AsRef<Path>) -> Result<Self, ContentError> {
         let dir = dir.as_ref();
         let optional = |name: &str| -> Result<Option<String>, ContentError> {
@@ -301,7 +592,28 @@ impl ContentSet {
         let traits = read(&dir.join("traits.ron"))?;
         let items = optional("items.ron")?;
         let rules = optional("rules.ron")?;
-        ContentSet::from_ron(&units, &traits, items.as_deref(), rules.as_deref())
+        let mut set = ContentSet::from_ron(&units, &traits, items.as_deref(), rules.as_deref())?;
+        if let Some(text) = optional("augments.ron")? {
+            set = set.with_augments(parse_ron("augments.ron", &text)?)?;
+        }
+        if let Some(text) = optional("rounds.ron")? {
+            set = set.with_schedule(parse_ron("rounds.ron", &text)?)?;
+        }
+        let scripts_dir = dir.join("scripts");
+        if scripts_dir.is_dir() {
+            let io = |e: std::io::Error| ContentError::Io { path: scripts_dir.display().to_string(), message: e.to_string() };
+            let mut scripts = BTreeMap::new();
+            for entry in std::fs::read_dir(&scripts_dir).map_err(io)? {
+                let path = entry.map_err(io)?.path();
+                if path.extension().is_some_and(|e| e == "rhai")
+                    && let Some(name) = path.file_stem().and_then(|n| n.to_str())
+                {
+                    scripts.insert(name.to_string(), read(&path)?);
+                }
+            }
+            set = set.with_scripts(scripts)?;
+        }
+        Ok(set)
     }
 
     fn validate(&self) -> Result<(), ContentError> {
@@ -312,11 +624,23 @@ impl ContentSet {
         if r.star_levels.is_empty() {
             return invalid("rules need at least one star level".into());
         }
+        if r.levels.is_empty() {
+            return invalid("rules need at least one player level".into());
+        }
+        if r.levels.iter().any(|l| l.shop_odds.iter().all(|w| *w == 0)) {
+            return invalid("every player level needs shop odds above zero".into());
+        }
+        if r.copies_to_upgrade < 2 {
+            return invalid("copies_to_upgrade must be at least 2".into());
+        }
+        if r.economy.interest_per <= 0 {
+            return invalid("interest_per must be positive".into());
+        }
         let check_trait = |owner: &str, id: &str| {
             if self.traits.contains_key(id) {
                 Ok(())
             } else {
-                invalid(format!("{owner} refers to unknown trait `{id}`"))
+                invalid(format!("{owner} refers to unknown trait `{id}`{}", suggestion(id, self.traits.keys())))
             }
         };
         let check_effects = |owner: &str, effects: &[EffectSpec]| {
@@ -324,7 +648,7 @@ impl ContentSet {
                 if let Effect::Summon { unit, .. } = &spec.effect
                     && !self.units.contains_key(unit)
                 {
-                    return invalid(format!("{owner} summons unknown unit `{unit}`"));
+                    return invalid(format!("{owner} summons unknown unit `{unit}`{}", suggestion(unit, self.units.keys())));
                 }
                 if let Effect::ApplyStatus { status: StatusKind::StatMods(mods), .. } = &spec.effect
                     && mods.is_empty()
@@ -372,9 +696,33 @@ impl ContentSet {
             if let Some((a, b)) = &i.recipe {
                 for part in [a, b] {
                     if !self.items.contains_key(part) {
-                        return invalid(format!("{owner} is built from unknown item `{part}`"));
+                        return invalid(format!("{owner} is built from unknown item `{part}`{}", suggestion(part, self.items.keys())));
                     }
                 }
+            }
+        }
+        for a in self.augments.values() {
+            let owner = format!("augment `{}`", a.id);
+            for bonus in &a.bonuses {
+                if let Scope::WithTrait(t) = &bonus.scope {
+                    check_trait(&owner, t)?;
+                }
+                check_passives(&owner, &bonus.passives)?;
+            }
+        }
+        let sched = &self.schedule;
+        if sched.rounds.is_empty() || sched.repeat_from >= sched.rounds.len() {
+            return invalid("the round schedule needs at least one round and a valid repeat_from".into());
+        }
+        for round in &sched.rounds {
+            if let RoundKindDef::Pve { enemies, .. } = &round.kind {
+                let team = TeamSetup { units: enemies.clone(), bonuses: vec![] };
+                if let Err(e) = self.setup_combat(0, &[TeamSetup::default(), team]) {
+                    return invalid(format!("round `{}`: {e}", round.name));
+                }
+            }
+            if let RoundKindDef::Choice { options: 0, .. } = &round.kind {
+                return invalid(format!("round `{}` offers no options", round.name));
             }
         }
         Ok(())
@@ -406,6 +754,16 @@ impl ContentSet {
     pub fn items(&self) -> impl Iterator<Item = &ItemDef> {
         self.items.values()
     }
+    pub fn augment(&self, id: &str) -> Option<&AugmentDef> {
+        self.augments.get(id)
+    }
+    /// All augments, ordered by id.
+    pub fn augments(&self) -> impl Iterator<Item = &AugmentDef> {
+        self.augments.values()
+    }
+    pub fn schedule(&self) -> &Schedule {
+        &self.schedule
+    }
     pub fn board(&self) -> HexBoard {
         HexBoard::new(self.rules.board_cols, self.rules.board_rows)
     }
@@ -419,11 +777,11 @@ impl ContentSet {
     // ----- building teams -------------------------------------------------
 
     fn unit_def(&self, id: &str) -> Result<&UnitDef, ContentError> {
-        self.units.get(id).ok_or_else(|| ContentError::Invalid(format!("unknown unit `{id}`")))
+        self.units.get(id).ok_or_else(|| ContentError::Invalid(format!("unknown unit `{id}`{}", suggestion(id, self.units.keys()))))
     }
 
     fn item_def(&self, id: &str) -> Result<&ItemDef, ContentError> {
-        self.items.get(id).ok_or_else(|| ContentError::Invalid(format!("unknown item `{id}`")))
+        self.items.get(id).ok_or_else(|| ContentError::Invalid(format!("unknown item `{id}`{}", suggestion(id, self.items.keys()))))
     }
 
     /// The traits a board unit counts as having: its own plus any granted

@@ -1,0 +1,12 @@
+newmtl cloak
+Kd 0.260 0.220 0.340
+
+newmtl dark
+Kd 0.060 0.050 0.090
+
+newmtl frame
+Kd 0.300 0.280 0.250
+
+newmtl lamp
+Kd 1.000 0.850 0.350
+
