@@ -32,6 +32,8 @@ pub struct UnitView {
     pub alive: bool,
     pub casting: bool,
     pub stunned_until_ms: u32,
+    /// Named stack counters (see `Effect::AddStacks`), without the empty ones.
+    pub stacks: BTreeMap<String, u32>,
 }
 
 impl UnitView {
@@ -117,10 +119,11 @@ impl Playback {
                         alive: true,
                         casting: false,
                         stunned_until_ms: 0,
+                        stacks: BTreeMap::new(),
                     },
                 );
             }
-            EventKind::Moved { unit, from, to } => {
+            EventKind::Moved { unit, from, to } | EventKind::Displaced { unit, from, to } => {
                 if let Some(u) = self.units.get_mut(&unit) {
                     u.prev_pos = from;
                     u.pos = to;
@@ -171,6 +174,15 @@ impl Playback {
                     u.casting = false;
                 }
                 self.flashes.push((at, Flash::Death { unit }));
+            }
+            EventKind::StacksChanged { unit, stack, count } => {
+                if let Some(u) = self.units.get_mut(&unit) {
+                    if count == 0 {
+                        u.stacks.remove(&stack);
+                    } else {
+                        u.stacks.insert(stack, count);
+                    }
+                }
             }
             EventKind::Ended { .. } => self.ended = true,
             EventKind::PassiveTriggered { .. } | EventKind::StatusExpired { .. } => {}

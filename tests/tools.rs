@@ -2,13 +2,19 @@
 use autoengine::content::{ContentSet, RoundDef, RoundKindDef, Schedule};
 use autoengine::tools::{lint, simulate};
 
+// The starter game's content, compiled here exactly as `autoengine new`
+// writes it into a new crate.
+#[path = "../templates/starter/src/lib.rs"]
+#[allow(dead_code)]
+mod starter;
+
 fn sample() -> ContentSet {
-    ContentSet::load_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/content")).expect("sample content loads")
+    autoengine::sample::content()
 }
 
 #[test]
 fn the_sample_content_has_no_warnings() {
-    let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/content"));
+    let dir = std::path::Path::new(autoengine::sample::ASSETS);
     let warnings = lint(&sample(), Some(dir));
     assert!(warnings.is_empty(), "{warnings:?}");
 }
@@ -52,33 +58,25 @@ fn the_simulator_is_repeatable_and_its_numbers_add_up() {
 }
 
 mod new_tools {
-    use autoengine::content::ContentSet;
-    use autoengine::tools::scenario::{Expect, ScenarioFile, run_all, run_scenario};
+    use autoengine::sample;
+    use autoengine::tools::scenario::{Expect, run_all, run_scenario};
     use autoengine::tools::{bench, lint, scaffold, simulate};
 
-    fn sample_dir() -> &'static str {
-        concat!(env!("CARGO_MANIFEST_DIR"), "/content")
-    }
-
-    fn scenarios(dir: &std::path::Path) -> ScenarioFile {
-        let file = dir.join("tests.ron");
-        ScenarioFile::parse("tests.ron", &std::fs::read_to_string(file).unwrap()).unwrap()
-    }
+    use super::starter;
 
     #[test]
     fn the_sample_content_passes_its_own_tests() {
-        let content = ContentSet::load_dir(sample_dir()).unwrap();
-        let file = scenarios(std::path::Path::new(sample_dir()));
-        assert!(!file.tests.is_empty());
-        for result in run_all(&content, &file) {
+        let tests = sample::tests();
+        assert!(!tests.is_empty());
+        for result in run_all(&sample::content(), &tests) {
             assert!(result.passed(), "{}: {:?}", result.name, result.failures);
         }
     }
 
     #[test]
     fn a_broken_expectation_says_what_went_wrong() {
-        let content = ContentSet::load_dir(sample_dir()).unwrap();
-        let mut scenario = scenarios(std::path::Path::new(sample_dir())).tests.remove(0);
+        let content = sample::content();
+        let mut scenario = sample::tests().remove(0);
         // The two-star unit wins, so each of these is wrong in its own way.
         scenario.expect = vec![
             Expect::Winner(1),
@@ -105,32 +103,42 @@ mod new_tools {
 
     #[test]
     fn the_starter_game_is_a_working_game() {
-        let dir = std::env::temp_dir().join(format!("autoengine-starter-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let written = scaffold::write_starter(&dir).unwrap();
-        assert_eq!(written.len(), scaffold::STARTER.len());
-        // It never overwrites anything.
-        assert!(scaffold::write_starter(&dir).unwrap_err().contains("not empty"));
-
-        let content = ContentSet::load_dir(&dir).expect("the starter loads");
-        let warnings = lint(&content, Some(&dir));
-        assert!(warnings.is_empty(), "{warnings:?}");
-        for result in run_all(&content, &scenarios(&dir)) {
+        let content = starter::content();
+        assert!(lint(&content, None).is_empty(), "{:?}", lint(&content, None));
+        for result in run_all(&content, &starter::tests()) {
             assert!(result.passed(), "{}: {:?}", result.name, result.failures);
         }
         // Bots can play it to the end, scripted round included.
         let report = simulate(content, 2, 4, 5);
         assert_eq!(report.unfinished, 0);
         assert!(report.fights > 0);
-        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn new_writes_a_rust_crate_for_the_starter_game() {
+        let dir = std::env::temp_dir().join(format!("autoengine-starter-{}", std::process::id())).join("My Game");
+        let _ = std::fs::remove_dir_all(&dir);
+        let written = scaffold::write_starter(&dir).unwrap();
+        assert_eq!(written.len(), scaffold::STARTER.len());
+        // It never overwrites anything.
+        assert!(scaffold::write_starter(&dir).unwrap_err().contains("not empty"));
+
+        let read = |path: &str| std::fs::read_to_string(dir.join(path)).unwrap();
+        assert!(read("Cargo.toml").contains("name = \"my_game\""));
+        assert!(read("Cargo.toml").contains(&format!("path = \"{}\"", env!("CARGO_MANIFEST_DIR").replace('\\', "/"))));
+        assert!(read("src/main.rs").contains("my_game::spec()"));
+        assert!(read("tests/content.rs").contains("my_game::content()"));
+        assert!(read("src/lib.rs").contains("GameSpec::new(\"my_game\""));
+        assert!(dir.join("scripts/bonus_gold.rhai").is_file() && dir.join("assets").is_dir());
+        assert!(written.iter().all(|f| !f.ends_with(".ron")));
+        assert_eq!(scaffold::crate_name("2nd-try"), "game_2nd_try");
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
     #[test]
     fn the_benchmarks_run() {
-        let content = ContentSet::load_dir(sample_dir()).unwrap();
-        let text = std::fs::read_to_string(format!("{}/sample_match.ron", sample_dir())).unwrap();
-        let setup = autoengine::content::parse_ron("sample_match.ron", &text).unwrap();
-        let fights = bench::fights(&content, &setup, 3).unwrap();
+        let content = sample::content();
+        let fights = bench::fights(&content, &sample::sample_match(), 3).unwrap();
         assert_eq!(fights.count, 3);
         assert!(fights.steps > 0 && fights.per_second() > 0.0);
         let games = bench::games(content, 1, 4);

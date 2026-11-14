@@ -7,7 +7,8 @@ line of JSON per message, using only the Rust standard library.
 ## Hosting
 
 ```
-autoengine-server --content mygame                 # local only, port 7777
+autoengine-server                                  # the sample game, local only, port 7777
+cargo run -- serve                                 # from a game crate: hosts that game
 autoengine-server --bind 0.0.0.0 --port 7777       # reachable from other machines
 autoengine-server --stats-secs 10                  # print traffic counters every 10 s
 ```
@@ -18,7 +19,7 @@ From Rust:
 use autoengine::net::Server;
 use autoengine::prelude::*;
 
-let content = ContentSet::load_dir("content")?;
+let content = autoengine::sample::content();          // or your game's content()
 let session = Session::new(content, SessionConfig::default());
 let server = Server::bind("0.0.0.0:7777")?.spawn(session);   // runs in the background
 println!("{:?}", server.stats());                           // connections, drops, bytes

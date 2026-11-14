@@ -1,25 +1,30 @@
-//! Fights written as data with an expected result, behind `autoengine test`.
+//! Fights with an expected result, behind `autoengine test`.
 //!
-//! A content folder can hold a `tests.ron` file listing fights and what is
-//! expected of them. They pin down what the content is supposed to do, so a
-//! later change that breaks it is caught:
+//! A game lists fights and what is expected of them. They pin down what the
+//! content is supposed to do, so a later change that breaks it is caught.
+//! They run from the command line and work just as well in a game's own
+//! `cargo test`:
 //!
-//! ```ron
-//! (tests: [(
-//!     name: "two guards beat one",
-//!     runs: 5,
-//!     teams: [
-//!         (units: [(unit: "shield_bearer", pos: (3, 4)), (unit: "field_medic", pos: (3, 6))]),
-//!         (units: [(unit: "shield_bearer", pos: (3, 4))]),
+//! ```
+//! use autoengine::content::{BoardUnit, TeamSetup};
+//! use autoengine::tools::scenario::{Expect, Scenario, run_scenario};
+//!
+//! let test = Scenario::new(
+//!     "two stars beat one star",
+//!     [
+//!         TeamSetup::new().unit(BoardUnit::new("ironbark_warden", (3, 4)).star(2)),
+//!         TeamSetup::new().unit(BoardUnit::new("ironbark_warden", (3, 4))),
 //!     ],
-//!     expect: [Winner(0), LastsAtMost(seconds: 40)],
-//! )])
+//! )
+//! .runs(5)
+//! .expect([Expect::Winner(0), Expect::Survives(0, "ironbark_warden".into())]);
+//! assert!(run_scenario(&autoengine::sample::content(), &test).passed());
 //! ```
 
 use serde::{Deserialize, Serialize};
 
 use crate::combat::{Combat, EventKind, Team};
-use crate::content::{ContentError, ContentSet, TeamSetup, parse_ron};
+use crate::content::{ContentSet, TeamSetup};
 
 /// Something a [`Scenario`] expects of its fight. Teams are numbered from 0
 /// in the order they are listed.
@@ -65,15 +70,27 @@ pub struct Scenario {
     pub expect: Vec<Expect>,
 }
 
-/// The contents of a `tests.ron` file.
-#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct ScenarioFile {
-    pub tests: Vec<Scenario>,
-}
+impl Scenario {
+    /// One run with seed 1 and no expectations yet.
+    pub fn new(name: impl Into<String>, teams: impl IntoIterator<Item = TeamSetup>) -> Self {
+        Scenario { name: name.into(), teams: teams.into_iter().collect(), runs: 1, seed: 1, expect: Vec::new() }
+    }
 
-impl ScenarioFile {
-    pub fn parse(file: &str, text: &str) -> Result<Self, ContentError> {
-        parse_ron(file, text)
+    /// How many times to fight, each with different dice.
+    pub fn runs(mut self, runs: u32) -> Self {
+        self.runs = runs;
+        self
+    }
+
+    /// The seed of the first run; later runs count up from it.
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
+        self
+    }
+
+    pub fn expect(mut self, expect: impl IntoIterator<Item = Expect>) -> Self {
+        self.expect.extend(expect);
+        self
     }
 }
 
@@ -203,7 +220,7 @@ pub fn run_scenario(content: &ContentSet, scenario: &Scenario) -> ScenarioResult
     result
 }
 
-/// Runs every scenario in a file.
-pub fn run_all(content: &ContentSet, file: &ScenarioFile) -> Vec<ScenarioResult> {
-    file.tests.iter().map(|s| run_scenario(content, s)).collect()
+/// Runs every scenario.
+pub fn run_all(content: &ContentSet, scenarios: &[Scenario]) -> Vec<ScenarioResult> {
+    scenarios.iter().map(|s| run_scenario(content, s)).collect()
 }

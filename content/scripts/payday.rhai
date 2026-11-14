@@ -1,10 +1,10 @@
 // A round type written as a script: no fighting, everyone gets paid.
 //
-// Use it from rounds.ron with
-//     (name: "Payday", kind: Custom(kind: "payday", params: {"gold": 3}))
+// Use it from the schedule (see src/sample.rs) with
+//     RoundDef::new("Payday", 3, RoundKindDef::custom("payday").param("gold", 3))
 //
-// `begin` runs when the round starts and `finish` when it ends. The file
-// name is the round kind.
+// `begin` runs when the round starts and `finish` when it ends. The name
+// the script is added under is the round kind.
 
 fn begin(game) {
     game.log("Payday! Gold for everyone when the round ends.");

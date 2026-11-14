@@ -1,43 +1,34 @@
 # A new AutoEngine game
 
-This folder is a complete, small game. Everything in it is data you can
-change without rebuilding the engine. From the folder that contains it
-(replace `mygame` with this folder's name):
+This crate is a complete, small game, written in Rust. The content (units,
+traits, items, augments, rounds and content tests) is in `src/lib.rs`.
 
 ```
-autoengine check mygame            # look for mistakes
-autoengine test mygame             # run the fights in tests.ron
-autoengine fight --content mygame  # watch one fight as text
-autoengine lobby --content mygame  # bots play a whole game
-autoengine sim --content mygame    # balance table from many bot games
-autoengine-server --content mygame --dev
-autoengine-client --assets mygame
+cargo run -- check                 # look for mistakes
+cargo test                         # run the content tests
+cargo run -- fight                 # watch one fight as text
+cargo run -- lobby                 # bots play a whole game
+cargo run -- sim                   # balance table from many bot games
+cargo run -- serve --dev           # host it for clients
+cargo run -- help                  # every command
 ```
+
+Clients get the content from the server when they join, so
+`autoengine-client` can play this game without being rebuilt.
 
 ## Things to try, in order
 
-1. Change a number in `units.ron` and run `autoengine test mygame`.
-2. Copy a unit, give it a new `id`, and add it to a fight in `tests.ron`.
-3. Add a breakpoint to a trait in `traits.ron`. `autoengine check` tells
+1. Change a number in `units()` and run `cargo test`.
+2. Copy a unit, give it a new id, and add it to a fight in `tests()`.
+3. Add a breakpoint to a trait in `traits()`. `cargo run -- check` tells
    you if no team could ever reach it.
-4. Add a round to `rounds.ron`.
-5. Change `scripts/bonus_gold.rhai`. `autoengine api` lists what scripts
+4. Add a round to `schedule()`.
+5. Change `scripts/bonus_gold.rhai`. `cargo run -- api` lists what scripts
    can do.
-6. Change a colour in `theme.ron` while the client is running.
+6. Write a round type or rule in Rust: see `RoundType` and `GameHook` in
+   the engine's documentation (`cargo doc --open`).
 
-## Files
-
-| File | Contents |
-| --- | --- |
-| `units.ron` | Units: cost, traits, stats, ability |
-| `traits.ron` | Traits and what each breakpoint grants |
-| `items.ron` | Items and recipes |
-| `augments.ron` | Augments offered in Choice rounds |
-| `rules.ron` | Board size, item limit, star levels |
-| `rounds.ron` | The order of rounds |
-| `scripts/` | Round types and rules written as scripts |
-| `tests.ron` | Fights with expected results |
-| `theme.ron` | Colours, light and particle effects for the client |
-
-Add `models/`, `icons/<item id>.png` and `sounds/<name>.wav` when you have
-art. Until then the client draws stand-ins.
+Put models in `assets/models/` and point units at them with
+`.model("models/knight.glb", 100)`, and add `assets/icons/<item id>.png`
+and `assets/sounds/<name>.wav` when you have art. Until then the client draws
+stand-ins.

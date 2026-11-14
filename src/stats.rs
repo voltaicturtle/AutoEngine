@@ -65,6 +65,17 @@ impl Stat {
     const fn index(self) -> usize {
         self as usize
     }
+
+    /// A flat modifier to this stat: `Stat::Armor.flat(15)`.
+    pub const fn flat(self, amount: i64) -> StatMod {
+        StatMod::flat(self, amount)
+    }
+
+    /// A percentage modifier to this stat, in permille:
+    /// `Stat::AttackSpeed.percent(200)` is +20%.
+    pub const fn percent(self, permille: i64) -> StatMod {
+        StatMod::percent(self, permille)
+    }
 }
 
 /// One value per [`Stat`].

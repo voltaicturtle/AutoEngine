@@ -9,7 +9,7 @@
 use autoengine::prelude::*;
 
 fn main() {
-    let content = ContentSet::load_dir("content").expect("run this from the repository root");
+    let content = autoengine::sample::content();
     let mut game = Game::new(content, 7, &["Ana", "Ben", "Cho", "Dee"]);
     let mut dice = Rng::new(7);
 

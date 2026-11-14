@@ -1,5 +1,6 @@
 // A round type written as a script. The file name is the round kind, used
-// from rounds.ron as  Custom(kind: "bonus_gold", params: {"gold": 3}).
+// from the schedule in src/lib.rs as
+//     RoundKindDef::custom("bonus_gold").param("gold", 3)
 //
 // `begin` runs when the round starts and `finish` when it ends. Run
 // `autoengine api` for everything `game` can do.

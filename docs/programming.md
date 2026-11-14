@@ -2,19 +2,20 @@
 
 There are three ways to build on the engine, from least to most code:
 
-1. **Data.** Units, traits, items, augments and the round schedule are RON
-   files. See [guide.md](guide.md).
-2. **Scripts.** Round types and rules in `.rhai` files, loaded with the data.
+1. **Content in Rust.** Units, traits, items, augments and the round
+   schedule are built with `ContentSet::builder()`. See [guide.md](guide.md)
+   and [Content in Rust](#content-in-rust).
+2. **Scripts.** Round types and rules in `.rhai` sources, added with the content.
 3. **Rust.** The engine is a library. Use all of it, or only some layers.
 
 ## Scripting
 
-Game rules can be written as [Rhai](https://rhai.rs) scripts in
-`content/scripts/`, with no engine rebuild. A script can be a round type, a
-rule that listens to events, or both.
+Game rules can be written as [Rhai](https://rhai.rs) scripts, added to the
+content with `.script(name, include_str!("scripts/name.rhai"))`. A script can
+be a round type, a rule that listens to events, or both.
 
 ```rhai
-// content/scripts/payday.rhai: the file name is the round kind.
+// content/scripts/payday.rhai, added as "payday": that name is the round kind.
 fn begin(game)  { game.log("Payday!"); }
 fn finish(game) {
     for p in game.players() { game.give_gold(p, game.param("gold") + game.stage()); }
@@ -26,8 +27,8 @@ fn on_event(game, event) {
 }
 ```
 
-A scripted round is used from `rounds.ron` as
-`Custom(kind: "payday", params: {"gold": 2})`. Through `game` a script can read
+A scripted round is used in the schedule as
+`RoundKindDef::custom("payday").param("gold", 2)`. Through `game` a script can read
 players (`players`, `name`, `gold`, `health`, `level`, `unit_count`,
 `item_count`, `streak`, `stage`, `round`, `param`), keep its own numbers
 (`get`, `set`), roll dice (`random`), and act (`give_gold`, `give_xp`,
@@ -55,6 +56,47 @@ Run an example with `cargo run --example first_fight`. They are built by
 `cargo test`, so they keep working. `use autoengine::prelude::*;` imports the
 types most programs need, and `cargo doc --open` has the full reference.
 
+## Content in Rust
+
+Every definition type has a constructor and chainable setters, and `build()`
+validates the result:
+
+```rust
+use autoengine::content::{Bonus, ContentSet, TraitDef, UnitDef};
+use autoengine::effect::{Ability, Effect, Selector};
+use autoengine::stats::Stat::*;
+
+let game = ContentSet::builder()
+    .trait_def(TraitDef::new("grove", "Grove").breakpoint(2, [Bonus::members().mods([Armor.flat(15)])]))
+    .unit(
+        UnitDef::new("warden", "Ironbark Warden")
+            .cost(2)
+            .traits(["grove"])
+            .stats([(MaxHealth, 900), (Armor, 40)])
+            .ability(Ability::new("Rootwall").effect(Effect::shield_for(250, 4000).to(Selector::Source))),
+    )
+    .build()?;
+```
+
+The builder can also register **Rust hooks** for effects and conditions that
+data can't express. Content then refers to them by name, and `build()` rejects
+names nobody registered:
+
+```rust
+ContentSet::builder()
+    .custom_effect("siphon", |ctx| {
+        let amount = ctx.arg(0);
+        ctx.apply(ctx.target(), &Effect::true_damage(amount));
+        ctx.apply(ctx.source(), &Effect::heal(amount));
+    })
+    .custom_condition("outnumbered", |ctx| { /* read ctx.combat() */ false })
+```
+
+A hook acts through `EffectContext` (`apply` any effect, `move_unit`, the
+seeded `rng`) and must be deterministic. Clients replay fights from a seed, so
+every process that replays fights, server and clients alike, must register the
+same hooks. Scripts and content travel with the game, so they don't have this requirement.
+
 ## The game loop
 
 ```text
@@ -63,7 +105,7 @@ apply(cmd)...   players act; invalid commands are rejected and change nothing
 finish_round()  the round resolves, fights run, players without health are out
 ```
 
-The schedule in `rounds.ron` decides which kind each round is, so a game can
+The content's `Schedule` decides which kind each round is, so a game can
 mix fights with drafts, choices and its own custom rounds freely.
 
 ## Layers
@@ -74,12 +116,12 @@ simulation alone, or everything up to the lobby, without the rest.
 | Layer | Modules | What it gives you |
 | --- | --- | --- |
 | Foundations | `rng`, `hex`, `stats` | seeded dice, board geometry and pathfinding, integer stats |
-| Fights | `effect`, `combat` | abilities as data and the tick-based fight simulation |
-| Content | `content` | everything loaded from data files and validated |
+| Fights | `effect`, `combat` | abilities built from effect blocks, and the tick-based fight simulation |
+| Content | `content`, `sample` | content defined in Rust and validated; a complete sample game |
 | Game | `game`, `round`, `bot`, `script` | shop, economy, round loop, round types, scripts, computer players |
 | Hosting | `protocol`, `session`, `net`, `replay` | messages, a hosted game with seats and timers, TCP, saved fights |
 | Display | `client`, `playback` | what a front end needs to show a game, with no rendering in it |
-| Tools | `tools` | the checker, content tests, simulator, starter game and benchmarks |
+| Tools | `tools` | the command line, checker, content tests, simulator, starter game and benchmarks |
 
 The graphical client is a separate crate (`client/`), so the library has no
 graphics dependencies. Scripting is a cargo feature that is on by default:

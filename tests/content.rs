@@ -1,29 +1,30 @@
 use autoengine::combat::EventKind;
 use autoengine::content::{
-    BoardUnit, Bonus, ContentError, ContentSet, MatchSetup, Scope, TeamSetup, parse_ron,
+    BoardUnit, Bonus, ContentError, ContentSet, GameBuilder, ItemDef, MatchSetup, Scope, TeamSetup, TraitDef, UnitDef,
 };
-use autoengine::effect::Trigger;
+use autoengine::effect::{Ability, Effect, Passive, Selector, Trigger};
 use autoengine::stats::{Stat, StatMod};
 
 fn sample() -> ContentSet {
-    ContentSet::load_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/content")).expect("sample content loads")
+    autoengine::sample::content()
 }
 
 fn sample_match() -> MatchSetup {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/content/sample_match.ron");
-    parse_ron(path, &std::fs::read_to_string(path).unwrap()).expect("sample match parses")
+    autoengine::sample::sample_match()
 }
 
 fn unit(id: &str, pos: (i32, i32)) -> BoardUnit {
     BoardUnit { unit: id.into(), star: 1, items: vec![], pos }
 }
 
-const TRAITS: &str = r#"[
-    (id: "a", name: "A", breakpoints: [
-        (count: 2, bonuses: [(mods: [(stat: Armor, flat: 10)])]),
-        (count: 3, bonuses: [(mods: [(stat: Armor, flat: 30)]), (scope: Team, mods: [(stat: MagicResist, flat: 5)])]),
-    ]),
-]"#;
+/// A game with one trait, `a`, and nothing else.
+fn with_trait_a() -> GameBuilder {
+    ContentSet::builder().trait_def(
+        TraitDef::new("a", "A")
+            .breakpoint(2, [Bonus::members().mods([Stat::Armor.flat(10)])])
+            .breakpoint(3, [Bonus::members().mods([Stat::Armor.flat(30)]), Bonus::team().mods([Stat::MagicResist.flat(5)])]),
+    )
+}
 
 fn expect_invalid(result: Result<ContentSet, ContentError>, needle: &str) {
     match result {
@@ -85,7 +86,7 @@ fn build_team_folds_in_stars_items_traits_and_team_bonuses() {
         bonuses: vec![Bonus {
             scope: Scope::WithTrait("tide".into()),
             mods: vec![StatMod::flat(Stat::AbilityPower, 25)],
-            passives: vec![],
+            ..Bonus::default()
         }],
     };
     let built = c.build_team(&team).unwrap();
@@ -114,81 +115,6 @@ fn build_team_folds_in_stars_items_traits_and_team_bonuses() {
 }
 
 #[test]
-fn only_the_highest_breakpoint_applies() {
-    let units = r#"[
-        (id: "x", name: "X", traits: ["a"]),
-        (id: "y", name: "Y", traits: ["a"]),
-        (id: "z", name: "Z", traits: ["a"]),
-        (id: "w", name: "W"),
-    ]"#;
-    let c = ContentSet::from_ron(units, TRAITS, None, None).unwrap();
-    let armor = |ids: &[&str]| -> Vec<(i64, i64)> {
-        let units = ids.iter().enumerate().map(|(i, id)| unit(id, (i as i32, 4))).collect();
-        c.build_team(&TeamSetup { units, bonuses: vec![] })
-            .unwrap()
-            .iter()
-            .map(|p| (p.template.stats.get(Stat::Armor), p.template.stats.get(Stat::MagicResist)))
-            .collect()
-    };
-    assert_eq!(armor(&["x", "w"]), [(0, 0), (0, 0)]);
-    assert_eq!(armor(&["x", "y", "w"]), [(10, 0), (10, 0), (0, 0)]);
-    assert_eq!(armor(&["x", "y", "z", "w"]), [(30, 5), (30, 5), (30, 5), (0, 5)]);
-}
-
-#[test]
-fn invalid_content_is_rejected_with_a_clear_message() {
-    let ok_units = r#"[(id: "x", name: "X", traits: ["a"])]"#;
-    assert!(ContentSet::from_ron(ok_units, TRAITS, None, None).is_ok());
-
-    expect_invalid(
-        ContentSet::from_ron(r#"[(id: "x", name: "X", traits: ["nope"])]"#, TRAITS, None, None),
-        "unknown trait `nope`",
-    );
-    expect_invalid(
-        ContentSet::from_ron(r#"[(id: "x", name: "X"), (id: "x", name: "Again")]"#, TRAITS, None, None),
-        "duplicate unit id `x`",
-    );
-    expect_invalid(
-        ContentSet::from_ron(
-            r#"[(id: "x", name: "X", passives: [(trigger: OnDeath, effects: [
-                (target: Source, effect: Summon(unit: "ghost", count: 1)),
-            ])])]"#,
-            TRAITS,
-            None,
-            None,
-        ),
-        "summons unknown unit `ghost`",
-    );
-    expect_invalid(
-        ContentSet::from_ron(
-            ok_units,
-            r#"[(id: "a", name: "A", breakpoints: [(count: 3, bonuses: []), (count: 2, bonuses: [])])]"#,
-            None,
-            None,
-        ),
-        "increasing",
-    );
-    expect_invalid(
-        ContentSet::from_ron(
-            ok_units,
-            TRAITS,
-            Some(r#"[(id: "i", name: "I", recipe: ("i", "missing"))]"#),
-            None,
-        ),
-        "unknown item `missing`",
-    );
-    expect_invalid(
-        ContentSet::from_ron(ok_units, TRAITS, None, Some("(star_levels: [])")),
-        "star level",
-    );
-
-    match ContentSet::from_ron("[(id: 5)]", TRAITS, None, None) {
-        Err(ContentError::Parse { file, .. }) => assert_eq!(file, "units.ron"),
-        other => panic!("expected a parse error, got {other:?}"),
-    }
-}
-
-#[test]
 fn bad_boards_are_rejected() {
     let c = sample();
     let build = |u: BoardUnit| c.build_team(&TeamSetup { units: vec![u], bonuses: vec![] }).map(|_| ());
@@ -210,7 +136,7 @@ fn bad_boards_are_rejected() {
 }
 
 #[test]
-fn sample_match_runs_deterministically_from_data() {
+fn sample_match_runs_deterministically() {
     let c = sample();
     let setup = sample_match();
     let run = |seed| {
@@ -236,7 +162,7 @@ fn sample_match_runs_deterministically_from_data() {
 }
 
 #[test]
-fn summons_and_trait_passives_work_from_data() {
+fn summons_and_trait_passives_work() {
     let c = sample();
     let keeper = TeamSetup {
         units: vec![unit("hollow_lantern_keeper", (3, 4)), unit("ashen_hound", (2, 4))],
@@ -266,7 +192,7 @@ fn sample_units_name_model_files_that_exist() {
     let mut with_model = 0;
     for unit in content.units() {
         if let Some(model) = &unit.model {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("content").join(&model.file);
+            let path = std::path::Path::new(autoengine::sample::ASSETS).join(&model.file);
             assert!(path.is_file(), "{} names a missing model: {}", unit.id, model.file);
             assert!(model.scale_percent > 0);
             with_model += 1;
@@ -283,4 +209,135 @@ fn a_mistyped_id_gets_a_suggestion() {
     // Nothing is suggested when nothing is close.
     let err = sample().setup_combat(1, &[TeamSetup { units: vec![unit("zzz", (3, 4))], bonuses: vec![] }]);
     assert!(!err.err().unwrap().to_string().contains("did you mean"));
+}
+
+#[test]
+fn build_team_records_unit_ids() {
+    let c = sample();
+    let team = TeamSetup::new()
+        .unit(unit("ironbark_warden", (3, 4)).star(2).item("barkplate"))
+        .unit(unit("tidewater_stormcaller", (1, 7)))
+        .bonus(Bonus::with_trait("tide").mods([Stat::AbilityPower.flat(25)]));
+    let built = c.build_team(&team).unwrap();
+    assert_eq!(built[1].template.stats.get(Stat::AbilityPower), 125);
+    assert_eq!((built[0].template.id.as_str(), built[1].template.id.as_str()), ("ironbark_warden", "tidewater_stormcaller"));
+}
+
+#[test]
+fn only_the_highest_breakpoint_applies() {
+    let c = with_trait_a()
+        .units(["x", "y", "z"].map(|id| UnitDef::new(id, id.to_uppercase()).traits(["a"])))
+        .unit(UnitDef::new("w", "W"))
+        .build()
+        .unwrap();
+    let armor = |ids: &[&str]| -> Vec<(i64, i64)> {
+        let units = ids.iter().enumerate().map(|(i, id)| unit(id, (i as i32, 4))).collect();
+        c.build_team(&TeamSetup { units, bonuses: vec![] })
+            .unwrap()
+            .iter()
+            .map(|p| (p.template.stats.get(Stat::Armor), p.template.stats.get(Stat::MagicResist)))
+            .collect()
+    };
+    assert_eq!(armor(&["x", "w"]), [(0, 0), (0, 0)]);
+    assert_eq!(armor(&["x", "y", "w"]), [(10, 0), (10, 0), (0, 0)]);
+    assert_eq!(armor(&["x", "y", "z", "w"]), [(30, 5), (30, 5), (30, 5), (0, 5)]);
+}
+
+#[test]
+fn invalid_built_content_is_rejected_with_a_clear_message() {
+    let x = || UnitDef::new("x", "X").traits(["a"]);
+    assert!(with_trait_a().unit(x()).build().is_ok());
+
+    expect_invalid(with_trait_a().unit(UnitDef::new("x", "X").traits(["nope"])).build(), "unknown trait `nope`");
+    expect_invalid(with_trait_a().unit(x()).unit(UnitDef::new("x", "Again")).build(), "duplicate unit id `x`");
+    expect_invalid(with_trait_a().unit(UnitDef::new("", "Nameless")).build(), "empty id");
+    let summoner = x().passive(Passive::new("", Trigger::OnDeath).effect(Effect::summon("ghost", 1).to(Selector::Source)));
+    expect_invalid(with_trait_a().unit(summoner).build(), "summons unknown unit `ghost`");
+    expect_invalid(
+        ContentSet::builder().unit(x()).trait_def(TraitDef::new("a", "A").breakpoint(3, []).breakpoint(2, [])).build(),
+        "increasing",
+    );
+    expect_invalid(ContentSet::builder().trait_def(TraitDef::new("a", "A")).build(), "no breakpoints");
+    expect_invalid(with_trait_a().unit(x()).item(ItemDef::new("i", "I").recipe("i", "missing")).build(), "unknown item `missing`");
+    expect_invalid(
+        with_trait_a().item(ItemDef::new("i", "I").grants_trait("nope")).build(),
+        "item `i` refers to unknown trait `nope`",
+    );
+    let empty_status = Ability::new("Hex").effect(Effect::stat_status([], 1000).to(Selector::Source));
+    expect_invalid(with_trait_a().unit(x().ability(empty_status)).build(), "no modifiers");
+    expect_invalid(with_trait_a().unit(x()).star_levels(Vec::<Vec<_>>::new()).build(), "star level");
+    expect_invalid(with_trait_a().board(0, 8).build(), "at least one column");
+    let custom = Ability::new("Odd").effect(Effect::custom("unregistered").to(Selector::Source));
+    expect_invalid(with_trait_a().unit(x().ability(custom)).build(), "unregistered custom effect `unregistered`");
+}
+
+#[test]
+fn definitions_can_be_added_in_any_order() {
+    // Units and items name traits and units that are only added afterwards.
+    let call = Passive::new("Call", Trigger::CombatStart).effect(Effect::summon("pet", 1).to(Selector::Source));
+    let c = ContentSet::builder()
+        .item(ItemDef::new("sigil", "Sigil").grants_trait("a"))
+        .unit(UnitDef::new("caller", "Caller").passive(call))
+        .unit(UnitDef::new("pet", "Pet").summon_only())
+        .trait_def(TraitDef::new("a", "A").breakpoint(1, [Bonus::members().mods([Stat::Armor.flat(5)])]))
+        .build()
+        .unwrap();
+    assert!(!c.unit("pet").unwrap().in_shop);
+    let built = c.build_team(&TeamSetup::new().unit(unit("caller", (0, 4)).item("sigil"))).unwrap();
+    assert_eq!(built[0].template.stats.get(Stat::Armor), 5);
+    assert_eq!(built[0].template.tags, ["a"]);
+}
+
+#[test]
+fn custom_hooks_run_in_fights_set_up_from_content() {
+    let c = ContentSet::builder()
+        .custom_effect("execute", |ctx| {
+            let target = ctx.target();
+            let health = ctx.combat().unit(target).health();
+            ctx.apply(target, &Effect::true_damage(health));
+        })
+        .unit(
+            UnitDef::new("reaper", "Reaper")
+                .stats([(Stat::MaxMana, 10), (Stat::StartingMana, 10), (Stat::Range, 7)])
+                .ability(Ability::new("Execute").effect(Effect::custom("execute").to(Selector::CurrentTarget))),
+        )
+        .unit(UnitDef::new("dummy", "Dummy").stat(Stat::MaxHealth, 99_999))
+        .build()
+        .unwrap();
+    let mut combat = c
+        .setup_combat(1, &[TeamSetup::new().unit(unit("reaper", (3, 4))), TeamSetup::new().unit(unit("dummy", (3, 4)))])
+        .unwrap();
+    let outcome = combat.run();
+    assert_eq!(outcome.winner.map(|t| t.0), Some(0), "the hook killed the dummy outright");
+    assert!(outcome.duration_ms < 5_000);
+}
+
+/// The example in docs/guide.md ("Conditions, stacks and movement") builds
+/// and fights.
+#[test]
+fn the_guide_example_for_conditions_and_stacks_works() {
+    use autoengine::effect::{Condition, Who};
+    let brawler = UnitDef::new("frenzied_brawler", "Frenzied Brawler")
+        .cost(2)
+        .passive(
+            Passive::new("Frenzy", Trigger::OnAttack).effect(
+                Effect::add_stacks("frenzy", 1).capped_at(10).per_stack([Stat::AttackSpeed.percent(50)]).to(Selector::Source),
+            ),
+        )
+        .passive(
+            Passive::new("Finisher", Trigger::OnAttack)
+                .when(Condition::StacksAtLeast { who: Who::Source, stack: "frenzy".into(), count: 10 })
+                .effect(Effect::knockback(1).to(Selector::EventOther))
+                .effect(Effect::stun(500).to(Selector::EventOther).when(Condition::Stunned(Who::Target).not()))
+                .effect(Effect::clear_stacks("frenzy").to(Selector::Source)),
+        );
+    let c = ContentSet::builder().unit(brawler).build().expect("the guide example is valid");
+    let team = || TeamSetup::new().unit(unit("frenzied_brawler", (3, 4)));
+    let mut combat = c.setup_combat(3, &[team(), team()]).unwrap();
+    combat.run();
+    let stacked = combat
+        .events()
+        .iter()
+        .any(|e| matches!(&e.kind, EventKind::StacksChanged { stack, .. } if stack == "frenzy"));
+    assert!(stacked);
 }

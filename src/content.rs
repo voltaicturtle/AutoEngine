@@ -1,10 +1,34 @@
-//! Game content defined in data files.
+//! Game content: the units, traits, items, augments, rounds and rules that
+//! make up a game.
 //!
-//! A [`ContentSet`] holds everything a game built on the engine ships as
-//! data: units, traits (synergies), items and a few global rules. It is
-//! loaded from [RON](https://github.com/ron-rs/ron) files and validated up
-//! front, so mistakes such as a unit naming a trait that does not exist are
-//! reported when content loads, not in the middle of a match.
+//! A [`ContentSet`] holds everything a game built on the engine defines, and
+//! a game defines it in Rust with [`ContentSet::builder`]. Every definition
+//! type has a constructor and chainable setters, and the builder can also
+//! register Rust hooks for effects and conditions the built-in blocks cannot
+//! express. The set is validated when it is built, so mistakes such as a
+//! unit naming a trait that does not exist are reported up front, not in the
+//! middle of a match. [`crate::sample`] is a complete example.
+//!
+//! ```
+//! use autoengine::content::{Bonus, ContentSet, ItemDef, TraitDef, UnitDef};
+//! use autoengine::effect::{Ability, Effect, Selector};
+//! use autoengine::stats::Stat;
+//!
+//! let game = ContentSet::builder()
+//!     .board(7, 8)
+//!     .trait_def(TraitDef::new("grove", "Grove").breakpoint(2, [Bonus::members().mods([Stat::Armor.flat(15)])]))
+//!     .unit(
+//!         UnitDef::new("warden", "Warden")
+//!             .cost(2)
+//!             .traits(["grove"])
+//!             .stat(Stat::MaxHealth, 900)
+//!             .ability(Ability::new("Rootwall").effect(Effect::shield_for(250, 4000).to(Selector::Source))),
+//!     )
+//!     .item(ItemDef::new("whetstone", "Whetstone").mods([Stat::AttackDamage.flat(15)]))
+//!     .build()
+//!     .unwrap();
+//! assert_eq!(game.unit("warden").unwrap().cost, 2);
+//! ```
 //!
 //! The content layer sits on top of combat without combat knowing about it:
 //! [`ContentSet::build_team`] turns "these units, at these star levels, with
@@ -12,14 +36,12 @@
 //! and item bonus already folded in.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 use std::sync::Arc;
 
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::combat::{Combat, Team};
-use crate::effect::{Ability, Effect, EffectSpec, Passive, StatusKind, UnitTemplate};
+use crate::combat::{Combat, ConditionContext, CustomConditionFn, CustomEffectFn, EffectContext, Team};
+use crate::effect::{Ability, Condition, Effect, EffectSpec, Passive, StatusKind, UnitTemplate};
 use crate::hex::{Hex, HexBoard};
 use crate::stats::{Stat, StatBlock, StatMod};
 
@@ -27,7 +49,7 @@ fn default_true() -> bool {
     true
 }
 
-/// A unit as authored in `units.ron`.
+/// A unit definition. Build one with [`UnitDef::new`] and its setters.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnitDef {
     pub id: String,
@@ -75,6 +97,68 @@ fn default_hundred() -> u32 {
     100
 }
 
+impl UnitDef {
+    /// A unit with base stats, no traits, no ability, that appears in shops.
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        UnitDef {
+            id: id.into(),
+            name: name.into(),
+            cost: 0,
+            traits: Vec::new(),
+            stats: BTreeMap::new(),
+            ability: None,
+            passives: Vec::new(),
+            in_shop: true,
+            model: None,
+        }
+    }
+
+    pub fn cost(mut self, cost: u32) -> Self {
+        self.cost = cost;
+        self
+    }
+
+    /// Adds traits by id.
+    pub fn traits<S: Into<String>>(mut self, ids: impl IntoIterator<Item = S>) -> Self {
+        self.traits.extend(ids.into_iter().map(Into::into));
+        self
+    }
+
+    /// Overrides one base stat.
+    pub fn stat(mut self, stat: Stat, value: i64) -> Self {
+        self.stats.insert(stat, value);
+        self
+    }
+
+    /// Overrides several base stats.
+    pub fn stats(mut self, stats: impl IntoIterator<Item = (Stat, i64)>) -> Self {
+        self.stats.extend(stats);
+        self
+    }
+
+    pub fn ability(mut self, ability: Ability) -> Self {
+        self.ability = Some(ability);
+        self
+    }
+
+    pub fn passive(mut self, passive: Passive) -> Self {
+        self.passives.push(passive);
+        self
+    }
+
+    /// Keeps the unit out of shops, e.g. for units that are only summoned.
+    pub fn summon_only(mut self) -> Self {
+        self.in_shop = false;
+        self
+    }
+
+    /// The model graphical clients draw for this unit.
+    pub fn model(mut self, file: impl Into<String>, scale_percent: u32) -> Self {
+        self.model = Some(ModelRef { file: file.into(), scale_percent, yaw_degrees: 0 });
+        self
+    }
+}
+
 /// Who receives a bonus.
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Scope {
@@ -94,7 +178,47 @@ pub enum Scope {
 pub struct Bonus {
     pub scope: Scope,
     pub mods: Vec<StatMod>,
+    /// Modifiers multiplied by a member count: for a trait bonus, the number
+    /// of distinct units with that trait; for a team bonus scoped
+    /// [`Scope::WithTrait`], the units with the named trait; for any other
+    /// team bonus, the distinct units on the board.
+    pub mods_per_member: Vec<StatMod>,
     pub passives: Vec<Passive>,
+}
+
+impl Bonus {
+    /// A bonus for the members of the trait granting it (or every unit, for
+    /// a team bonus that does not come from a trait).
+    pub fn members() -> Self {
+        Bonus::default()
+    }
+
+    /// A bonus for every unit on the team.
+    pub fn team() -> Self {
+        Bonus { scope: Scope::Team, ..Bonus::default() }
+    }
+
+    /// A bonus for units that have the given trait.
+    pub fn with_trait(id: impl Into<String>) -> Self {
+        Bonus { scope: Scope::WithTrait(id.into()), ..Bonus::default() }
+    }
+
+    pub fn mods(mut self, mods: impl IntoIterator<Item = StatMod>) -> Self {
+        self.mods.extend(mods);
+        self
+    }
+
+    /// Modifiers that scale with the member count; see
+    /// [`Bonus::mods_per_member`](field@Bonus::mods_per_member).
+    pub fn mods_per_member(mut self, mods: impl IntoIterator<Item = StatMod>) -> Self {
+        self.mods_per_member.extend(mods);
+        self
+    }
+
+    pub fn passive(mut self, passive: Passive) -> Self {
+        self.passives.push(passive);
+        self
+    }
 }
 
 /// One tier of a trait: active when at least `count` distinct members are on
@@ -105,7 +229,7 @@ pub struct Breakpoint {
     pub bonuses: Vec<Bonus>,
 }
 
-/// A trait (synergy) as authored in `traits.ron`.
+/// A trait (synergy) definition.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraitDef {
     pub id: String,
@@ -115,7 +239,25 @@ pub struct TraitDef {
     pub breakpoints: Vec<Breakpoint>,
 }
 
-/// An item as authored in `items.ron`.
+impl TraitDef {
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        TraitDef { id: id.into(), name: name.into(), description: String::new(), breakpoints: Vec::new() }
+    }
+
+    pub fn description(mut self, text: impl Into<String>) -> Self {
+        self.description = text.into();
+        self
+    }
+
+    /// Adds a tier that is active from `count` distinct members. Tiers must
+    /// be added in increasing order.
+    pub fn breakpoint(mut self, count: u32, bonuses: impl IntoIterator<Item = Bonus>) -> Self {
+        self.breakpoints.push(Breakpoint { count, bonuses: bonuses.into_iter().collect() });
+        self
+    }
+}
+
+/// An item definition.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemDef {
     pub id: String,
@@ -130,6 +272,41 @@ pub struct ItemDef {
     /// The two component items that combine into this one, if any.
     #[serde(default)]
     pub recipe: Option<(String, String)>,
+}
+
+impl ItemDef {
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        ItemDef {
+            id: id.into(),
+            name: name.into(),
+            mods: Vec::new(),
+            passives: Vec::new(),
+            grants_traits: Vec::new(),
+            recipe: None,
+        }
+    }
+
+    pub fn mods(mut self, mods: impl IntoIterator<Item = StatMod>) -> Self {
+        self.mods.extend(mods);
+        self
+    }
+
+    pub fn passive(mut self, passive: Passive) -> Self {
+        self.passives.push(passive);
+        self
+    }
+
+    /// The holder counts as having this trait.
+    pub fn grants_trait(mut self, id: impl Into<String>) -> Self {
+        self.grants_traits.push(id.into());
+        self
+    }
+
+    /// The two component items that combine into this one.
+    pub fn recipe(mut self, a: impl Into<String>, b: impl Into<String>) -> Self {
+        self.recipe = Some((a.into(), b.into()));
+        self
+    }
 }
 
 /// Gold and experience rules.
@@ -184,7 +361,7 @@ pub struct LevelRule {
     pub shop_odds: Vec<u32>,
 }
 
-/// Global rules, authored in `rules.ron`. Every field has a default.
+/// Global rules. Every field has a default.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GameRules {
@@ -256,6 +433,25 @@ impl Default for GameRules {
             base_damage_by_stage: vec![2, 3, 5, 8, 12, 17],
             damage_per_survivor: 1,
         }
+    }
+}
+
+impl GameRules {
+    pub fn board(mut self, cols: u32, rows: u32) -> Self {
+        self.board_cols = cols;
+        self.board_rows = rows;
+        self
+    }
+
+    pub fn max_items_per_unit(mut self, n: usize) -> Self {
+        self.max_items_per_unit = n;
+        self
+    }
+
+    /// Stat modifiers for each star level, starting at one star.
+    pub fn star_levels<L: IntoIterator<Item = StatMod>>(mut self, levels: impl IntoIterator<Item = L>) -> Self {
+        self.star_levels = levels.into_iter().map(|l| l.into_iter().collect()).collect();
+        self
     }
 }
 
@@ -333,7 +529,7 @@ pub struct RoundDef {
     pub kind: RoundKindDef,
 }
 
-/// The order of rounds in a game, authored in `rounds.ron`. When the list
+/// The order of rounds in a game. When the list
 /// runs out it loops back to `repeat_from`, one stage higher each time.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Schedule {
@@ -369,6 +565,107 @@ fn default_star() -> u8 {
     1
 }
 
+impl AugmentDef {
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        AugmentDef { id: id.into(), name: name.into(), description: String::new(), bonuses: Vec::new(), gold: 0 }
+    }
+
+    pub fn description(mut self, text: impl Into<String>) -> Self {
+        self.description = text.into();
+        self
+    }
+
+    pub fn bonus(mut self, bonus: Bonus) -> Self {
+        self.bonuses.push(bonus);
+        self
+    }
+
+    /// Gold given once, when the augment is picked.
+    pub fn gold(mut self, gold: i64) -> Self {
+        self.gold = gold;
+        self
+    }
+}
+
+impl RoundKindDef {
+    pub fn pvp() -> Self {
+        RoundKindDef::Pvp
+    }
+
+    /// Everyone fights this neutral board. Add rewards with
+    /// [`gold`](Self::gold) and [`items`](Self::items).
+    pub fn pve(enemies: impl IntoIterator<Item = BoardUnit>) -> Self {
+        RoundKindDef::Pve { enemies: enemies.into_iter().collect(), gold: 0, items: 0 }
+    }
+
+    /// Gold for winning a [`RoundKindDef::Pve`] round. Other kinds are
+    /// returned unchanged.
+    pub fn gold(mut self, amount: i64) -> Self {
+        if let RoundKindDef::Pve { gold, .. } = &mut self {
+            *gold = amount;
+        }
+        self
+    }
+
+    /// Random component items for winning a [`RoundKindDef::Pve`] round.
+    pub fn items(mut self, count: u32) -> Self {
+        if let RoundKindDef::Pve { items, .. } = &mut self {
+            *items = count;
+        }
+        self
+    }
+
+    /// A shared draft with `extra` offers beyond one per player.
+    pub fn draft(extra: u32) -> Self {
+        RoundKindDef::Draft { extra, max_cost: None }
+    }
+
+    /// Limits a [`RoundKindDef::Draft`] to units up to this cost.
+    pub fn max_cost(mut self, cost: u32) -> Self {
+        if let RoundKindDef::Draft { max_cost, .. } = &mut self {
+            *max_cost = Some(cost);
+        }
+        self
+    }
+
+    pub fn choice(options: u32, offer: ChoiceOffer) -> Self {
+        RoundKindDef::Choice { options, offer }
+    }
+
+    /// A round type registered by the game or defined by a script.
+    pub fn custom(kind: impl Into<String>) -> Self {
+        RoundKindDef::Custom { kind: kind.into(), params: BTreeMap::new() }
+    }
+
+    /// A named number for a [`RoundKindDef::Custom`] round.
+    pub fn param(mut self, name: impl Into<String>, value: i64) -> Self {
+        if let RoundKindDef::Custom { params, .. } = &mut self {
+            params.insert(name.into(), value);
+        }
+        self
+    }
+}
+
+impl RoundDef {
+    pub fn new(name: impl Into<String>, stage: u32, kind: RoundKindDef) -> Self {
+        RoundDef { name: name.into(), stage, kind }
+    }
+}
+
+impl Schedule {
+    /// A schedule that loops back to the first round when it runs out; see
+    /// [`repeat_from`](Self::repeat_from).
+    pub fn new(rounds: impl IntoIterator<Item = RoundDef>) -> Self {
+        Schedule { rounds: rounds.into_iter().collect(), repeat_from: 0 }
+    }
+
+    /// Where the schedule loops back to (one stage higher each time).
+    pub fn repeat_from(mut self, index: usize) -> Self {
+        self.repeat_from = index;
+        self
+    }
+}
+
 /// A unit a player has placed on their board.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardUnit {
@@ -382,6 +679,23 @@ pub struct BoardUnit {
     pub pos: (i32, i32),
 }
 
+impl BoardUnit {
+    /// A one-star unit with no items at `(column, row)`.
+    pub fn new(unit: impl Into<String>, pos: (i32, i32)) -> Self {
+        BoardUnit { unit: unit.into(), star: 1, items: Vec::new(), pos }
+    }
+
+    pub fn star(mut self, star: u8) -> Self {
+        self.star = star;
+        self
+    }
+
+    pub fn item(mut self, id: impl Into<String>) -> Self {
+        self.items.push(id.into());
+        self
+    }
+}
+
 /// One side of a fight.
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TeamSetup {
@@ -390,6 +704,22 @@ pub struct TeamSetup {
     /// as augment-style modifiers a player has picked up.
     #[serde(default)]
     pub bonuses: Vec<Bonus>,
+}
+
+impl TeamSetup {
+    pub fn new() -> Self {
+        TeamSetup::default()
+    }
+
+    pub fn unit(mut self, unit: BoardUnit) -> Self {
+        self.units.push(unit);
+        self
+    }
+
+    pub fn bonus(mut self, bonus: Bonus) -> Self {
+        self.bonuses.push(bonus);
+        self
+    }
 }
 
 /// A whole fight described in data: the teams and where they stand.
@@ -419,16 +749,18 @@ pub struct Placement {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContentError {
-    Io { path: String, message: String },
-    Parse { file: String, message: String },
+    /// A script that does not compile, or scripts in a build without the
+    /// `scripting` feature.
+    Script { name: String, message: String },
+    /// Content that breaks a rule: a dangling reference, a duplicate id, a
+    /// unit that cannot be placed, and so on.
     Invalid(String),
 }
 
 impl std::fmt::Display for ContentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ContentError::Io { path, message } => write!(f, "cannot read {path}: {message}"),
-            ContentError::Parse { file, message } => write!(f, "{file}: {message}"),
+            ContentError::Script { name, message } => write!(f, "script `{name}`: {message}"),
             ContentError::Invalid(message) => write!(f, "invalid content: {message}"),
         }
     }
@@ -465,19 +797,6 @@ fn invalid<T>(message: String) -> Result<T, ContentError> {
     Err(ContentError::Invalid(message))
 }
 
-/// Parses a RON document. Optional fields may be written without `Some(..)`.
-pub fn parse_ron<T: DeserializeOwned>(file: &str, text: &str) -> Result<T, ContentError> {
-    ron::Options::default()
-        .with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME)
-        .from_str(text)
-        .map_err(|e| ContentError::Parse { file: file.to_string(), message: e.to_string() })
-}
-
-fn read(path: &Path) -> Result<String, ContentError> {
-    std::fs::read_to_string(path)
-        .map_err(|e| ContentError::Io { path: path.display().to_string(), message: e.to_string() })
-}
-
 fn index<T>(
     kind: &str,
     defs: Vec<T>,
@@ -496,6 +815,192 @@ fn index<T>(
     Ok(map)
 }
 
+/// The Rust hooks a game registers, by name.
+#[derive(Clone, Default)]
+struct Hooks {
+    effects: BTreeMap<String, Arc<CustomEffectFn>>,
+    conditions: BTreeMap<String, Arc<CustomConditionFn>>,
+}
+
+impl std::fmt::Debug for Hooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hooks")
+            .field("effects", &self.effects.keys().collect::<Vec<_>>())
+            .field("conditions", &self.conditions.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// Hooks are closures, so two sets are equal when they register the same names.
+impl PartialEq for Hooks {
+    fn eq(&self, other: &Self) -> bool {
+        self.effects.keys().eq(other.effects.keys()) && self.conditions.keys().eq(other.conditions.keys())
+    }
+}
+
+impl Eq for Hooks {}
+
+/// Collects definitions for a [`ContentSet`]; see the [module docs](self).
+/// Definitions can be added in any order since references are only checked
+/// by [`GameBuilder::build`].
+#[derive(Clone, Debug, Default)]
+pub struct GameBuilder {
+    units: Vec<UnitDef>,
+    traits: Vec<TraitDef>,
+    items: Vec<ItemDef>,
+    augments: Vec<AugmentDef>,
+    schedule: Option<Schedule>,
+    rules: GameRules,
+    scripts: BTreeMap<String, String>,
+    hooks: Hooks,
+}
+
+impl GameBuilder {
+    pub fn new() -> Self {
+        GameBuilder::default()
+    }
+
+    /// Replaces all rules.
+    pub fn rules(mut self, rules: GameRules) -> Self {
+        self.rules = rules;
+        self
+    }
+
+    pub fn board(mut self, cols: u32, rows: u32) -> Self {
+        self.rules = self.rules.board(cols, rows);
+        self
+    }
+
+    pub fn max_items_per_unit(mut self, n: usize) -> Self {
+        self.rules = self.rules.max_items_per_unit(n);
+        self
+    }
+
+    /// Stat modifiers for each star level, starting at one star.
+    pub fn star_levels<L: IntoIterator<Item = StatMod>>(mut self, levels: impl IntoIterator<Item = L>) -> Self {
+        self.rules = self.rules.star_levels(levels);
+        self
+    }
+
+    pub fn unit(mut self, unit: UnitDef) -> Self {
+        self.units.push(unit);
+        self
+    }
+
+    pub fn units(mut self, units: impl IntoIterator<Item = UnitDef>) -> Self {
+        self.units.extend(units);
+        self
+    }
+
+    pub fn trait_def(mut self, def: TraitDef) -> Self {
+        self.traits.push(def);
+        self
+    }
+
+    pub fn trait_defs(mut self, defs: impl IntoIterator<Item = TraitDef>) -> Self {
+        self.traits.extend(defs);
+        self
+    }
+
+    pub fn item(mut self, item: ItemDef) -> Self {
+        self.items.push(item);
+        self
+    }
+
+    pub fn items(mut self, items: impl IntoIterator<Item = ItemDef>) -> Self {
+        self.items.extend(items);
+        self
+    }
+
+    pub fn augment(mut self, augment: AugmentDef) -> Self {
+        self.augments.push(augment);
+        self
+    }
+
+    pub fn augments(mut self, augments: impl IntoIterator<Item = AugmentDef>) -> Self {
+        self.augments.extend(augments);
+        self
+    }
+
+    /// The round schedule; without one the game is one PvP round, repeated.
+    pub fn schedule(mut self, schedule: Schedule) -> Self {
+        self.schedule = Some(schedule);
+        self
+    }
+
+    /// Adds a Rhai script. A script named `x` defines the round kind `x`
+    /// (see the `script` module). Pass the source with `include_str!` to
+    /// keep it in its own file:
+    /// `.script("payday", include_str!("scripts/payday.rhai"))`.
+    pub fn script(mut self, name: impl Into<String>, source: impl Into<String>) -> Self {
+        self.scripts.insert(name.into(), source.into());
+        self
+    }
+
+    /// Registers a Rust hook for `Effect::Custom { name, .. }`, for logic
+    /// the built-in effects cannot express. The hook runs once per selected
+    /// unit and acts through the [`EffectContext`]. It must be deterministic:
+    /// use [`EffectContext::rng`] for randomness.
+    ///
+    /// Hooks live in the process that built the content set, so a networked
+    /// game needs the same hooks registered on the server and on any client
+    /// that replays fights.
+    ///
+    /// ```
+    /// use autoengine::content::{ContentSet, UnitDef};
+    /// use autoengine::effect::{Ability, Effect, Selector};
+    ///
+    /// // Deals true damage equal to the gap in current health, if positive.
+    /// let game = ContentSet::builder()
+    ///     .custom_effect("equalize", |ctx| {
+    ///         let me = ctx.combat().unit(ctx.source()).health();
+    ///         let them = ctx.combat().unit(ctx.target()).health();
+    ///         if them > me {
+    ///             ctx.apply(ctx.target(), &Effect::true_damage(them - me));
+    ///         }
+    ///     })
+    ///     .unit(UnitDef::new("judge", "Judge").ability(
+    ///         Ability::new("Equalize").effect(Effect::custom("equalize").to(Selector::CurrentTarget)),
+    ///     ))
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn custom_effect(
+        mut self,
+        name: impl Into<String>,
+        hook: impl Fn(&mut EffectContext<'_>) + Send + Sync + 'static,
+    ) -> Self {
+        self.hooks.effects.insert(name.into(), Arc::new(hook));
+        self
+    }
+
+    /// Registers a Rust predicate for `Condition::Custom(name)`.
+    pub fn custom_condition(
+        mut self,
+        name: impl Into<String>,
+        predicate: impl Fn(&ConditionContext<'_>) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.hooks.conditions.insert(name.into(), Arc::new(predicate));
+        self
+    }
+
+    /// Validates everything and produces the content set.
+    pub fn build(self) -> Result<ContentSet, ContentError> {
+        let set = ContentSet {
+            units: index("unit", self.units, |u| &u.id)?,
+            traits: index("trait", self.traits, |t| &t.id)?,
+            items: index("item", self.items, |i| &i.id)?,
+            augments: index("augment", self.augments, |a| &a.id)?,
+            schedule: self.schedule.unwrap_or_default(),
+            rules: self.rules,
+            scripts: BTreeMap::new(),
+            hooks: self.hooks,
+        };
+        set.validate()?;
+        set.with_scripts(self.scripts)
+    }
+}
+
 /// All the content of a game, validated and indexed by id.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ContentSet {
@@ -507,19 +1012,26 @@ pub struct ContentSet {
     rules: GameRules,
     /// Script sources by name (see the `script` module).
     scripts: BTreeMap<String, String>,
+    /// Rust hooks registered with [`GameBuilder`].
+    hooks: Hooks,
 }
 
 impl ContentSet {
+    /// Starts defining a game in Rust.
+    pub fn builder() -> GameBuilder {
+        GameBuilder::new()
+    }
+
     /// Adds scripts, given as name and source, after checking that they
     /// compile. A script named `x` defines the round kind `x`.
     pub fn with_scripts(mut self, scripts: BTreeMap<String, String>) -> Result<Self, ContentError> {
         #[cfg(feature = "scripting")]
         crate::script::ScriptHost::compile(&scripts)
-            .map_err(|e| ContentError::Parse { file: format!("scripts/{}.rhai", e.script), message: e.message })?;
+            .map_err(|e| ContentError::Script { name: e.script, message: e.message })?;
         #[cfg(not(feature = "scripting"))]
         if let Some(name) = scripts.keys().next() {
-            return Err(ContentError::Parse {
-                file: format!("scripts/{name}.rhai"),
+            return Err(ContentError::Script {
+                name: name.clone(),
                 message: "this build of the engine has scripting turned off (the `scripting` cargo feature)".into(),
             });
         }
@@ -546,6 +1058,7 @@ impl ContentSet {
             schedule: Schedule::default(),
             rules,
             scripts: BTreeMap::new(),
+            hooks: Hooks::default(),
         };
         set.validate()?;
         Ok(set)
@@ -563,57 +1076,6 @@ impl ContentSet {
         self.schedule = schedule;
         self.validate()?;
         Ok(self)
-    }
-
-    /// Parses content from RON text. `items` and `rules` may be `None`.
-    pub fn from_ron(
-        units: &str,
-        traits: &str,
-        items: Option<&str>,
-        rules: Option<&str>,
-    ) -> Result<Self, ContentError> {
-        ContentSet::new(
-            parse_ron("units.ron", units)?,
-            parse_ron("traits.ron", traits)?,
-            items.map(|t| parse_ron("items.ron", t)).transpose()?.unwrap_or_default(),
-            rules.map(|t| parse_ron("rules.ron", t)).transpose()?.unwrap_or_default(),
-        )
-    }
-
-    /// Loads `units.ron` and `traits.ron`, plus `items.ron`, `rules.ron`,
-    /// `augments.ron` and `rounds.ron` if present, from a directory.
-    pub fn load_dir(dir: impl AsRef<Path>) -> Result<Self, ContentError> {
-        let dir = dir.as_ref();
-        let optional = |name: &str| -> Result<Option<String>, ContentError> {
-            let path = dir.join(name);
-            if path.exists() { read(&path).map(Some) } else { Ok(None) }
-        };
-        let units = read(&dir.join("units.ron"))?;
-        let traits = read(&dir.join("traits.ron"))?;
-        let items = optional("items.ron")?;
-        let rules = optional("rules.ron")?;
-        let mut set = ContentSet::from_ron(&units, &traits, items.as_deref(), rules.as_deref())?;
-        if let Some(text) = optional("augments.ron")? {
-            set = set.with_augments(parse_ron("augments.ron", &text)?)?;
-        }
-        if let Some(text) = optional("rounds.ron")? {
-            set = set.with_schedule(parse_ron("rounds.ron", &text)?)?;
-        }
-        let scripts_dir = dir.join("scripts");
-        if scripts_dir.is_dir() {
-            let io = |e: std::io::Error| ContentError::Io { path: scripts_dir.display().to_string(), message: e.to_string() };
-            let mut scripts = BTreeMap::new();
-            for entry in std::fs::read_dir(&scripts_dir).map_err(io)? {
-                let path = entry.map_err(io)?.path();
-                if path.extension().is_some_and(|e| e == "rhai")
-                    && let Some(name) = path.file_stem().and_then(|n| n.to_str())
-                {
-                    scripts.insert(name.to_string(), read(&path)?);
-                }
-            }
-            set = set.with_scripts(scripts)?;
-        }
-        Ok(set)
     }
 
     fn validate(&self) -> Result<(), ContentError> {
@@ -643,23 +1105,49 @@ impl ContentSet {
                 invalid(format!("{owner} refers to unknown trait `{id}`{}", suggestion(id, self.traits.keys())))
             }
         };
+        let check_condition = |owner: &str, condition: Option<&Condition>| {
+            let mut result = Ok(());
+            if let Some(c) = condition {
+                c.walk(&mut |c| {
+                    if let Condition::Custom(name) = c
+                        && !self.hooks.conditions.contains_key(name)
+                        && result.is_ok()
+                    {
+                        result = invalid(format!("{owner} uses unregistered custom condition `{name}`"));
+                    }
+                });
+            }
+            result
+        };
         let check_effects = |owner: &str, effects: &[EffectSpec]| {
             for spec in effects {
-                if let Effect::Summon { unit, .. } = &spec.effect
-                    && !self.units.contains_key(unit)
-                {
-                    return invalid(format!("{owner} summons unknown unit `{unit}`{}", suggestion(unit, self.units.keys())));
-                }
-                if let Effect::ApplyStatus { status: StatusKind::StatMods(mods), .. } = &spec.effect
-                    && mods.is_empty()
-                {
-                    return invalid(format!("{owner} applies a stat status with no modifiers"));
+                check_condition(owner, spec.condition.as_ref())?;
+                match &spec.effect {
+                    Effect::Summon { unit, .. } if !self.units.contains_key(unit) => {
+                        return invalid(format!(
+                            "{owner} summons unknown unit `{unit}`{}",
+                            suggestion(unit, self.units.keys())
+                        ));
+                    }
+                    Effect::ApplyStatus { status: StatusKind::StatMods(mods), .. } if mods.is_empty() => {
+                        return invalid(format!("{owner} applies a stat status with no modifiers"));
+                    }
+                    Effect::AddStacks { stack, .. } | Effect::ClearStacks { stack } if stack.is_empty() => {
+                        return invalid(format!("{owner} uses a stack with an empty name"));
+                    }
+                    Effect::Custom { name, .. } if !self.hooks.effects.contains_key(name) => {
+                        return invalid(format!("{owner} uses unregistered custom effect `{name}`"));
+                    }
+                    _ => {}
                 }
             }
             Ok(())
         };
         let check_passives = |owner: &str, passives: &[Passive]| {
-            passives.iter().try_for_each(|p| check_effects(owner, &p.effects))
+            passives.iter().try_for_each(|p| {
+                check_condition(owner, p.condition.as_ref())?;
+                check_effects(owner, &p.effects)
+            })
         };
 
         for u in self.units.values() {
@@ -830,6 +1318,7 @@ impl ContentSet {
             stats.set(*stat, *value);
         }
         Ok(UnitTemplate {
+            id: def.id.clone(),
             name: def.name.clone(),
             stats: stats.with_mods(star_mods),
             ability: def.ability.clone(),
@@ -842,6 +1331,8 @@ impl ContentSet {
     /// levels, items, active trait bonuses and team bonuses.
     pub fn build_team(&self, team: &TeamSetup) -> Result<Vec<Placement>, ContentError> {
         let active = self.active_traits(&team.units)?;
+        let count_of = |t: &str| active.iter().find(|a| a.id == t).map_or(0, |a| a.count) as i64;
+        let distinct_units = team.units.iter().map(|u| u.unit.as_str()).collect::<BTreeSet<_>>().len() as i64;
         // (trait the bonus came from, bonus)
         let mut bonuses: Vec<(Option<&str>, &Bonus)> = Vec::new();
         for a in &active {
@@ -878,6 +1369,18 @@ impl ContentSet {
                 };
                 if applies {
                     mods.extend(&bonus.mods);
+                    if !bonus.mods_per_member.is_empty() {
+                        let members = match (source, &bonus.scope) {
+                            (Some(t), _) => count_of(t),
+                            (None, Scope::WithTrait(t)) => count_of(t),
+                            (None, _) => distinct_units,
+                        };
+                        mods.extend(bonus.mods_per_member.iter().map(|m| StatMod {
+                            stat: m.stat,
+                            flat: m.flat * members,
+                            permille: m.permille * members,
+                        }));
+                    }
                     template.passives.extend(bonus.passives.iter().cloned());
                 }
             }
@@ -895,6 +1398,14 @@ impl ContentSet {
     pub fn setup_combat(&self, seed: u64, teams: &[TeamSetup]) -> Result<Combat, ContentError> {
         let board = self.board();
         let mut combat = Combat::new(board.clone(), seed);
+        for (name, hook) in &self.hooks.effects {
+            let hook = hook.clone();
+            combat.register_custom_effect(name.clone(), move |ctx| hook(ctx));
+        }
+        for (name, predicate) in &self.hooks.conditions {
+            let predicate = predicate.clone();
+            combat.register_custom_condition(name.clone(), move |ctx| predicate(ctx));
+        }
         for id in self.units.keys() {
             combat.register_template(id.clone(), self.base_template(id, 1)?);
         }

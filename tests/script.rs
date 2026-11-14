@@ -10,7 +10,7 @@ const P0: PlayerId = PlayerId(0);
 const P1: PlayerId = PlayerId(1);
 
 fn sample() -> ContentSet {
-    ContentSet::load_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/content")).expect("sample content loads")
+    autoengine::sample::content()
 }
 
 fn scripts(list: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -133,7 +133,7 @@ fn script_mistakes_are_reported_and_do_not_stop_the_game() {
 #[test]
 fn scripts_that_do_not_compile_are_rejected_with_the_content() {
     let broken = sample().with_scripts(scripts(&[("broken", "fn finish(game) { let = ; }")]));
-    assert!(broken.unwrap_err().to_string().contains("scripts/broken.rhai"));
+    assert!(broken.unwrap_err().to_string().contains("script `broken`"));
     let idle = sample().with_scripts(scripts(&[("idle", "fn helper() { 1 }")]));
     assert!(idle.unwrap_err().to_string().contains("never run"));
 }

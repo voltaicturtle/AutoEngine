@@ -23,17 +23,20 @@ Escape opens a menu with the settings, and F3 shows frame-rate and scene
 statistics.
 
 Server options: `--port`, `--bind`, `--seats`, `--seed`, `--planning-secs`,
-`--content DIR`, `--record DIR`, `--dev`. `--autoplay` makes a client play by itself, which is handy
+`--record DIR`, `--dev` (see `cargo run -- help`). The server hosts the content its binary was built
+with; a game crate hosts its own with `cargo run -- serve`. `--autoplay` makes a client play by itself, which is handy
 for demos.
 
 ## 3D models
 
 The board is a 3D scene and every unit is a model. A unit names its model in
-`units.ron`:
+its definition:
 
-```ron
-model: (file: "models/ironbark_warden.obj", scale_percent: 110, yaw_degrees: 0),
+```rust
+UnitDef::new("ironbark_warden", "Ironbark Warden").model("models/ironbark_warden.obj", 110)
 ```
+
+Set `ModelRef::yaw_degrees` on `unit.model` for files that face another way.
 
 The file is looked up in the client's assets folder (`--assets DIR`, default
 `content`) and read with [Assimp](https://www.assimp.org/) through the
@@ -68,7 +71,7 @@ are rigged this way.
 Fights throw particles for hits, heals, casts and deaths, ranged attacks fire
 a bolt, and units cast a soft shadow. Settings (name, server address, window
 size, fullscreen, volume, and switches for particles, shadows and animations)
-live in `autoengine-client.ron` in the folder the client is started from
+live in `autoengine-client.json` in the folder the client is started from
 (`--settings FILE` to use another) and are saved when changed in the menu.
 
 Sound effects are synthesised by the client, so no sound files are needed
@@ -115,4 +118,4 @@ The client contains no game rules. Each file in `client/src/` has one job:
 | `menu.rs`, `console.rs` | the settings menu, statistics overlay and developer console |
 | `scene.rs`, `draw.rs`, `fx.rs` | the camera and ground, flat interface drawing, particles |
 | `model.rs` | Assimp import, skinning and animation |
-| `theme.rs`, `settings.rs`, `sound.rs` | `theme.ron`, the settings file and key bindings, sound effects |
+| `theme.rs`, `settings.rs`, `sound.rs` | the theme (colours, light, effects, font), the settings file and key bindings, sound effects |

@@ -15,7 +15,7 @@ use autoengine::protocol::ViewPhase;
 fn main() {
     // The server side: a session (the game) hosted on a socket. Port 0
     // picks any free port.
-    let content = ContentSet::load_dir("content").expect("run this from the repository root");
+    let content = autoengine::sample::content();
     // No pause for watching fights, since nobody here is watching.
     let config = SessionConfig { seats: 4, planning_ms: 5_000, wait_for_playback: false, ..SessionConfig::default() };
     let session = Session::new(content, config);

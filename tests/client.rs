@@ -9,7 +9,7 @@ use autoengine::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg, ViewPhase, de
 use autoengine::session::{Session, SessionConfig};
 
 fn content() -> Arc<ContentSet> {
-    Arc::new(ContentSet::load_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/content")).unwrap())
+    Arc::new(autoengine::sample::content())
 }
 
 /// Runs a two-seat session with one person, feeding everything the server

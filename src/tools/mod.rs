@@ -5,11 +5,13 @@
 //! | --- | --- | --- |
 //! | [`lint`](lint()) | `autoengine check` | finds likely mistakes in content |
 //! | [`simulate`] | `autoengine sim` | plays bot games and reports balance |
-//! | [`scenario`] | `autoengine test` | runs fights written as data and checks what was expected of them |
-//! | [`scaffold`] | `autoengine new` | writes a small starter game to build on |
+//! | [`scenario`] | `autoengine test` | runs fights with expected results and checks them |
+//! | [`scaffold`] | `autoengine new` | writes a small starter game (a Rust crate) to build on |
+//! | [`cli`] | all of them | the command line, for any game defined in Rust |
 //! | [`mod@bench`] | `autoengine bench` | measures how fast fights and games run |
 
 pub mod bench;
+pub mod cli;
 mod lint;
 pub mod scaffold;
 pub mod scenario;

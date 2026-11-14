@@ -78,7 +78,7 @@ pub struct NetStats {
 /// use autoengine::prelude::*;
 /// use autoengine::net::Server;
 ///
-/// let content = ContentSet::load_dir("content").unwrap();
+/// let content = autoengine::sample::content();
 /// let session = Session::new(content, SessionConfig::default());
 /// let server = Server::bind("127.0.0.1:7777").unwrap().spawn(session);
 /// println!("listening on {}", server.addr());

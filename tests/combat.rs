@@ -155,6 +155,7 @@ fn stun_stops_actions_and_expires() {
             Effect::ApplyStatus { status: StatusKind::Stun, duration_ms: 2000 },
         )],
         max_procs: None,
+        condition: None,
     });
     let (mut c, a, b) = duel(stunner, grunt("Victim"), 1);
     for _ in 0..39 {
@@ -179,6 +180,7 @@ fn reactive_passives_fire_without_looping() {
                 Effect::Damage { amount: Amount::flat(10), kind: DamageKind::True, can_crit: false },
             )],
             max_procs: None,
+            condition: None,
         })
     };
     let (mut c, _, _) = duel(thorns("A"), thorns("B"), 1);
@@ -208,6 +210,7 @@ fn shields_absorb_before_health_and_buffs_revert() {
             ),
         ],
         max_procs: None,
+        condition: None,
     });
     let attacker = UnitTemplate::new(
         "Hitter",
@@ -241,6 +244,7 @@ fn death_trigger_summons_units_that_keep_fighting() {
             trigger: Trigger::OnDeath,
             effects: vec![EffectSpec::new(Selector::Source, Effect::Summon { unit: "minion".into(), count: 3 })],
             max_procs: None,
+            condition: None,
         });
     let (mut c, a, _) = duel(host, grunt("Enemy"), 1);
     c.register_template("minion", grunt("Minion"));
@@ -260,6 +264,7 @@ fn health_threshold_fires_once_and_heal_respects_max() {
             trigger: Trigger::HealthBelow { permille: 500 },
             effects: vec![EffectSpec::new(Selector::Source, Effect::Heal { amount: Amount::flat(5000) })],
             max_procs: None,
+            condition: None,
         });
     let enemy = UnitTemplate::new("Enemy", StatBlock::base().with(Stat::CritChance, 0).with(Stat::MaxHealth, 4000));
     let (mut c, a, _) = duel(survivor, enemy, 1);

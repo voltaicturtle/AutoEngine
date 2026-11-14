@@ -5,7 +5,6 @@
 //! Scripts (see content/scripts/) do the same without rebuilding. Use Rust
 //! when a rule needs more than the script functions offer.
 
-use std::collections::BTreeMap;
 
 use autoengine::content::{RoundDef, RoundKindDef, Schedule};
 use autoengine::prelude::*;
@@ -43,15 +42,13 @@ impl GameHook for UpgradeBounty {
 
 fn main() {
     // Use the sample content, with a charity round after every two fights.
-    // In a real game this schedule would be in rounds.ron.
-    let round = |name: &str, kind| RoundDef { name: name.into(), stage: 1, kind };
-    let charity = RoundKindDef::Custom { kind: "charity".into(), params: BTreeMap::from([("gold".to_string(), 5)]) };
-    let schedule = Schedule {
-        rounds: vec![round("fight", RoundKindDef::Pvp), round("fight", RoundKindDef::Pvp), round("charity", charity)],
-        repeat_from: 0,
-    };
-    let content = ContentSet::load_dir("content")
-        .expect("run this from the repository root")
+    // In a real game this schedule would be part of the content definition.
+    let schedule = Schedule::new([
+        RoundDef::new("fight", 1, RoundKindDef::pvp()),
+        RoundDef::new("fight", 1, RoundKindDef::pvp()),
+        RoundDef::new("charity", 1, RoundKindDef::custom("charity").param("gold", 5)),
+    ]);
+    let content = autoengine::sample::content()
         .with_schedule(schedule)
         .expect("the schedule is valid");
 

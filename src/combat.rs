@@ -9,14 +9,20 @@
 //!
 //! Units act in id order within a tick. Units spawned during a tick start
 //! acting on the next one.
+//!
+//! Games can extend the simulation with Rust hooks: a [`CustomEffectFn`]
+//! runs for [`Effect::Custom`] and a [`CustomConditionFn`] answers
+//! [`Condition::Custom`]. Hooks see the whole fight and act through an
+//! [`EffectContext`], which only exposes operations that keep the
+//! simulation consistent and reproducible.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::effect::{
-    Amount, Anchor, DamageKind, Effect, EffectSpec, ScaleBy, Selector, StatusKind, Trigger,
+    Amount, Anchor, Condition, DamageKind, Effect, EffectSpec, ScaleBy, Selector, StatusKind, Trigger,
     UnitTemplate, Who,
 };
 use crate::hex::{Hex, HexBoard};
@@ -38,6 +44,19 @@ const PROGRESS_FULL: i64 = 1_000_000;
 /// Upper bound on triggered passives resolved in one go, as a guard against
 /// content that triggers itself forever.
 const MAX_TRIGGER_CHAIN: usize = 10_000;
+
+/// How deeply custom effects may call other custom effects.
+const MAX_HOOK_DEPTH: u32 = 16;
+
+/// A Rust hook run by [`Effect::Custom`], once per selected unit.
+///
+/// Hooks must be deterministic: use [`EffectContext::rng`] for randomness and
+/// never read clocks, global state or anything else outside the combat.
+pub type CustomEffectFn = dyn Fn(&mut EffectContext<'_>) + Send + Sync;
+
+/// A Rust predicate checked by [`Condition::Custom`]. The same determinism
+/// rules as [`CustomEffectFn`] apply.
+pub type CustomConditionFn = dyn Fn(&ConditionContext<'_>) -> bool + Send + Sync;
 
 /// Tunable rules of the simulation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,6 +107,13 @@ struct PassiveState {
     timer_ms: u32,
 }
 
+#[derive(Clone, Debug, Default)]
+struct StackState {
+    count: u32,
+    /// Stat modifiers granted so far, removed again when the stack clears.
+    granted: Vec<StatMod>,
+}
+
 /// A unit taking part in a combat.
 #[derive(Clone, Debug)]
 pub struct CombatUnit {
@@ -106,6 +132,7 @@ pub struct CombatUnit {
     shields: Vec<ShieldInstance>,
     statuses: Vec<StatusInstance>,
     passive_state: Vec<PassiveState>,
+    stacks: BTreeMap<String, StackState>,
 }
 
 impl CombatUnit {
@@ -150,6 +177,17 @@ impl CombatUnit {
     pub fn is_stunned(&self) -> bool {
         self.statuses.iter().any(|s| matches!(s.kind, StatusKind::Stun))
     }
+    /// Every stack the unit has, by name.
+    pub fn all_stacks(&self) -> impl Iterator<Item = (&str, u32)> {
+        self.stacks.iter().filter(|(_, s)| s.count > 0).map(|(k, s)| (k.as_str(), s.count))
+    }
+    /// Current count of a named stack (zero if the unit has none).
+    pub fn stacks(&self, stack: &str) -> u32 {
+        self.stacks.get(stack).map_or(0, |s| s.count)
+    }
+    pub fn has_tag(&self, tag: &str) -> bool {
+        self.template.tags.iter().any(|t| t == tag)
+    }
 }
 
 /// Something that happened during combat.
@@ -157,6 +195,9 @@ impl CombatUnit {
 pub enum EventKind {
     Spawned { unit: UnitId, team: Team, pos: Hex, name: String, max_health: i64 },
     Moved { unit: UnitId, from: Hex, to: Hex },
+    /// Moved by an effect (knockback, leap, a custom hook) rather than by
+    /// walking.
+    Displaced { unit: UnitId, from: Hex, to: Hex },
     Attacked { source: UnitId, target: UnitId },
     Damaged {
         source: UnitId,
@@ -175,6 +216,7 @@ pub enum EventKind {
     PassiveTriggered { unit: UnitId, passive: usize },
     StatusApplied { source: UnitId, target: UnitId, status: StatusKind, duration_ms: u32 },
     StatusExpired { target: UnitId, status: StatusKind },
+    StacksChanged { unit: UnitId, stack: String, count: u32 },
     Died { unit: UnitId, killer: UnitId },
     Ended { winner: Option<Team>, timed_out: bool },
 }
@@ -233,6 +275,9 @@ pub struct Combat {
     events: Vec<Event>,
     pending: VecDeque<PendingTrigger>,
     outcome: Option<Outcome>,
+    custom_effects: HashMap<String, Arc<CustomEffectFn>>,
+    custom_conditions: HashMap<String, Arc<CustomConditionFn>>,
+    hook_depth: u32,
 }
 
 impl Combat {
@@ -255,6 +300,9 @@ impl Combat {
             events: Vec::new(),
             pending: VecDeque::new(),
             outcome: None,
+            custom_effects: HashMap::new(),
+            custom_conditions: HashMap::new(),
+            hook_depth: 0,
         }
     }
 
@@ -301,6 +349,26 @@ impl Combat {
         self.library.insert(id.into(), template.into());
     }
 
+    /// Registers the hook run by `Effect::Custom { name, .. }`. Custom
+    /// effects with no registered hook do nothing.
+    pub fn register_custom_effect(
+        &mut self,
+        name: impl Into<String>,
+        hook: impl Fn(&mut EffectContext<'_>) + Send + Sync + 'static,
+    ) {
+        self.custom_effects.insert(name.into(), Arc::new(hook));
+    }
+
+    /// Registers the predicate behind `Condition::Custom(name)`. Unregistered
+    /// custom conditions are false.
+    pub fn register_custom_condition(
+        &mut self,
+        name: impl Into<String>,
+        predicate: impl Fn(&ConditionContext<'_>) -> bool + Send + Sync + 'static,
+    ) {
+        self.custom_conditions.insert(name.into(), Arc::new(predicate));
+    }
+
     /// Places a unit on the board.
     pub fn spawn(
         &mut self,
@@ -334,6 +402,7 @@ impl Combat {
             shields: Vec::new(),
             statuses: Vec::new(),
             passive_state,
+            stacks: BTreeMap::new(),
         });
         self.occupancy[idx] = Some(id);
         let name = self.u(id).template.name.clone();
@@ -545,7 +614,8 @@ impl Combat {
         target
     }
 
-    fn move_unit(&mut self, id: UnitId, to: Hex) {
+    /// Moves a unit to a free hex and returns where it came from.
+    fn place(&mut self, id: UnitId, to: Hex) -> Hex {
         let from = self.u(id).pos;
         let from_idx = self.board.index(from).unwrap();
         let to_idx = self.board.index(to).unwrap();
@@ -553,7 +623,29 @@ impl Combat {
         self.occupancy[from_idx] = None;
         self.occupancy[to_idx] = Some(id);
         self.u_mut(id).pos = to;
+        from
+    }
+
+    fn move_unit(&mut self, id: UnitId, to: Hex) {
+        let from = self.place(id, to);
         self.emit(EventKind::Moved { unit: id, from, to });
+    }
+
+    fn displace(&mut self, id: UnitId, to: Hex) {
+        if self.u(id).pos != to {
+            let from = self.place(id, to);
+            self.emit(EventKind::Displaced { unit: id, from, to });
+        }
+    }
+
+    fn is_free(&self, hex: Hex) -> bool {
+        self.board.index(hex).is_some_and(|i| self.occupancy[i].is_none())
+    }
+
+    /// Living units on `id`'s team (itself included) that carry `tag`.
+    fn allies_with_tag(&self, id: UnitId, tag: &str) -> u32 {
+        let team = self.u(id).team;
+        self.units.iter().filter(|o| o.alive && o.team == team && o.has_tag(tag)).count() as u32
     }
 
     fn basic_attack(&mut self, id: UnitId, target: UnitId) {
@@ -606,11 +698,15 @@ impl Combat {
                 Trigger::HealthBelow { .. } => Some(passive.max_procs.unwrap_or(1)),
                 _ => passive.max_procs,
             };
-            let state = &mut self.u_mut(p.owner).passive_state[p.passive];
-            if limit.is_some_and(|max| state.procs >= max) {
+            if limit.is_some_and(|max| self.u(p.owner).passive_state[p.passive].procs >= max) {
                 continue;
             }
-            state.procs += 1;
+            if let Some(condition) = &passive.condition
+                && !self.check(condition, p.owner, p.other)
+            {
+                continue;
+            }
+            self.u_mut(p.owner).passive_state[p.passive].procs += 1;
             self.emit(EventKind::PassiveTriggered { unit: p.owner, passive: p.passive });
             // Effects from passives do not themselves count as attacks or
             // ability hits, which keeps reactive passives from ping-ponging.
@@ -623,8 +719,46 @@ impl Combat {
     fn resolve(&mut self, source: UnitId, other: Option<UnitId>, effects: &[EffectSpec], direct: bool) {
         for spec in effects {
             for target in self.select(&spec.target, source, other) {
-                self.apply_effect(source, target, &spec.effect, direct);
+                if let Some(condition) = &spec.condition
+                    && !self.check(condition, source, Some(target))
+                {
+                    continue;
+                }
+                self.apply_effect(source, target, other, &spec.effect, direct);
             }
+        }
+    }
+
+    /// Evaluates a condition. `target` is `None` when there is no other unit
+    /// (a passive triggered without one); conditions about it are false.
+    fn check(&mut self, condition: &Condition, source: UnitId, target: Option<UnitId>) -> bool {
+        let who = |w: &Who| match w {
+            Who::Source => Some(source),
+            Who::Target => target,
+        };
+        let health_permille = |u: &CombatUnit| u.health * 1000 / u.stat(Stat::MaxHealth).max(1);
+        match condition {
+            Condition::HealthBelow { who: w, permille } => {
+                who(w).is_some_and(|id| health_permille(self.u(id)) <= *permille as i64)
+            }
+            Condition::HealthAbove { who: w, permille } => {
+                who(w).is_some_and(|id| health_permille(self.u(id)) > *permille as i64)
+            }
+            Condition::Stunned(w) => who(w).is_some_and(|id| self.u(id).is_stunned()),
+            Condition::Shielded(w) => who(w).is_some_and(|id| self.u(id).shield() > 0),
+            Condition::HasTag { who: w, tag } => who(w).is_some_and(|id| self.u(id).has_tag(tag)),
+            Condition::StacksAtLeast { who: w, stack, count } => {
+                who(w).is_some_and(|id| self.u(id).stacks(stack) >= *count)
+            }
+            Condition::AlliesWithTagAtLeast { tag, count } => self.allies_with_tag(source, tag) >= *count,
+            Condition::Chance { permille } => self.rng.chance(*permille as u64, 1000),
+            Condition::Not(c) => !self.check(c, source, target),
+            Condition::All(cs) => cs.iter().all(|c| self.check(c, source, target)),
+            Condition::Any(cs) => cs.iter().any(|c| self.check(c, source, target)),
+            Condition::Custom(name) => match self.custom_conditions.get(name).cloned() {
+                Some(predicate) => predicate(&ConditionContext { combat: self, source, target }),
+                None => false,
+            },
         }
     }
 
@@ -687,10 +821,12 @@ impl Combat {
                 Who::Source => self.u(source),
                 Who::Target => self.u(target),
             };
-            let value = match s.by {
-                ScaleBy::Stat(stat) => unit.stat(stat),
+            let value = match &s.by {
+                ScaleBy::Stat(stat) => unit.stat(*stat),
                 ScaleBy::CurrentHealth => unit.health.max(0),
                 ScaleBy::MissingHealth => (unit.stat(Stat::MaxHealth) - unit.health).max(0),
+                ScaleBy::Stacks(stack) => unit.stacks(stack) as i64,
+                ScaleBy::AlliesWithTag(tag) => self.allies_with_tag(unit.id, tag) as i64,
             };
             total += value * s.permille / 1000;
         }
@@ -700,10 +836,10 @@ impl Combat {
         total
     }
 
-    fn apply_effect(&mut self, source: UnitId, target: UnitId, effect: &Effect, direct: bool) {
-        // Summons may be anchored on a unit that just died; everything else
-        // needs a living target.
-        if !self.u(target).alive && !matches!(effect, Effect::Summon { .. }) {
+    fn apply_effect(&mut self, source: UnitId, target: UnitId, other: Option<UnitId>, effect: &Effect, direct: bool) {
+        // Summons may be anchored on a unit that just died, and custom hooks
+        // decide for themselves; everything else needs a living target.
+        if !self.u(target).alive && !matches!(effect, Effect::Summon { .. } | Effect::Custom { .. }) {
             return;
         }
         match effect {
@@ -762,6 +898,79 @@ impl Combat {
                         remaining -= 1;
                     }
                 }
+            }
+            Effect::AddStacks { stack, count, max, mods_per_stack } => {
+                let current = self.u(target).stacks(stack);
+                let wanted = current.saturating_add(*count);
+                let new = max.map_or(wanted, |m| wanted.min(m)).max(current);
+                let gained = (new - current) as i64;
+                if gained == 0 {
+                    return;
+                }
+                let granted: Vec<StatMod> = mods_per_stack
+                    .iter()
+                    .map(|m| StatMod { stat: m.stat, flat: m.flat * gained, permille: m.permille * gained })
+                    .collect();
+                self.change_stats(target, &granted, true);
+                let state = self.u_mut(target).stacks.entry(stack.clone()).or_default();
+                state.count = new;
+                state.granted.extend(granted);
+                self.emit(EventKind::StacksChanged { unit: target, stack: stack.clone(), count: new });
+            }
+            Effect::ClearStacks { stack } => {
+                if let Some(state) = self.u_mut(target).stacks.remove(stack) {
+                    self.change_stats(target, &state.granted, false);
+                    self.emit(EventKind::StacksChanged { unit: target, stack: stack.clone(), count: 0 });
+                }
+            }
+            Effect::Knockback { hexes } => {
+                if source == target {
+                    return;
+                }
+                // Follow the straight line from the source through the
+                // target, stopping at the board edge or another unit.
+                let origin = self.u(source).pos;
+                let start = self.u(target).pos;
+                let dist = origin.distance(start);
+                let reach = 1 + hexes.div_ceil(dist) as i32;
+                let line = origin.line_to(origin.add(start.sub(origin).scale(reach)));
+                let mut pos = start;
+                for &h in line.iter().skip(dist as usize + 1).take(*hexes as usize) {
+                    if !self.is_free(h) {
+                        break;
+                    }
+                    pos = h;
+                }
+                self.displace(target, pos);
+            }
+            Effect::Leap => {
+                if source == target || !self.u(source).alive {
+                    return;
+                }
+                let (from, center) = (self.u(source).pos, self.u(target).pos);
+                let reach = self.board.cols() + self.board.rows();
+                let best = center
+                    .spiral(reach)
+                    .into_iter()
+                    .filter(|h| *h == from || self.is_free(*h))
+                    .min_by_key(|h| (h.distance(center), h.distance(from)));
+                if let Some(to) = best {
+                    self.displace(source, to);
+                }
+                if self.u(target).team != self.u(source).team {
+                    self.u_mut(source).target = Some(target);
+                }
+            }
+            Effect::Custom { name, args } => {
+                let Some(hook) = self.custom_effects.get(name).cloned() else {
+                    return;
+                };
+                if self.hook_depth >= MAX_HOOK_DEPTH {
+                    return;
+                }
+                self.hook_depth += 1;
+                hook(&mut EffectContext { combat: self, source, target, other, args });
+                self.hook_depth -= 1;
             }
         }
     }
@@ -935,5 +1144,101 @@ impl Combat {
             timed_out,
             survivors: self.units.iter().filter(|u| u.alive).map(|u| u.id).collect(),
         });
+    }
+}
+
+/// What a [`CustomEffectFn`] can see and do.
+///
+/// Reads go through [`EffectContext::combat`]. Changes go through
+/// [`EffectContext::apply`], which runs any [`Effect`] (built-in or custom)
+/// exactly as content would, so events, triggers and stat bookkeeping stay
+/// consistent.
+pub struct EffectContext<'a> {
+    combat: &'a mut Combat,
+    source: UnitId,
+    target: UnitId,
+    other: Option<UnitId>,
+    args: &'a [i64],
+}
+
+impl EffectContext<'_> {
+    /// The unit producing the effect.
+    pub fn source(&self) -> UnitId {
+        self.source
+    }
+    /// The selected unit this call is for.
+    pub fn target(&self) -> UnitId {
+        self.target
+    }
+    /// The other unit in the triggering event, if any (see
+    /// [`Selector::EventOther`]).
+    pub fn other(&self) -> Option<UnitId> {
+        self.other
+    }
+    /// The arguments given in [`Effect::Custom`].
+    pub fn args(&self) -> &[i64] {
+        self.args
+    }
+    /// One argument, or zero if it was not given.
+    pub fn arg(&self, index: usize) -> i64 {
+        self.args.get(index).copied().unwrap_or(0)
+    }
+    /// The whole fight, read-only.
+    pub fn combat(&self) -> &Combat {
+        self.combat
+    }
+    /// The combat's seeded generator; the only allowed source of randomness.
+    pub fn rng(&mut self) -> &mut Rng {
+        &mut self.combat.rng
+    }
+    /// Units chosen by a selector, relative to the source.
+    pub fn select(&self, selector: &Selector) -> Vec<UnitId> {
+        self.combat.select(selector, self.source, self.other)
+    }
+    /// Computes an amount from the source to `target`.
+    pub fn eval(&self, amount: &Amount, target: UnitId) -> i64 {
+        self.combat.eval(amount, self.source, target)
+    }
+    /// Checks a condition from the source's point of view against `target`.
+    pub fn check(&mut self, condition: &Condition, target: UnitId) -> bool {
+        self.combat.check(condition, self.source, Some(target))
+    }
+    /// Applies an effect from the source to `target`.
+    pub fn apply(&mut self, target: UnitId, effect: &Effect) {
+        self.apply_from(self.source, target, effect);
+    }
+    /// Applies an effect as if `source` produced it.
+    pub fn apply_from(&mut self, source: UnitId, target: UnitId, effect: &Effect) {
+        self.combat.apply_effect(source, target, self.other, effect, false);
+    }
+    /// Moves a living unit to a free hex on the board. Returns whether it
+    /// moved.
+    pub fn move_unit(&mut self, unit: UnitId, to: Hex) -> bool {
+        if !self.combat.u(unit).alive || !self.combat.is_free(to) {
+            return false;
+        }
+        self.combat.displace(unit, to);
+        true
+    }
+}
+
+/// What a [`CustomConditionFn`] can see.
+pub struct ConditionContext<'a> {
+    combat: &'a Combat,
+    source: UnitId,
+    target: Option<UnitId>,
+}
+
+impl ConditionContext<'_> {
+    pub fn source(&self) -> UnitId {
+        self.source
+    }
+    /// The unit being checked, or `None` for a passive triggered without
+    /// another unit.
+    pub fn target(&self) -> Option<UnitId> {
+        self.target
+    }
+    pub fn combat(&self) -> &Combat {
+        self.combat
     }
 }

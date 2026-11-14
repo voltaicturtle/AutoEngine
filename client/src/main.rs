@@ -22,7 +22,7 @@
 //! effects, and reloads when the file changes.
 //!
 //! `--replay FILE` watches a fight the server saved (`--record`) without
-//! connecting to anything. Settings live in `autoengine-client.ron` (see
+//! connecting to anything. Settings live in `autoengine-client.json` (see
 //! `settings.rs`) and can be changed from the menu.
 //!
 //! Controls: drag units between the bench and your half of the board, drag a
@@ -109,7 +109,7 @@ fn parse_options() -> Result<Options, String> {
     let mut o = Options {
         addr: None,
         name: None,
-        settings: PathBuf::from("autoengine-client.ron"),
+        settings: PathBuf::from("autoengine-client.json"),
         replay: None,
         view: None,
         menu: false,
@@ -196,8 +196,7 @@ struct App {
     camera_zoom: f32,
     settings: Settings,
     theme: Theme,
-    /// When `theme.ron` was last changed, and when assets were last checked.
-    theme_seen: Option<std::time::SystemTime>,
+    /// When assets were last checked for changes.
     assets_checked_at: f64,
     icons: RefCell<Icons>,
     particles: fx::Particles,
@@ -255,29 +254,20 @@ impl App {
         look.model.draw(at, yaw + look.yaw, scale, tint, flash, pose);
     }
 
-    /// Loads `theme.ron` and puts it into effect. A broken file keeps the
-    /// current look and says what is wrong.
-    fn load_theme(&mut self) {
-        self.theme_seen = theme::modified(&self.options.assets.join("theme.ron"));
-        match Theme::load(&self.options.assets) {
-            Ok(new) => {
-                if new.font != self.theme.font || self.assets_checked_at == 0.0 {
-                    let font = new.font.as_ref().and_then(|file| {
-                        let path = self.options.assets.join(file);
-                        let loaded = std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| load_ttf_font_from_bytes(&b).map_err(|e| e.to_string()));
-                        loaded.map_err(|e| self.connect_error = Some(format!("font {}: {e}", path.display()))).ok()
-                    });
-                    theme::set_font(font);
-                }
-                theme::set_palette(new.palette);
-                model::set_light(new.light.direction, new.light.ambient, new.light.diffuse);
-                self.theme = new;
-            }
-            Err(e) => self.connect_error = Some(e),
-        }
+    /// Puts the theme (see `theme.rs`) into effect, loading its font file if
+    /// it names one.
+    fn apply_theme(&mut self) {
+        let font = self.theme.font.as_ref().and_then(|file| {
+            let path = self.options.assets.join(file);
+            let loaded = std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| load_ttf_font_from_bytes(&b).map_err(|e| e.to_string()));
+            loaded.map_err(|e| self.connect_error = Some(format!("font {}: {e}", path.display()))).ok()
+        });
+        theme::set_font(font);
+        theme::set_palette(self.theme.palette);
+        model::set_light(self.theme.light.direction, self.theme.light.ambient, self.theme.light.diffuse);
     }
 
-    /// Picks up edits to the theme, models and icons, twice a second.
+    /// Picks up edits to models and icons, twice a second.
     fn refresh_assets(&mut self) {
         if get_time() - self.assets_checked_at < 0.5 {
             return;
@@ -286,9 +276,6 @@ impl App {
             && theme::modified(&viewer.path) != viewer.seen
         {
             viewer.load();
-        }
-        if theme::modified(&self.options.assets.join("theme.ron")) != self.theme_seen {
-            self.load_theme();
         }
         self.assets_checked_at = get_time();
         self.models.borrow_mut().drop_changed();
@@ -476,7 +463,6 @@ async fn main() {
     };
     let mut app = App {
         theme: Theme::default(),
-        theme_seen: None,
         assets_checked_at: 0.0,
         icons: RefCell::new(Icons { assets: options.assets.clone(), cache: HashMap::new() }),
         settings,
@@ -513,7 +499,7 @@ async fn main() {
         app.connect();
     }
     app.connect_error = app.connect_error.take().or(problem);
-    app.load_theme();
+    app.apply_theme();
     // Room for a whole model part in one draw call.
     macroquad::window::gl_set_drawcall_buffer_capacity(model::MAX_PART_VERTICES + 16, model::MAX_PART_INDICES + 16);
 

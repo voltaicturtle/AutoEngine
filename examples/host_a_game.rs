@@ -12,7 +12,7 @@ use autoengine::prelude::*;
 use autoengine::protocol::{ClientMsg, GameView, PROTOCOL_VERSION, ServerMsg, ViewPhase, ViewUpdate};
 
 fn main() {
-    let content = ContentSet::load_dir("content").expect("run this from the repository root");
+    let content = autoengine::sample::content();
     let config = SessionConfig { seats: 4, seed: 11, wait_for_playback: false, ..SessionConfig::default() };
     let mut session = Session::new(content, config);
 

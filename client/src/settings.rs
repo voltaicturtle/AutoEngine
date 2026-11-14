@@ -1,4 +1,4 @@
-//! Player settings, kept in a small RON file next to where the client runs.
+//! Player settings, kept in a small JSON file next to where the client runs.
 //!
 //! Every field has a default, so an old or partial file still loads, and a
 //! missing file is not an error. The file is rewritten whenever a setting
@@ -137,8 +137,7 @@ impl Default for Settings {
 
 impl Settings {
     pub fn parse(text: &str) -> Result<Settings, String> {
-        let options = ron::Options::default().with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME);
-        let mut settings: Settings = options.from_str(text).map_err(|e| e.to_string())?;
+        let mut settings: Settings = serde_json::from_str(text).map_err(|e| e.to_string())?;
         settings.volume = settings.volume.min(100);
         settings.window_width = settings.window_width.clamp(640, 7680);
         settings.window_height = settings.window_height.clamp(480, 4320);
@@ -182,7 +181,7 @@ impl Settings {
     }
 
     pub fn to_text(&self) -> String {
-        ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default()).expect("settings are plain data")
+        serde_json::to_string_pretty(self).expect("settings are plain data")
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
@@ -202,7 +201,7 @@ mod tests {
 
     #[test]
     fn missing_fields_take_defaults_and_values_are_clamped() {
-        let settings = Settings::parse("(volume: 250, shadows: false, window_width: 10)").unwrap();
+        let settings = Settings::parse(r#"{"volume": 250, "shadows": false, "window_width": 10}"#).unwrap();
         assert_eq!(settings.volume, 100);
         assert!(!settings.shadows);
         assert_eq!(settings.window_width, 640);
@@ -211,7 +210,7 @@ mod tests {
 
     #[test]
     fn keys_can_be_rebound_by_name() {
-        let settings = Settings::parse(r#"(keys: {"skip": "enter", "console": "backquote"})"#).unwrap();
+        let settings = Settings::parse(r#"{"keys": {"skip": "enter", "console": "backquote"}}"#).unwrap();
         assert_eq!(settings.key(Action::Skip), KeyCode::Enter);
         assert_eq!(settings.key(Action::Console), KeyCode::GraveAccent);
         // Actions the file leaves out keep their defaults.
@@ -221,17 +220,17 @@ mod tests {
         assert_eq!(key_code("q"), Some(KeyCode::Q));
         assert_eq!(key_code("7"), Some(KeyCode::Key7));
         assert_eq!(key_code("f13"), None);
-        assert!(Settings::parse(r#"(keys: {"skip": "Banana"})"#).unwrap_err().contains("Banana"));
-        assert!(Settings::parse(r#"(keys: {"jump": "Space"})"#).unwrap_err().contains("jump"));
+        assert!(Settings::parse(r#"{"keys": {"skip": "Banana"}}"#).unwrap_err().contains("Banana"));
+        assert!(Settings::parse(r#"{"keys": {"jump": "Space"}}"#).unwrap_err().contains("jump"));
     }
 
     #[test]
     fn a_missing_file_is_fine_and_a_broken_one_is_reported() {
         let dir = std::env::temp_dir();
-        let (settings, problem) = Settings::load(&dir.join("autoengine-no-such-settings.ron"));
+        let (settings, problem) = Settings::load(&dir.join("autoengine-no-such-settings.json"));
         assert_eq!((settings, problem), (Settings::default(), None));
-        let broken = dir.join(format!("autoengine-broken-settings-{}.ron", std::process::id()));
-        std::fs::write(&broken, "(volume: loud)").unwrap();
+        let broken = dir.join(format!("autoengine-broken-settings-{}.json", std::process::id()));
+        std::fs::write(&broken, r#"{"volume": "loud"}"#).unwrap();
         let (settings, problem) = Settings::load(&broken);
         assert_eq!(settings, Settings::default());
         assert!(problem.is_some());

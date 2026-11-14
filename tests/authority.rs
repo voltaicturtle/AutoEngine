@@ -5,13 +5,12 @@
 
 use std::sync::Arc;
 
-use autoengine::content::ContentSet;
 use autoengine::game::{Command, Player, PlayerId, Slot};
 use autoengine::protocol::{ClientMsg, PROTOCOL_VERSION, ServerMsg};
 use autoengine::session::{ConnId, Session, SessionConfig};
 
 fn session(seats: usize) -> Session {
-    let content = Arc::new(ContentSet::load_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/content")).unwrap());
+    let content = Arc::new(autoengine::sample::content());
     Session::new(content, SessionConfig { seats, seed: 7, planning_ms: 30_000, wait_for_playback: false, after_combat_ms: 0 })
 }
 

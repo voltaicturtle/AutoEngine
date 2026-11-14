@@ -7,12 +7,12 @@
 //!
 //! # Quick start
 //!
-//! Load a content folder, set up two teams and let them fight:
+//! Take a game's content, set up two teams and let them fight:
 //!
 //! ```
 //! use autoengine::prelude::*;
 //!
-//! let content = ContentSet::load_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/content")).unwrap();
+//! let content = autoengine::sample::content();
 //! let unit = |id: &str, pos| BoardUnit { unit: id.into(), star: 1, items: vec![], pos };
 //! let home = TeamSetup { units: vec![unit("ironbark_warden", (3, 4))], bonuses: vec![] };
 //! let away = TeamSetup { units: vec![unit("ashen_hound", (3, 4))], bonuses: vec![] };
@@ -35,18 +35,19 @@
 //! | Layer | Modules | What it gives you |
 //! | --- | --- | --- |
 //! | Foundations | [`rng`], [`hex`], [`stats`] | seeded dice, board geometry and pathfinding, integer stats |
-//! | Fights | [`effect`], [`combat`] | abilities as data and the tick-based fight simulation |
-//! | Content | [`content`] | units, traits, items, augments and rounds loaded from data files |
+//! | Fights | [`effect`], [`combat`] | abilities built from effect blocks, and the tick-based fight simulation |
+//! | Content | [`content`], [`sample`] | units, traits, items, augments and rounds, defined in Rust; a complete sample game |
 //! | Game | [`game`], [`round`], [`bot`], `script` | the lobby: shop, economy, round loop, pluggable round types, scripts, computer players |
 //! | Hosting | [`protocol`], [`session`], [`net`], [`replay`] | messages, a hosted game with seats and timers, TCP, saved fights |
 //! | Display | [`client`], [`playback`] | what a front end needs to show a game, with no rendering in it |
-//! | Tools | [`tools`] | content checker, content tests, balance simulator, starter game, benchmarks |
+//! | Tools | [`tools`] | the command line, content checker, content tests, balance simulator, starter game, benchmarks |
 //!
 //! # Extending
 //!
 //! | To add | Use |
 //! | --- | --- |
-//! | units, traits, items, augments, rounds | data files (see [`content`]) |
+//! | units, traits, items, augments, rounds | [`content::ContentSet::builder`] (see [`sample`]) |
+//! | an effect or condition the data model cannot express | [`content::GameBuilder::custom_effect`] and [`content::GameBuilder::custom_condition`] |
 //! | a round type or rule without rebuilding | a script (see `script`, or run `autoengine api`) |
 //! | a round type in Rust | [`round::RoundType`] and [`game::Game::register_round_type`] |
 //! | a rule that reacts to events in Rust | [`game::GameHook`] and [`game::Game::add_hook`] |
@@ -73,6 +74,7 @@ pub mod protocol;
 pub mod replay;
 pub mod rng;
 pub mod round;
+pub mod sample;
 #[cfg(feature = "scripting")]
 pub mod script;
 pub mod session;

@@ -5,8 +5,8 @@
 use autoengine::prelude::*;
 
 fn main() {
-    // A content folder holds the whole game as data files.
-    let content = ContentSet::load_dir("content").expect("run this from the repository root");
+    // The sample game, defined in Rust (see src/sample.rs).
+    let content = autoengine::sample::content();
 
     // A team is a list of units and where they stand, from that team's own
     // side of the board: row 4 is the front line, row 7 the back.

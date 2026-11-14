@@ -1,7 +1,0 @@
-// A fight for `autoengine fight`, which prints everything that happens.
-(
-    teams: [
-        (units: [(unit: "shield_bearer", pos: (3, 4)), (unit: "longbow", pos: (2, 7))]),
-        (units: [(unit: "shield_bearer", pos: (3, 4)), (unit: "field_medic", pos: (4, 6))]),
-    ],
-)

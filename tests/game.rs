@@ -13,7 +13,7 @@ const P1: PlayerId = PlayerId(1);
 const P2: PlayerId = PlayerId(2);
 
 fn sample() -> ContentSet {
-    ContentSet::load_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/content")).expect("sample content loads")
+    autoengine::sample::content()
 }
 
 /// The sample content with a schedule that repeats the given kinds.

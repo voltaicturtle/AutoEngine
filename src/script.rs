@@ -1,12 +1,13 @@
-//! Game rules written in script files.
+//! Game rules written as Rhai scripts.
 //!
-//! Scripts are [Rhai](https://rhai.rs) files in the content folder's
-//! `scripts/` directory. They let a game add rules without recompiling the
-//! engine, in two ways:
+//! Scripts are [Rhai](https://rhai.rs) sources a game adds with
+//! [`GameBuilder::script`](crate::content::GameBuilder::script), usually
+//! kept in their own `.rhai` files and embedded with `include_str!`. They
+//! add rules in two ways:
 //!
 //! - A script with a `finish(game)` function is a **round type**, named
-//!   after the file. `Custom(kind: "payday")` in `rounds.ron` runs
-//!   `scripts/payday.rhai`: `begin(game)` when the round starts (optional)
+//!   after the script. `RoundKindDef::custom("payday")` in the schedule runs
+//!   the `payday` script: `begin(game)` when the round starts (optional)
 //!   and `finish(game)` when it ends.
 //! - A script with an `on_event(game, event)` function is called for every
 //!   [`GameEvent`], so it can react to anything that happens in the lobby.
@@ -36,7 +37,7 @@ pub struct ScriptError {
 
 impl std::fmt::Display for ScriptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "scripts/{}.rhai: {}", self.script, self.message)
+        write!(f, "script `{}`: {}", self.script, self.message)
     }
 }
 
@@ -126,8 +127,8 @@ pub const API: &[(&str, &str)] = &[
     ("streak(p)", "a player's streak: wins are positive, losses negative"),
     ("stage()", "the current stage number"),
     ("round()", "the current round, counting from 0"),
-    ("round_name()", "the current round's name from rounds.ron"),
-    ("param(\"name\")", "a number from the round's `params` in rounds.ron, or 0"),
+    ("round_name()", "the current round's name from the schedule"),
+    ("param(\"name\")", "a number from the round's params in the schedule (`.param(name, value)`), or 0"),
     ("random(n)", "a number from 0 to n-1, from the game's seed"),
     ("get(\"key\")", "a number saved with `set`, or 0"),
     ("set(\"key\", n)", "saves a number for the rest of the game, shared by all scripts"),
@@ -173,10 +174,10 @@ pub fn api_reference() -> String {
     use std::fmt::Write;
     let mut out = String::new();
     out.push_str(
-        "Scripts are .rhai files in a content folder's scripts/ directory.\n\n\
+        "Scripts are .rhai sources added with ContentSet::builder().script(name, source).\n\n\
          A script can define any of these functions:\n  \
          begin(game)            runs when a round of this script's kind starts\n  \
-         finish(game)           runs when it ends; makes the script a round kind named after its file\n  \
+         finish(game)           runs when it ends; makes the script a round kind named after it\n  \
          on_event(game, event)  runs for everything that happens in the game\n\n\
          Functions on `game` (p is a player id):\n",
     );
@@ -288,7 +289,7 @@ fn event_map(event: &GameEvent) -> Map {
 }
 
 impl ScriptHost {
-    /// Compiles scripts given as name (file name without `.rhai`) and source.
+    /// Compiles scripts given as name and source.
     pub fn compile(sources: &BTreeMap<String, String>) -> Result<ScriptHost, ScriptError> {
         let engine = new_engine();
         let mut scripts = Vec::new();
@@ -390,7 +391,7 @@ impl ScriptHost {
             }
         }
         for message in problems {
-            eprintln!("scripts/{}.rhai: {message}", script.name);
+            eprintln!("script `{}`: {message}", script.name);
             game.emit(GameEvent::Script { script: script.name.clone(), message });
         }
     }

@@ -10,7 +10,7 @@ use autoengine::protocol::{ClientMsg, GameView, PROTOCOL_VERSION, ServerMsg, Vie
 use autoengine::session::{ConnId, Session, SessionConfig};
 
 fn content() -> Arc<ContentSet> {
-    Arc::new(ContentSet::load_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/content")).unwrap())
+    Arc::new(autoengine::sample::content())
 }
 
 fn session(seats: usize) -> Session {
