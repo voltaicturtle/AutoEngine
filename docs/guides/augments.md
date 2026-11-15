@@ -49,6 +49,7 @@ as `Bonus::team()`.
 | Field | Given every round |
 | --- | --- |
 | `gold` | gold |
+| `currencies` | other currencies, by id. Add one with `.currency("souls", 3)`; see [Currencies](rules.md#currencies) |
 | `xp` | experience |
 | `free_rerolls` | rerolls that cost no gold. They are used before gold, and unused ones carry over |
 | `components` | random component items |

@@ -36,6 +36,8 @@ check the rules.
 | `bench_size` | 9 | bench slots |
 | `starting_health` | 100 | each player's health at the start |
 | `economy` | see below | gold and experience |
+| `currencies` | empty | what players hold besides gold, added with `.currency(CurrencyDef)`; see [Currencies](#currencies) |
+| `sell_refund_permille` | 1000 | the share of a unit's price that selling it gives back, in thousandths. 1000 is all of it, 500 is half |
 | `levels` | see below | one entry per player level |
 | `pool_sizes` | 1: 29, 2: 22, 3: 18, 4: 12, 5: 10 | copies of each unit in the shared pool, by cost |
 | `default_pool_size` | 10 | pool size for costs not in `pool_sizes` |
@@ -79,6 +81,56 @@ assert_eq!(rules.star_levels.len(), 4);
 | `reroll_cost` | 2 | gold per shop reroll |
 | `xp_cost`, `xp_per_purchase` | 4, 4 | price and amount of experience bought with `BuyXp` |
 | `xp_per_round` | 2 | experience every round after the first |
+
+## Currencies
+
+Gold is built in: it buys units, rerolls and experience. A game can give
+players other things to hold as well, such as souls, tokens or favor. The
+engine keeps each player's balance, pays it out and shows it to clients.
+What it buys is up to the game: a round type, a hook or a script charges
+for it.
+
+```rust
+use std::sync::Arc;
+use autoengine::content::{AugmentDef, ContentSet, CurrencyDef, RoundGrant};
+use autoengine::game::{CommandError, Game, PlayerId};
+
+let content = ContentSet::builder()
+    // One soul to start with and two more every round.
+    .currency(CurrencyDef::new("souls", "Souls").starting(1).per_round(2).color([150, 90, 200]))
+    // An augment can pay a currency too.
+    .augment(AugmentDef::new("reaper", "Reaper").per_round(RoundGrant::default().currency("souls", 3)))
+    .build()
+    .unwrap();
+
+let mut game = Game::new(Arc::new(content), 1, &["a", "b"]);
+let me = PlayerId(0);
+assert_eq!(game.currency(me, "souls"), 1);
+game.add_currency(me, "souls", 4);
+// Spending takes nothing unless the player has enough.
+assert_eq!(game.spend_currency(me, "souls", 9), Err(CommandError::NotEnough { currency: "souls".into(), need: 9, have: 5 }));
+game.spend_currency(me, "souls", 5).unwrap();
+assert_eq!(game.currency(me, "souls"), 0);
+```
+
+| `CurrencyDef` call | Meaning |
+| --- | --- |
+| `CurrencyDef::new(id, name)` | a currency nobody is given yet. The id `gold` is taken |
+| `.starting(n)` | what every player starts with |
+| `.per_round(n)` | what every player gets each round after the first, with their gold |
+| `.color([r, g, b])` | the color front ends show it in |
+
+| On `Game` | Does |
+| --- | --- |
+| `currency(player, id)` | how much the player has |
+| `add_currency(player, id, n)` | gives some, or takes it away when negative, never below zero |
+| `spend_currency(player, id, cost)` | takes `cost` if the player has it, and fails with `NotEnough` otherwise |
+
+Every change sends a `CurrencyChanged` event, so hooks and scripts can
+react. Scripts use `game.amount`, `game.give` and `game.take` (see
+[Scripting](scripting.md)), `Grant::Currency` hands some out from outside
+the rules, and the cheat console has `give CURRENCY N`. A player's balances
+are in `Player::wallet`, and the client lists them under the gold.
 
 ## Levels
 
@@ -162,6 +214,7 @@ assert_eq!(content.name_in(Some("fr"), "ashen_hound").as_deref(), Some("Chien de
 | `unit.ID.ability_description` | its ability's description |
 | `unit.ID.ability_2`, `unit.ID.ability_2_description` | the same for a second ability, and so on |
 | `resource.ID.name` | a [resource](resources.md)'s name |
+| `currency.ID.name` | a [currency](#currencies)'s name |
 | `item.ID.name`, `item.ID.description` | an item's name and description |
 | `trait.ID.name`, `trait.ID.description` | a trait's name and description |
 | `augment.ID.name`, `augment.ID.description` | an augment's name and description |

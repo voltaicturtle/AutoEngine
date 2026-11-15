@@ -33,6 +33,8 @@ pub fn clean_chat(text: &str) -> Option<String> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DevCommand {
     Gold(i64),
+    /// Some of a currency other than gold, by id.
+    Currency(String, i64),
     Xp(u32),
     /// Add a unit by id, without paying or touching the shop.
     Unit(String),
@@ -47,7 +49,7 @@ pub enum DevCommand {
 impl DevCommand {
     /// Reads a console line such as `gold 50`, `unit ashen_hound` or `skip`.
     pub fn parse(line: &str) -> Result<DevCommand, String> {
-        const HELP: &str = "commands: gold N, xp N, unit ID, item ID, augment ID, hurt N, skip";
+        const HELP: &str = "commands: gold N, give CURRENCY N, xp N, unit ID, item ID, augment ID, hurt N, skip";
         let mut words = line.split_whitespace();
         let command = words.next().ok_or(HELP)?;
         let arg = words.next();
@@ -55,6 +57,10 @@ impl DevCommand {
         let id = || arg.map(str::to_string).ok_or(format!("{command} needs an id"));
         Ok(match command {
             "gold" => DevCommand::Gold(number()?),
+            "give" => {
+                let amount = words.next().and_then(|a| a.parse::<i64>().ok()).ok_or("give needs a currency and a number")?;
+                DevCommand::Currency(id()?, amount)
+            }
             "xp" => DevCommand::Xp(number()?.clamp(0, 10_000) as u32),
             "unit" => DevCommand::Unit(id()?),
             "item" => DevCommand::Item(id()?),

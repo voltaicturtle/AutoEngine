@@ -73,6 +73,7 @@ or `game.drain_events()` (the ones since the last call).
 | `RoundFinished` | `index` | a round has resolved, before eliminations |
 | `ShopRolled` | `player`, `offers` | a player's shop got new offers: at the start of a round, or after a reroll. `offers` holds unit ids, with `None` (`()` in Rhai) for empty slots |
 | `GoldChanged` | `player`, `gold` | a player's gold changed. `gold` is the new total |
+| `CurrencyChanged` | `player`, `currency`, `amount` | a player's balance of a currency other than gold changed. `amount` is the new total |
 | `XpChanged` | `player`, `level`, `xp` | a player gained experience. These are the new level and experience |
 | `UnitGained` | `player`, `uid`, `unit` | a player got a unit: bought, drafted, granted or duplicated. `uid` identifies this copy for the rest of the game |
 | `UnitSold` | `player`, `uid`, `unit` | a unit was sold |
@@ -153,6 +154,8 @@ one place.
 | `Forfeited` | the player has forfeited and is only waiting for the round to end |
 | `GameOver` | the game is over |
 | `NotEnoughGold { need, have }` | can't afford it |
+| `NotEnough { currency, need, have }` | not enough of a currency other than gold (from `spend_currency`) |
+| `UnknownCurrency` | the game has no currency with that id |
 | `EmptyShopSlot` | nothing in that shop slot |
 | `SoldOut` | no copies of that unit are left in the pool |
 | `BenchFull` | no room on the bench |
@@ -180,6 +183,7 @@ directly, because they run again on replay.
 | `Grant` | Gives |
 | --- | --- |
 | `Gold(n)` | gold |
+| `Currency { currency, amount }` | some of a currency other than gold. A negative amount takes it away |
 | `Xp(n)` | experience |
 | `Unit(id)` | a one-star unit, without taking a copy from the pool |
 | `Item(id)` | an item |

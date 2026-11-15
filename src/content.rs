@@ -421,6 +421,57 @@ impl Default for EconomyRules {
     }
 }
 
+/// A currency players hold besides gold: tokens, souls, favor. The engine
+/// keeps the balance, pays it out and shows it; what it buys is up to the
+/// game's round types, scripts and hooks (see
+/// [`Game::spend_currency`](crate::game::Game::spend_currency)).
+///
+/// ```
+/// use autoengine::content::{ContentSet, CurrencyDef};
+///
+/// let game = ContentSet::builder().currency(CurrencyDef::new("souls", "Souls").starting(1).per_round(2)).build().unwrap();
+/// assert_eq!(game.currency("souls").unwrap().per_round, 2);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrencyDef {
+    /// What content calls it: `"souls"`.
+    pub id: String,
+    /// What players call it.
+    pub name: String,
+    /// How much every player starts the game with.
+    #[serde(default)]
+    pub starting: i64,
+    /// How much every player receives at the start of each round after the
+    /// first.
+    #[serde(default)]
+    pub per_round: i64,
+    /// The color clients show it in, as red, green and blue.
+    #[serde(default)]
+    pub color: Option<[u8; 3]>,
+}
+
+impl CurrencyDef {
+    /// A currency nobody is given yet.
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        CurrencyDef { id: id.into(), name: name.into(), starting: 0, per_round: 0, color: None }
+    }
+
+    pub fn starting(mut self, amount: i64) -> Self {
+        self.starting = amount;
+        self
+    }
+
+    pub fn per_round(mut self, amount: i64) -> Self {
+        self.per_round = amount;
+        self
+    }
+
+    pub fn color(mut self, rgb: [u8; 3]) -> Self {
+        self.color = Some(rgb);
+        self
+    }
+}
+
 /// What one player level means.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LevelRule {
@@ -478,6 +529,11 @@ pub struct GameRules {
     /// game starts: a twist that makes each game a little different. Empty
     /// for none.
     pub lobby_modifiers: Vec<String>,
+    /// Currencies players hold besides gold.
+    pub currencies: Vec<CurrencyDef>,
+    /// The share of what a unit is worth that selling it gives back, in
+    /// thousandths. 1000 is a full refund.
+    pub sell_refund_permille: u32,
 }
 
 impl Default for GameRules {
@@ -529,6 +585,8 @@ impl Default for GameRules {
             planning_ms_by_kind: BTreeMap::new(),
             choice_rerolls: 1,
             lobby_modifiers: Vec::new(),
+            currencies: Vec::new(),
+            sell_refund_permille: 1000,
         }
     }
 }
@@ -580,6 +638,16 @@ pub struct RoundGrant {
     pub free_rerolls: u32,
     /// Random component items.
     pub components: u32,
+    /// Other currencies, by id.
+    pub currencies: BTreeMap<String, i64>,
+}
+
+impl RoundGrant {
+    /// Adds some of a currency other than gold to the grant.
+    pub fn currency(mut self, id: impl Into<String>, amount: i64) -> Self {
+        self.currencies.insert(id.into(), amount);
+        self
+    }
 }
 
 /// What a choice round offers.
@@ -993,7 +1061,7 @@ pub struct GameBuilder {
 pub type Translations = BTreeMap<String, BTreeMap<String, String>>;
 
 /// The kinds of definition that have translatable text.
-pub const TEXT_KINDS: [&str; 5] = ["unit", "trait", "item", "augment", "resource"];
+pub const TEXT_KINDS: [&str; 6] = ["unit", "trait", "item", "augment", "resource", "currency"];
 
 /// The text fields of a unit's ability, by position: `"ability"` and
 /// `"ability_description"` for the first, `"ability_2"` and
@@ -1082,6 +1150,17 @@ impl GameBuilder {
         match resources.iter_mut().find(|r| r.id == def.id) {
             Some(existing) => *existing = def,
             None => resources.push(def),
+        }
+        self
+    }
+
+    /// Adds a currency players hold besides gold, or replaces the one with
+    /// the same id.
+    pub fn currency(mut self, def: CurrencyDef) -> Self {
+        let currencies = &mut self.rules.currencies;
+        match currencies.iter_mut().find(|c| c.id == def.id) {
+            Some(existing) => *existing = def,
+            None => currencies.push(def),
         }
         self
     }
@@ -1345,6 +1424,7 @@ impl ContentSet {
             ("augment", "name") => self.augment(id).map(|d| d.name.clone()),
             ("augment", "description") => self.augment(id).map(|d| d.description.clone()),
             ("resource", "name") => self.resource(id).map(|d| d.name.clone()),
+            ("currency", "name") => self.currency(id).map(|d| d.name.clone()),
             _ => None,
         }?;
         let translated = language
@@ -1378,6 +1458,9 @@ impl ContentSet {
         }
         for def in self.resources() {
             keys.push(text_key("resource", &def.id, "name"));
+        }
+        for def in self.currencies() {
+            keys.push(text_key("currency", &def.id, "name"));
         }
         keys
     }
@@ -1511,6 +1594,7 @@ impl ContentSet {
                         "trait" => self.traits.contains_key(*id) && matches!(*field, "name" | "description"),
                         "augment" => self.augments.contains_key(*id) && matches!(*field, "name" | "description"),
                         "resource" => self.resource(id).is_some() && *field == "name",
+                        "currency" => self.currency(id).is_some() && *field == "name",
                         _ => false,
                     },
                     _ => false,
@@ -1534,6 +1618,14 @@ impl ContentSet {
         }
         if r.economy.interest_per <= 0 {
             return invalid("interest_per must be positive".into());
+        }
+        for (i, def) in r.currencies.iter().enumerate() {
+            if def.id.is_empty() || def.id == "gold" {
+                return invalid("a currency needs an id, and `gold` is taken: the engine has it built in".into());
+            }
+            if r.currencies[..i].iter().any(|c| c.id == def.id) {
+                return invalid(format!("duplicate currency id `{}`", def.id));
+            }
         }
         let resources = &r.combat.resources;
         let check_resource = |owner: &str, id: &str| {
@@ -1709,6 +1801,12 @@ impl ContentSet {
         }
         for a in self.augments.values() {
             let owner = format!("augment `{}`", a.id);
+            for id in a.per_round.currencies.keys() {
+                if self.currency(id).is_none() {
+                    let known: Vec<String> = r.currencies.iter().map(|c| c.id.clone()).collect();
+                    return invalid(format!("{owner} pays out unknown currency `{id}`{}", suggestion(id, known.iter())));
+                }
+            }
             for bonus in &a.bonuses {
                 if let Scope::WithTrait(t) = &bonus.scope {
                     check_trait(&owner, t)?;
@@ -1745,6 +1843,13 @@ impl ContentSet {
     }
     pub fn resource(&self, id: &str) -> Option<&ResourceDef> {
         self.resources().iter().find(|r| r.id == id)
+    }
+    /// The currencies players hold besides gold.
+    pub fn currencies(&self) -> &[CurrencyDef] {
+        &self.rules.currencies
+    }
+    pub fn currency(&self, id: &str) -> Option<&CurrencyDef> {
+        self.currencies().iter().find(|c| c.id == id)
     }
     /// The rules for every kind of damage in the game.
     pub fn damage_types(&self) -> &[DamageType] {

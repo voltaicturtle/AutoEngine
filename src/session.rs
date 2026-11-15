@@ -288,6 +288,7 @@ impl Session {
         let game = self.game.as_mut().expect("a started session has a game");
         let grant = match command {
             DevCommand::Gold(n) => Grant::Gold(n),
+            DevCommand::Currency(currency, amount) => Grant::Currency { currency, amount },
             DevCommand::Xp(n) => Grant::Xp(n),
             DevCommand::Unit(unit) => Grant::Unit(unit),
             DevCommand::Item(item) => Grant::Item(item),

@@ -788,6 +788,18 @@ fn draw_top_bar(app: &App) {
         let x = w - 520.0;
         label(&format!("Health {}", me.health.max(0)), x, 29.0, 22.0, if me.health > 30 { ui().good } else { ui().bad });
         label(&format!("Gold {}", me.gold), x + 140.0, 29.0, 22.0, ui().gold);
+        // The game's other currencies, in a smaller line under the gold.
+        if let Some(content) = &app.net.state.content {
+            let language = app.net.state.language.as_deref();
+            let mut at = x + 140.0;
+            for currency in content.currencies() {
+                let name = content.text(language, "currency", &currency.id, "name").unwrap_or_default();
+                let text = format!("{name} {}", me.wallet.get(&currency.id).copied().unwrap_or(0));
+                let [r, g, b] = currency.color.unwrap_or([200, 200, 210]);
+                label(&text, at, 44.0, 14.0, Color::from_rgba(r, g, b, 255));
+                at += measure_text(&text, None, 14, 1.0).width + 14.0;
+            }
+        }
         label(&format!("Level {}  ({xp})", me.level), x + 250.0, 29.0, 22.0, ui().text);
     } else {
         label("Spectating", w - 140.0, 29.0, 22.0, ui().muted);

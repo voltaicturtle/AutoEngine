@@ -86,6 +86,10 @@ pub enum CommandError {
     UnknownPlayer,
     Eliminated,
     NotEnoughGold { need: i64, have: i64 },
+    /// Not enough of a currency other than gold.
+    NotEnough { currency: String, need: i64, have: i64 },
+    /// The game has no currency with that id.
+    UnknownCurrency,
     EmptyShopSlot,
     SoldOut,
     BenchFull,
@@ -114,6 +118,8 @@ impl std::fmt::Display for CommandError {
             CommandError::UnknownPlayer => write!(f, "no such player"),
             CommandError::Eliminated => write!(f, "the player has been eliminated"),
             CommandError::NotEnoughGold { need, have } => write!(f, "needs {need} gold, has {have}"),
+            CommandError::NotEnough { currency, need, have } => write!(f, "needs {need} {currency}, has {have}"),
+            CommandError::UnknownCurrency => write!(f, "the game has no such currency"),
             CommandError::EmptyShopSlot => write!(f, "that shop slot is empty"),
             CommandError::SoldOut => write!(f, "no copies of that unit are left"),
             CommandError::BenchFull => write!(f, "the bench is full"),
@@ -170,6 +176,10 @@ pub struct Player {
     /// How the game has gone for this player so far.
     #[serde(default)]
     pub stats: PlayerStats,
+    /// How much the player has of each currency besides gold, by id (see
+    /// `GameRules::currencies`).
+    #[serde(default)]
+    pub wallet: BTreeMap<String, i64>,
 }
 
 /// Running totals for one player, for end-of-game summaries.
@@ -300,6 +310,8 @@ pub enum GameEvent {
     RoundFinished { index: usize },
     ShopRolled { player: PlayerId, offers: Vec<Option<String>> },
     GoldChanged { player: PlayerId, gold: i64 },
+    /// A player now has `amount` of a currency other than gold.
+    CurrencyChanged { player: PlayerId, currency: String, amount: i64 },
     XpChanged { player: PlayerId, level: u32, xp: u32 },
     UnitGained { player: PlayerId, uid: u32, unit: String },
     UnitSold { player: PlayerId, uid: u32, unit: String },
@@ -406,6 +418,8 @@ pub enum Grant {
     Item(String),
     Augment(String),
     Damage(i64),
+    /// Some of a currency other than gold; negative takes it away.
+    Currency { currency: String, amount: i64 },
 }
 
 impl Game {
@@ -445,6 +459,7 @@ impl Game {
                 forfeited: false,
                 free_rerolls: 0,
                 stats: PlayerStats::default(),
+                wallet: rules.currencies.iter().map(|c| (c.id.clone(), c.starting.max(0))).collect(),
             })
             .collect();
         #[cfg(feature = "scripting")]
@@ -676,6 +691,9 @@ impl Game {
                     .max()
                     .unwrap_or(0);
                 self.add_gold(id, economy.round_income + interest + streak_gold);
+                for currency in &content.rules().currencies {
+                    self.add_currency(id, &currency.id, currency.per_round);
+                }
                 self.add_xp(id, economy.xp_per_round);
                 self.augment_grants(id);
             }
@@ -755,6 +773,9 @@ impl Game {
             let grant = &augment.per_round;
             self.add_gold(id, grant.gold);
             self.add_xp(id, grant.xp);
+            for (currency, amount) in &grant.currencies {
+                self.add_currency(id, currency, *amount);
+            }
             self.players[id.0 as usize].free_rerolls += grant.free_rerolls;
             for _ in 0..grant.components {
                 self.give_random_component(id);
@@ -943,7 +964,8 @@ impl Game {
         self.return_to_pool(&unit);
         self.emit(GameEvent::UnitSold { player: id, uid, unit: unit.unit.clone() });
         self.players[id.0 as usize].stats.units_sold += 1;
-        self.add_gold(id, cost * copies as i64);
+        let refund = self.content.rules().sell_refund_permille as i64;
+        self.add_gold(id, cost * copies as i64 * refund / 1000);
         Ok(())
     }
 
@@ -1106,6 +1128,10 @@ impl Game {
             Grant::Item(item) if content.item(item).is_some() => self.give_item(id, item),
             Grant::Augment(a) if content.augment(a).is_some() => self.give_augment(id, a),
             Grant::Damage(n) => self.damage_player(id, (*n).max(0)),
+            Grant::Currency { currency, amount } if content.currency(currency).is_some() => {
+                self.add_currency(id, currency, *amount);
+            }
+            Grant::Currency { .. } => return Err(CommandError::UnknownCurrency),
             Grant::Unit(_) => return Err(CommandError::UnknownUnit),
             Grant::Item(_) | Grant::Augment(_) => return Err(CommandError::UnknownItem),
         }
@@ -1163,6 +1189,39 @@ impl Game {
         p.gold = (p.gold + amount).max(0);
         let gold = p.gold;
         self.emit(GameEvent::GoldChanged { player: id, gold });
+    }
+
+    /// How much a player has of a currency other than gold.
+    pub fn currency(&self, id: PlayerId, currency: &str) -> i64 {
+        self.player(id).wallet.get(currency).copied().unwrap_or(0)
+    }
+
+    /// Gives a player some of a currency other than gold, or takes it away
+    /// when negative (never below zero). Currencies the content does not
+    /// define are ignored.
+    pub fn add_currency(&mut self, id: PlayerId, currency: &str, amount: i64) {
+        if amount == 0 || self.content.currency(currency).is_none() {
+            return;
+        }
+        let balance = self.players[id.0 as usize].wallet.entry(currency.to_string()).or_insert(0);
+        *balance = (*balance + amount).max(0);
+        let amount = *balance;
+        self.emit(GameEvent::CurrencyChanged { player: id, currency: currency.to_string(), amount });
+    }
+
+    /// Takes `cost` of a currency other than gold from a player, or fails
+    /// and takes nothing if they have less. This is how a round type or a
+    /// hook charges for something.
+    pub fn spend_currency(&mut self, id: PlayerId, currency: &str, cost: i64) -> Result<(), CommandError> {
+        let have = self.currency(id, currency);
+        if self.content.currency(currency).is_none() {
+            return Err(CommandError::UnknownCurrency);
+        }
+        if have < cost {
+            return Err(CommandError::NotEnough { currency: currency.to_string(), need: cost, have });
+        }
+        self.add_currency(id, currency, -cost.max(0));
+        Ok(())
     }
 
     pub fn add_xp(&mut self, id: PlayerId, amount: u32) {

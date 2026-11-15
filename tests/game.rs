@@ -794,7 +794,7 @@ fn augments_can_pay_out_every_round() {
         builder = builder.item(i.clone());
     }
     let content = builder
-        .augment(AugmentDef::new("patron", "Patron").per_round(RoundGrant { gold: 3, xp: 1, free_rerolls: 2, components: 1 }))
+        .augment(AugmentDef::new("patron", "Patron").per_round(RoundGrant { gold: 3, xp: 1, free_rerolls: 2, components: 1, ..Default::default() }))
         .build()
         .unwrap();
     let mut g = autoengine::game::Game::new(content, 3, &["a", "b"]);

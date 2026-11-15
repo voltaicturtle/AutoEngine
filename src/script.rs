@@ -60,6 +60,7 @@ pub struct ScriptHost {
 #[derive(Clone, Debug)]
 enum Action {
     Gold(INT, INT),
+    Currency(INT, String, INT),
     Xp(INT, INT),
     Item(INT, String),
     RandomItem(INT),
@@ -80,6 +81,7 @@ struct PlayerSnap {
     units: INT,
     items: INT,
     streak: INT,
+    wallet: BTreeMap<String, INT>,
 }
 
 struct Ctx {
@@ -133,6 +135,9 @@ pub const API: &[(&str, &str)] = &[
     ("get(\"key\")", "a number saved with `set`, or 0"),
     ("set(\"key\", n)", "saves a number for the rest of the game, shared by all scripts"),
     ("give_gold(p, n)", "gives a player gold (negative takes it away)"),
+    ("amount(p, \"id\")", "how much a player has of a currency other than gold"),
+    ("give(p, \"id\", n)", "gives a player some of a currency other than gold (negative takes it away)"),
+    ("take(p, \"id\", n)", "takes n of a currency if the player has that much; says whether it did"),
     ("give_xp(p, n)", "gives a player experience"),
     ("give_item(p, \"id\")", "gives a player an item"),
     ("give_random_item(p)", "gives a player a random component item"),
@@ -150,6 +155,7 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("RoundFinished", "index"),
     ("ShopRolled", "player, offers"),
     ("GoldChanged", "player, gold"),
+    ("CurrencyChanged", "player, currency, amount"),
     ("XpChanged", "player, level, xp"),
     ("UnitGained", "player, uid, unit"),
     ("UnitSold", "player, uid, unit"),
@@ -226,6 +232,30 @@ fn register_api(engine: &mut Engine) {
     engine.register_fn("give_gold", |g: &mut ScriptGame, p: INT, n: INT| {
         g.player(p, |s| s.gold = (s.gold + n).max(0));
         g.push(Action::Gold(p, n));
+    });
+    // Other currencies follow the same rule. Ones the game does not define
+    // read as 0 and cannot be given.
+    engine.register_fn("amount", |g: &mut ScriptGame, p: INT, id: &str| g.player(p, |s| s.wallet.get(id).copied().unwrap_or(0)));
+    engine.register_fn("give", |g: &mut ScriptGame, p: INT, id: &str, n: INT| {
+        g.player(p, |s| {
+            if let Some(balance) = s.wallet.get_mut(id) {
+                *balance = (*balance + n).max(0);
+            }
+        });
+        g.push(Action::Currency(p, id.to_string(), n));
+    });
+    engine.register_fn("take", |g: &mut ScriptGame, p: INT, id: &str, n: INT| -> bool {
+        let paid = g.player(p, |s| match s.wallet.get_mut(id) {
+            Some(balance) if n >= 0 && *balance >= n => {
+                *balance -= n;
+                true
+            }
+            _ => false,
+        });
+        if paid {
+            g.push(Action::Currency(p, id.to_string(), -n));
+        }
+        paid
     });
     engine.register_fn("damage", |g: &mut ScriptGame, p: INT, n: INT| {
         g.player(p, |s| s.health -= n.max(0));
@@ -367,6 +397,7 @@ impl ScriptHost {
                     units: p.units().count() as INT,
                     items: p.items.len() as INT,
                     streak: p.streak as INT,
+                    wallet: game.content().currencies().iter().map(|c| (c.id.clone(), game.currency(p.id, &c.id))).collect(),
                 })
                 .collect(),
             stage: game.stage() as INT,
@@ -407,6 +438,12 @@ fn apply(game: &mut Game, action: Action, script: &str) -> Result<(), String> {
     };
     match action {
         Action::Gold(p, n) => game.add_gold(player(p)?, n),
+        Action::Currency(p, currency, n) => {
+            if game.content().currency(&currency).is_none() {
+                return Err(format!("there is no currency \"{currency}\""));
+            }
+            game.add_currency(player(p)?, &currency, n);
+        }
         Action::Xp(p, n) => game.add_xp(player(p)?, n.clamp(0, u32::MAX as INT) as u32),
         Action::Item(p, item) => {
             if game.content().item(&item).is_none() {
