@@ -42,6 +42,17 @@ pub trait RoundType: Send {
         Err(CommandError::NothingToPick)
     }
 
+    /// Handles a player's [`Command::RerollPick`](crate::game::Command::RerollPick):
+    /// fresh options in place of the ones on offer.
+    fn reroll(&mut self, _game: &mut Game, _player: PlayerId) -> Result<(), CommandError> {
+        Err(CommandError::NothingToPick)
+    }
+
+    /// How many more times a player may reroll their options this round.
+    fn rerolls_left(&self, _game: &Game, _player: PlayerId) -> u32 {
+        0
+    }
+
     /// Called once when the round ends. Must settle everything, including
     /// picking for players who did not.
     fn finish(&mut self, game: &mut Game);
@@ -62,13 +73,66 @@ pub(crate) fn builtin(def: &RoundKindDef) -> Box<dyn RoundType> {
             turn: 0,
         }),
         RoundKindDef::Choice { options, offer } => {
-            Box::new(ChoiceRound { count: *options, offer: *offer, offers: BTreeMap::new() })
+            Box::new(ChoiceRound { count: *options, offer: *offer, offers: BTreeMap::new(), rerolled: BTreeMap::new() })
         }
         RoundKindDef::Custom { .. } => unreachable!("custom rounds are built by their factory"),
     }
 }
 
-/// Players are paired at random and fight. The loser takes damage.
+/// Pairs players for a round of fights: of all the ways to pair them, the
+/// one that repeats recent fights least (see [`Game::rematch_cost`]), the
+/// first such in the given (shuffled) order. With an odd number, one is
+/// left over. Lobbies of more than twelve are paired greedily instead.
+pub fn pair_up(game: &Game, players: &[PlayerId]) -> (Vec<(PlayerId, PlayerId)>, Option<PlayerId>) {
+    type Pairs = Vec<(PlayerId, PlayerId)>;
+    let cost = |a: PlayerId, b: PlayerId| game.rematch_cost(a, b) + game.rematch_cost(b, a);
+
+    /// Every pairing of `left` (one may sit out if the count is odd).
+    fn search(
+        cost: &dyn Fn(PlayerId, PlayerId) -> u32,
+        left: &[PlayerId],
+        spent: u32,
+        chosen: &mut Pairs,
+        sitting: Option<PlayerId>,
+        best: &mut Option<(u32, Pairs, Option<PlayerId>)>,
+    ) {
+        if best.as_ref().is_some_and(|(b, _, _)| spent >= *b) {
+            return;
+        }
+        let Some((&a, rest)) = left.split_first() else {
+            *best = Some((spent, chosen.clone(), sitting));
+            return;
+        };
+        for i in 0..rest.len() {
+            let b = rest[i];
+            let others: Vec<PlayerId> = rest.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, p)| *p).collect();
+            chosen.push((a, b));
+            search(cost, &others, spent + cost(a, b), chosen, sitting, best);
+            chosen.pop();
+        }
+        if left.len() % 2 == 1 && sitting.is_none() {
+            search(cost, rest, spent, chosen, Some(a), best);
+        }
+    }
+
+    if players.len() <= 12 {
+        let mut best = None;
+        search(&cost, players, 0, &mut Vec::new(), None, &mut best);
+        let (_, pairs, odd) = best.expect("there is always a pairing");
+        return (pairs, odd);
+    }
+    let mut left = players.to_vec();
+    let mut pairs = Vec::new();
+    while left.len() >= 2 {
+        let a = left.remove(0);
+        let i = (0..left.len()).min_by_key(|i| (cost(a, left[*i]), *i)).unwrap();
+        pairs.push((a, left.remove(i)));
+    }
+    (pairs, left.pop())
+}
+
+/// Players are paired (avoiding recent rematches) and fight. The loser
+/// takes damage.
 pub struct PvpRound;
 
 impl RoundType for PvpRound {
@@ -79,9 +143,8 @@ impl RoundType for PvpRound {
     fn finish(&mut self, game: &mut Game) {
         let mut players = game.alive();
         game.rng().shuffle(&mut players);
-        let mut pairs = players.chunks_exact(2);
-        for pair in &mut pairs {
-            let (a, b) = (pair[0], pair[1]);
+        let (pairs, odd) = pair_up(game, &players);
+        for (a, b) in pairs {
             let result = game.fight(a, Opponent::Player(b), &[]);
             let damage = game.loss_damage(result.survivors);
             match result.home_won {
@@ -101,7 +164,7 @@ impl RoundType for PvpRound {
         }
         // With an odd number of players, the one left over fights a copy of
         // someone else's board.
-        if let [odd] = pairs.remainder() {
+        if let Some(odd) = &odd {
             let others: Vec<PlayerId> = players.iter().copied().filter(|p| p != odd).collect();
             if others.is_empty() {
                 return;
@@ -247,9 +310,22 @@ pub struct ChoiceRound {
     offer: ChoiceOffer,
     /// Options still waiting on each player.
     offers: BTreeMap<PlayerId, Vec<String>>,
+    /// Rerolls each player has used this round.
+    rerolled: BTreeMap<PlayerId, u32>,
 }
 
 impl ChoiceRound {
+    /// Everything that could be offered to a player, before shuffling.
+    fn candidates(&self, game: &Game, player: PlayerId) -> Vec<String> {
+        match self.offer {
+            ChoiceOffer::Augments => {
+                let owned = &game.player(player).augments;
+                game.content().augments().map(|a| a.id.clone()).filter(|a| !owned.contains(a)).collect()
+            }
+            ChoiceOffer::Items => game.content().items().map(|i| i.id.clone()).collect(),
+        }
+    }
+
     fn grant(&mut self, game: &mut Game, player: PlayerId, option: usize) {
         let options = self.offers.remove(&player).expect("player has an offer");
         let choice = options[option].clone();
@@ -268,13 +344,7 @@ impl RoundType for ChoiceRound {
 
     fn begin(&mut self, game: &mut Game) {
         for player in game.alive() {
-            let mut candidates: Vec<String> = match self.offer {
-                ChoiceOffer::Augments => {
-                    let owned = &game.player(player).augments;
-                    game.content().augments().map(|a| a.id.clone()).filter(|a| !owned.contains(a)).collect()
-                }
-                ChoiceOffer::Items => game.content().items().map(|i| i.id.clone()).collect(),
-            };
+            let mut candidates = self.candidates(game, player);
             game.rng().shuffle(&mut candidates);
             candidates.truncate(self.count as usize);
             if candidates.is_empty() {
@@ -300,6 +370,32 @@ impl RoundType for ChoiceRound {
         }
         self.grant(game, player, option);
         Ok(())
+    }
+
+    fn reroll(&mut self, game: &mut Game, player: PlayerId) -> Result<(), CommandError> {
+        let current = self.offers.get(&player).ok_or(CommandError::NothingToPick)?.clone();
+        if self.rerolls_left(game, player) == 0 {
+            return Err(CommandError::NoRerollsLeft);
+        }
+        // New options where there are enough; the old ones fill any gap.
+        let mut fresh: Vec<String> = self.candidates(game, player).into_iter().filter(|c| !current.contains(c)).collect();
+        if fresh.is_empty() {
+            return Err(CommandError::NoRerollsLeft);
+        }
+        game.rng().shuffle(&mut fresh);
+        fresh.truncate(self.count as usize);
+        *self.rerolled.entry(player).or_insert(0) += 1;
+        game.emit(GameEvent::ChoiceOffered { player: Some(player), options: fresh.clone() });
+        self.offers.insert(player, fresh);
+        Ok(())
+    }
+
+    fn rerolls_left(&self, game: &Game, player: PlayerId) -> u32 {
+        if !self.offers.contains_key(&player) {
+            return 0;
+        }
+        let used = self.rerolled.get(&player).copied().unwrap_or(0);
+        game.content().rules().choice_rerolls.saturating_sub(used)
     }
 
     fn finish(&mut self, game: &mut Game) {

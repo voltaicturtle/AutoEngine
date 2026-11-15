@@ -14,16 +14,33 @@ point clients at it with `--addr HOST:7777`.
 
 In the client: click shop cards to buy, drag units between the bench and your
 half of the board, drag a unit onto the shop to sell it, drag items onto
-units, click a name on the scoreboard to look at that player's board, and
-press Space to skip a fight replay. Drag with the right mouse button to turn
+units (hovering a unit or an item shows what it does), click a name on the
+scoreboard to look at that player's board, and
+press Space to skip a fight replay. Keys for the shop: D rerolls, F buys
+experience, E sells the unit under the mouse, L locks the shop (so its
+offers stay for the next round; there is also a button) and R readies up.
+Shop cards show how many copies of the unit are left in the shared pool.
+Tab looks at the next player's board and Shift+Tab the previous one, coming
+back round to your own. Hovering a component lists what it combines into.
+Every key can be rebound in the settings file under `keys`. Drag with the right mouse button to turn
 the camera, scroll to zoom, and press Home to reset it. If the connection drops, the client keeps
 retrying and takes its seat back; a bot plays it in the meantime.
 
-Escape opens a menu with the settings, and F3 shows frame-rate and scene
-statistics.
+Escape opens a menu with the settings and a Forfeit button, which needs a
+second click. "Colour-blind colours" switches the team rings and the
+good/bad colours to blue against orange and bluish green against vermilion,
+which people with red-green colour blindness can tell apart. F3 shows frame-rate and scene statistics. Enter opens the chat
+line and Enter again sends it; chat shows in the log. When the game ends, a
+table shows everyone's place, level, fights won and lost, kills, gold earned,
+rerolls and best star level. After each fight, a damage meter in the corner
+shows how much damage each of your units dealt, with the healing and
+shielding they did. Fights that go long show "OVERTIME", and dodged attacks
+show "miss". On a server hosting many games, the lobby lists
+them, with buttons to enter one or open a new one.
 
 Server options: `--port`, `--bind`, `--seats`, `--seed`, `--planning-secs`,
-`--record DIR`, `--dev` (see `cargo run -- help`). The server hosts the content its binary was built
+`--record DIR [--resume]`, `--rooms N`, `--bots easy|normal|hard`, `--dev`
+(see `cargo run -- help`). The server hosts the content its binary was built
 with; a game crate hosts its own with `cargo run -- serve`. `--autoplay` makes a client play by itself, which is handy
 for demos.
 
@@ -62,8 +79,8 @@ A model file with animations keeps its skeleton, and the client plays its
 clips by name: `idle` while standing, `walk` while moving, `attack` on each
 attack and `cast` while casting. Names are matched without regard to case and
 may be part of a longer name such as `Armature|Walk`. Missing clips are
-simply not played. Skinning uses up to four bones per vertex and runs on the
-CPU. Two of the sample units (`emberlash_duelist.gltf`, `reed_stalker.gltf`)
+simply not played. A change of clip cross-fades over 0.15 seconds instead of
+snapping. Skinning uses up to four bones per vertex and runs on the CPU. Two of the sample units (`emberlash_duelist.gltf`, `reed_stalker.gltf`)
 are rigged this way.
 
 ## Effects, sound and settings
@@ -71,8 +88,11 @@ are rigged this way.
 Fights throw particles for hits, heals, casts and deaths, ranged attacks fire
 a bolt, and units cast a soft shadow. Settings (name, server address, window
 size, fullscreen, volume, and switches for particles, shadows and animations)
-live in `autoengine-client.json` in the folder the client is started from
-(`--settings FILE` to use another) and are saved when changed in the menu.
+live in `autoengine/client.json` in the system's settings folder
+(`%APPDATA%` on Windows, `~/Library/Application Support` on macOS,
+`~/.config` on Linux), or in `autoengine-client.json` if one exists where
+the client starts. `--settings FILE` uses another file. Settings are saved
+when changed in the menu.
 
 Sound effects are synthesised by the client, so no sound files are needed
 (a file in `sounds/` replaces one, see [art.md](art.md)).
@@ -101,8 +121,7 @@ balance-neutral engine changes.
 
 Connections are plain TCP with no encryption or accounts, so host it only
 for people you trust. Lighting is a single light worked out per vertex, and
-shadows are simple discs. Animation clips switch without blending. The menu
-covers the game while it is open.
+shadows are simple discs. The menu covers the game while it is open.
 
 ## How the client's code is laid out
 

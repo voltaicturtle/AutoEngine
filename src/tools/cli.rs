@@ -25,7 +25,6 @@ use std::time::Duration;
 use crate::bot;
 use crate::combat::{Combat, EventKind, Team, UnitId};
 use crate::content::{ContentSet, MatchSetup};
-use crate::effect::StatusKind;
 use crate::game::{Game, GameEvent, Opponent, PlayerId};
 use crate::net::{Server, ServerConfig};
 use crate::rng::Rng;
@@ -98,17 +97,23 @@ const COMMANDS: &[Command] = &[
     Command { name: "check", args: "", about: "look for mistakes in the content", run: check },
     Command { name: "test", args: "[--filter TEXT]", about: "run the content tests and check their results", run: test },
     Command { name: "fight", args: "[SEED] [--quiet] [--test NAME]", about: "run one fight and print what happens", run: fight },
-    Command { name: "lobby", args: "[SEED] [--players N] [--quiet]", about: "bots play a whole game", run: lobby },
-    Command { name: "sim", args: "[--games N] [--players N] [--seed N] [--json]", about: "bots play many games; prints a balance table", run: sim },
+    Command { name: "lobby", args: "[SEED] [--players N] [--bots easy|normal|hard|mixed] [--quiet] [--save FILE]", about: "bots play a whole game", run: lobby },
+    Command { name: "sim", args: "[--games N] [--players N] [--seed N] [--bots LEVEL] [--json]", about: "bots play many games; prints a balance table", run: sim },
     Command { name: "bench", args: "[--fights N] [--games N]", about: "measure how fast fights and games run", run: bench },
     Command {
         name: "serve",
-        args: "[--port 7777] [--bind ADDR] [--seats 8] [--seed N] [--planning-secs 30] [--record DIR] [--dev] \
-               [--max-connections 64] [--idle-secs 30] [--stats-secs N]",
-        about: "host a game for clients to join over TCP",
+        args: "[--port 7777] [--bind ADDR] [--seats 8] [--seed N] [--planning-secs 30] [--record DIR [--resume]] [--dev] [--bots LEVEL] [--rooms N [--ladder FILE]] [--spectator-delay-secs N] \
+               [--max-connections 64] [--max-per-ip 8] [--idle-secs 30] [--stats-secs N]",
+        about: "host a game (or with --rooms, up to N games at once) for clients to join over TCP",
         run: serve,
     },
     Command { name: "replay", args: "FILE...", about: "fight saved replays again and report any that changed", run: replay },
+    Command {
+        name: "match",
+        args: "FILE [--rounds]",
+        about: "play a saved match again, check it ends the same, and summarize it",
+        run: match_log,
+    },
     Command { name: "api", args: "", about: "print what scripts can do", run: api },
 ];
 
@@ -270,9 +275,10 @@ fn sim(spec: &GameSpec, args: &mut Args) -> Result<(), String> {
     let players = args.number("--players", 8, 2..=8)? as usize;
     let seed = args.number("--seed", 1, 0..=u64::MAX)?;
     let json = args.flag("--json");
+    let bots: bot::Difficulty = args.value("--bots")?.map(|b| b.parse()).transpose()?.unwrap_or_default();
     args.done()?;
     let content = Arc::new(spec.load()?);
-    let report = tools::simulate(content.clone(), games, players, seed);
+    let report = tools::sim::simulate_with(content.clone(), games, players, seed, bots);
     if json {
         println!("{}", serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?);
     } else {
@@ -326,6 +332,47 @@ fn api(_spec: &GameSpec, args: &mut Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Plays a saved match again and prints how each round left the players.
+fn match_log(spec: &GameSpec, args: &mut Args) -> Result<(), String> {
+    let rounds = args.flag("--rounds");
+    let file = args.positional().ok_or_else(|| args.usage())?;
+    args.done()?;
+    let path = Path::new(&file);
+    // Either a bare match log or what a server saves with --record.
+    let log = match crate::matchlog::MatchLog::load(path) {
+        Ok(log) => log,
+        Err(_) => {
+            let dir = if path.is_dir() { path } else { path.parent().unwrap_or(Path::new(".")) };
+            Session::load_match(dir)?.log
+        }
+    };
+    let content = Arc::new(spec.load()?);
+    if rounds {
+        let mut n = 0;
+        log.rounds(content.clone(), |_| {}, |game| {
+            n += 1;
+            let line: Vec<String> = game
+                .players()
+                .iter()
+                .map(|p| if p.alive { format!("{} {}hp {}g L{}", p.name, p.health, p.gold, p.level) } else { format!("{} out", p.name) })
+                .collect();
+            println!("round {n:>2}: {}", line.join(" | "));
+        })
+        .map_err(|e| format!("{file}: {e}"))?;
+    }
+    let game = log.replay(content, |_| {}).map_err(|e| format!("{file}: {e}"))?;
+    let mut standings: Vec<_> = game.players().iter().collect();
+    standings.sort_by_key(|p| (p.placement.unwrap_or(0) == 0, p.placement, std::cmp::Reverse(p.health)));
+    println!("ok: {} inputs replay to the same game (seed {})", log.inputs.len(), log.seed);
+    for p in standings {
+        match p.placement {
+            Some(place) => println!("  #{place} {}", p.name),
+            None => println!("  -- {} ({} health)", p.name, p.health),
+        }
+    }
+    Ok(())
+}
+
 /// Re-runs saved fights and reports whether the engine still plays them
 /// out exactly as recorded.
 fn replay(_spec: &GameSpec, args: &mut Args) -> Result<(), String> {
@@ -362,9 +409,21 @@ fn replay(_spec: &GameSpec, args: &mut Args) -> Result<(), String> {
 fn lobby(spec: &GameSpec, args: &mut Args) -> Result<(), String> {
     let quiet = args.flag("--quiet");
     let players = args.number("--players", 8, 2..=8)? as usize;
+    let save = args.value("--save")?;
+    let bots = args.value("--bots")?.unwrap_or_else(|| "normal".into());
+    let levels: Vec<bot::Difficulty> = if bots == "mixed" {
+        (0..players).map(|i| bot::Difficulty::ALL[i % 3]).collect()
+    } else {
+        vec![bots.parse()?; players]
+    };
     let seed = seed_argument(args)?;
     args.done()?;
-    play_lobby(spec.load()?, seed, players, quiet)
+    let game = play_lobby(spec.load()?, seed, &levels, quiet)?;
+    if let Some(file) = save {
+        crate::matchlog::MatchLog::of(&game).save(Path::new(&file)).map_err(|e| format!("{file}: {e}"))?;
+        println!("saved the match to {file}; `match {file} --rounds` plays it again");
+    }
+    Ok(())
 }
 
 /// An optional seed given as a bare number.
@@ -436,7 +495,8 @@ fn fight(spec: &GameSpec, args: &mut Args) -> Result<(), String> {
 }
 
 /// Plays a full game between bots, printing a summary of every round.
-fn play_lobby(content: ContentSet, seed: u64, players: usize, quiet: bool) -> Result<(), String> {
+fn play_lobby(content: ContentSet, seed: u64, levels: &[bot::Difficulty], quiet: bool) -> Result<Game, String> {
+    let players = levels.len();
     let mut game = Game::new(content, seed, &BOT_NAMES[..players]);
     let mut bot_rng = Rng::new(seed ^ 0xB07);
     let name = |game: &Game, id: PlayerId| game.player(id).name.clone();
@@ -445,7 +505,7 @@ fn play_lobby(content: ContentSet, seed: u64, players: usize, quiet: bool) -> Re
         if game.round_index() >= 500 {
             return Err("the game did not finish within 500 rounds".into());
         }
-        bot::play_round(&mut game, &mut bot_rng).map_err(|e| e.to_string())?;
+        bot::play_round_with(&mut game, &mut bot_rng, |id| levels[id.0 as usize]).map_err(|e| e.to_string())?;
         for event in game.drain_events() {
             let line = match event {
                 GameEvent::RoundStarted { index, name, kind, stage } => {
@@ -492,15 +552,16 @@ fn play_lobby(content: ContentSet, seed: u64, players: usize, quiet: bool) -> Re
     standings.sort_by_key(|p| p.placement);
     for p in standings {
         println!(
-            "  {}. {:<8} level {}  health {:>3}  augments: {}",
+            "  {}. {:<8} {:<6} level {}  health {:>3}  augments: {}",
             p.placement.unwrap_or(0),
             p.name,
+            levels[p.id.0 as usize].name(),
             p.level,
             p.health,
             if p.augments.is_empty() { "none".to_string() } else { p.augments.join(", ") },
         );
     }
-    Ok(())
+    Ok(game)
 }
 
 fn label(combat: &Combat, id: UnitId) -> String {
@@ -526,6 +587,8 @@ fn print_log(combat: &Combat) {
                 format!("{} has {} {} stacks", label(*unit), count, stack)
             }
             EventKind::Attacked { .. } => continue, // the damage line follows
+            EventKind::Dodged { source, target } => format!("{} dodges {}", label(*target), label(*source)),
+            EventKind::Overtime => "overtime: damage grows every second from now on".to_string(),
             EventKind::Damaged { source, target, amount, absorbed, kind, crit } => format!(
                 "{} hits {} for {} {:?}{}{}",
                 label(*source),
@@ -535,8 +598,8 @@ fn print_log(combat: &Combat) {
                 if *crit { " (crit)" } else { "" },
                 if *absorbed > 0 { format!(" ({absorbed} shielded)") } else { String::new() },
             ),
-            EventKind::Healed { target, amount } => format!("{} heals {}", label(*target), amount),
-            EventKind::Shielded { target, amount } => {
+            EventKind::Healed { target, amount, .. } => format!("{} heals {}", label(*target), amount),
+            EventKind::Shielded { target, amount, .. } => {
                 format!("{} gains a {} shield", label(*target), amount)
             }
             EventKind::CastStarted { unit } => {
@@ -550,11 +613,7 @@ fn print_log(combat: &Combat) {
                 combat.unit(*unit).template().passives[*passive].name
             ),
             EventKind::StatusApplied { target, status, duration_ms, .. } => {
-                let what = match status {
-                    StatusKind::Stun => "stunned",
-                    StatusKind::StatMods(_) => "stat-modified",
-                    StatusKind::DamageOverTime { .. } => "afflicted",
-                };
+                let what = status.name();
                 format!("{} is {} for {}ms", label(*target), what, duration_ms)
             }
             EventKind::StatusExpired { .. } => continue,
@@ -584,7 +643,19 @@ fn serve(spec: &GameSpec, args: &mut Args) -> Result<(), String> {
     // Local connections only unless asked otherwise.
     let bind = args.value("--bind")?.unwrap_or_else(|| "127.0.0.1".to_string());
     let record = args.value("--record")?;
+    let resume = args.flag("--resume");
+    if resume && record.is_none() {
+        return Err(format!("--resume needs --record DIR, the folder the match was saved in\n{usage}"));
+    }
     let dev = args.flag("--dev");
+    let rooms = args.number("--rooms", 0, 0..=1000)? as usize;
+    let spectator_delay = args.number("--spectator-delay-secs", 0, 0..=3600)? * 1000;
+    let ladder = args.value("--ladder")?;
+    if ladder.is_some() && rooms == 0 {
+        return Err(format!("--ladder needs --rooms: ratings are kept across the games of a hub\n{usage}"));
+    }
+
+    let bots: bot::Difficulty = args.value("--bots")?.map(|b| b.parse()).transpose()?.unwrap_or_default();
     let mut config = SessionConfig {
         seed: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -595,6 +666,9 @@ fn serve(spec: &GameSpec, args: &mut Args) -> Result<(), String> {
     let mut net = ServerConfig::default();
     if let Some(v) = args.value("--max-connections")? {
         net.max_connections = v.parse().ok().filter(|n| *n >= 1).ok_or_else(|| bad("--max-connections"))?;
+    }
+    if let Some(v) = args.value("--max-per-ip")? {
+        net.max_connections_per_ip = v.parse().ok().filter(|n| *n >= 1).ok_or_else(|| bad("--max-per-ip"))?;
     }
     if let Some(v) = args.value("--idle-secs")? {
         let secs = v.parse::<u64>().ok().filter(|n| *n >= 2).ok_or_else(|| bad("--idle-secs"))?;
@@ -620,16 +694,187 @@ fn serve(spec: &GameSpec, args: &mut Args) -> Result<(), String> {
         config.seed,
         config.planning_ms / 1000
     );
+    if rooms > 0 {
+        let mut hub = crate::hub::Hub::new(content, crate::hub::HubConfig { room: config, max_rooms: rooms, ..Default::default() });
+        hub.on_new_room(move |_, session| {
+            session.set_bot_difficulty(bots);
+            session.allow_dev(dev);
+            session.set_spectator_delay(spectator_delay);
+        });
+        if dev {
+            println!("developer commands are on");
+        }
+        if let Some(dir) = record {
+            println!("saving each game's fights and match in {dir}/room-N");
+            if resume {
+                let count = hub.resume(Path::new(&dir), 0)?;
+                println!("resumed {count} unfinished game(s) from {dir}");
+            }
+            hub.record_to(dir);
+        }
+        if let Some(file) = ladder {
+            let path = PathBuf::from(&file);
+            let loaded = crate::ladder::Ladder::load(&path)?;
+            println!("rating players across games in {file} ({} rated so far)", loaded.standings().len());
+            hub.keep_ladder(loaded, Some(path));
+        }
+        println!("hosting up to {rooms} games; players join the first with a free seat, or pick one");
+        return report_stats(server.spawn(hub), stats_secs);
+    }
     let mut session = Session::new(content, config);
+    session.set_bot_difficulty(bots);
+    session.set_spectator_delay(spectator_delay);
     if dev {
         println!("developer commands are on");
         session.allow_dev(true);
     }
     if let Some(dir) = record {
-        println!("saving every fight as a replay in {dir}");
+        if resume {
+            let saved = Session::load_match(Path::new(&dir))?;
+            let round = saved.log.inputs.iter().filter(|i| **i == crate::game::Input::FinishRound).count();
+            session.resume(saved, 0).map_err(|e| format!("cannot resume the match in {dir}: {e}"))?;
+            println!("resumed the match in {dir} after {round} rounds; players rejoin under their names");
+        }
+        println!("saving every fight as a replay, and the match as match.json, in {dir}");
         session.record_to(dir);
     }
-    let server = server.spawn(session);
+    report_stats(server.spawn(session), stats_secs)
+}
+
+/// What the server terminal's commands need from what is hosted.
+trait Admin: Send + 'static {
+    fn announce(&mut self, text: &str);
+    fn kick(&mut self, name: &str, now: u64) -> usize;
+    fn status(&self) -> String;
+    /// Pauses (or unpauses) the game, or on a hub the room named by `arg`.
+    fn pause(&mut self, arg: &str, pause: bool, now: u64) -> String;
+    fn ladder(&self) -> String {
+        "this server keeps no ladder (serve --rooms N --ladder FILE)".into()
+    }
+}
+
+fn pause_session(session: &mut Session, pause: bool, now: u64) -> String {
+    let done = if pause { session.pause(now) } else { session.unpause(now) };
+    match (done, pause) {
+        (true, true) => "paused".into(),
+        (true, false) => "running again".into(),
+        (false, true) => "nothing to pause (not running, or already paused)".into(),
+        (false, false) => "not paused".into(),
+    }
+}
+
+impl Admin for Session {
+    fn announce(&mut self, text: &str) {
+        Session::announce(self, text);
+    }
+    fn kick(&mut self, name: &str, now: u64) -> usize {
+        Session::kick(self, name, now) as usize
+    }
+    fn pause(&mut self, _arg: &str, pause: bool, now: u64) -> String {
+        pause_session(self, pause, now)
+    }
+    fn status(&self) -> String {
+        let seats: Vec<String> = self.seat_names().into_iter().map(|s| s.unwrap_or_else(|| "(open)".into())).collect();
+        let phase = match self.game() {
+            None => "waiting to start".to_string(),
+            Some(g) if g.is_over() => "over".to_string(),
+            Some(g) => format!("round {} ({})", g.round_name(), g.round_kind()),
+        };
+        format!("{phase}; {} connected; seats: {}", self.connections(), seats.join(", "))
+    }
+}
+
+impl Admin for crate::hub::Hub {
+    fn announce(&mut self, text: &str) {
+        crate::hub::Hub::announce(self, text);
+    }
+    fn kick(&mut self, name: &str, now: u64) -> usize {
+        crate::hub::Hub::kick(self, name, now)
+    }
+    fn ladder(&self) -> String {
+        let Some(ladder) = crate::hub::Hub::ladder(self) else {
+            return "this server keeps no ladder (serve --rooms N --ladder FILE)".into();
+        };
+        let rows = ladder.standings();
+        if rows.is_empty() {
+            return "nobody is rated yet".into();
+        }
+        rows.iter()
+            .take(10)
+            .enumerate()
+            .map(|(i, r)| format!("{:>2}. {:<16} {:>5}  {} games, {} wins", i + 1, r.name, r.rating.rating, r.rating.games, r.rating.wins))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    fn pause(&mut self, arg: &str, pause: bool, now: u64) -> String {
+        match arg.trim_start_matches('#').parse().ok().and_then(|id| self.room_mut(id)) {
+            Some(session) => pause_session(session, pause, now),
+            None => "name a game by its number, such as `pause 2` (see `status`)".into(),
+        }
+    }
+    fn status(&self) -> String {
+        let rooms = self.rooms();
+        let mut out = format!("{} games", rooms.len());
+        for r in rooms {
+            let state = if r.over { "over" } else if r.started { "playing" } else { "waiting" };
+            out.push_str(&format!("\n  #{} {}: {state}, {}/{} players, {} connected", r.id, r.name, r.players, r.seats, r.connected));
+        }
+        out
+    }
+}
+
+const ADMIN_HELP: &str = "commands: status, say TEXT, kick NAME, pause [GAME], resume [GAME], ladder, quit";
+
+/// Reads commands typed into the server's terminal and runs them on the
+/// hosted game.
+fn admin_console<H: Admin>(server: &crate::net::ServerHandle<H>) {
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match std::io::BufRead::read_line(&mut stdin.lock(), &mut line) {
+            Ok(0) | Err(_) => return, // no terminal: keep serving quietly
+            Ok(_) => {}
+        }
+        let line = line.trim().to_string();
+        let (command, rest) = line.split_once(' ').unwrap_or((line.as_str(), ""));
+        let rest = rest.trim().to_string();
+        let reply = match command {
+            "" => continue,
+            "help" => ADMIN_HELP.to_string(),
+            "status" => server.with_host(|h, _| h.status()).unwrap_or_default(),
+            "say" | "announce" if !rest.is_empty() => {
+                server.with_host(move |h, _| h.announce(&rest));
+                "sent".to_string()
+            }
+            "kick" if !rest.is_empty() => {
+                let name = rest.clone();
+                match server.with_host(move |h, now| h.kick(&name, now)) {
+                    Some(0) | None => format!("nobody called {rest} has a seat"),
+                    Some(n) => format!("removed {rest} from {n} game(s)"),
+                }
+            }
+            "ladder" => server.with_host(|h, _| h.ladder()).unwrap_or_default(),
+            "pause" | "resume" => {
+                let pause = command == "pause";
+                server.with_host(move |h, now| h.pause(&rest, pause, now)).unwrap_or_default()
+            }
+            "quit" | "exit" | "stop" => std::process::exit(0),
+            _ => format!("did not understand \"{line}\"; {ADMIN_HELP}"),
+        };
+        println!("{reply}");
+    }
+}
+
+/// Prints the server's counters every `stats_secs` seconds (if not zero)
+/// while it runs, which is forever, and takes commands from the terminal.
+fn report_stats<H: Admin>(server: crate::net::ServerHandle<H>, stats_secs: u64) -> Result<(), String> {
+    println!("type `help` for server commands");
+    let server = Arc::new(server);
+    {
+        let server = server.clone();
+        std::thread::spawn(move || admin_console(&server));
+    }
     // The game runs on the server's own thread; this one only reports.
     let mut last = server.stats();
     loop {

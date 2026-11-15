@@ -10,7 +10,7 @@
 //! folder; the content only names them.
 
 use crate::content::{
-    AugmentDef, BoardUnit, Bonus, ChoiceOffer, ContentSet, ItemDef, MatchSetup, RoundDef, RoundKindDef, Schedule,
+    AugmentDef, BoardUnit, Bonus, ChoiceOffer, Consumable, ContentSet, ItemDef, MatchSetup, RoundDef, RoundKindDef, Schedule,
     TeamSetup, TraitDef, UnitDef,
 };
 use crate::effect::{Ability, Amount, Anchor, DamageKind, Effect, Passive, ScaleBy, Selector, Trigger, Who};
@@ -209,6 +209,7 @@ pub fn units() -> Vec<UnitDef> {
             ])
             .ability(
                 Ability::new("Rootwall")
+                    .description("Shields itself for 250 plus 10% of its maximum health for 4 seconds and stuns adjacent enemies for 1 second.")
                     .cast_time(300)
                     .effect(
                         Effect::shield_for(Amount::power(250).plus(Who::Source, ScaleBy::Stat(MaxHealth), 100), 4000)
@@ -234,6 +235,7 @@ pub fn units() -> Vec<UnitDef> {
             ])
             .ability(
                 Ability::new("Searing Flurry")
+                    .description("Strikes its target for 80 plus 150% attack damage, then attacks 40% faster for 3 seconds.")
                     .cast_time(250)
                     .effect(
                         Effect::physical(Amount::power(80).plus(Who::Source, ScaleBy::Stat(AttackDamage), 1500))
@@ -263,6 +265,7 @@ pub fn units() -> Vec<UnitDef> {
             .ability({
                 let splash = Selector::EnemiesWithin { anchor: Anchor::CurrentTarget, radius: 1 };
                 Ability::new("Breaking Wave")
+                    .description("Crashes a wave on its target and the enemies next to it: 180 magic damage, then 30 more each second for 3 seconds.")
                     .cast_time(500)
                     .effect(Effect::magic(Amount::power(180)).to(splash.clone()))
                     .effect(Effect::damage_over_time(Amount::power(30), DamageKind::Magic, 3000).to(splash))
@@ -273,7 +276,10 @@ pub fn units() -> Vec<UnitDef> {
             .traits(["grove"])
             .stats([(MaxHealth, 520), (AttackDamage, 35), (Armor, 15), (MagicResist, 25), (Range, 3), (MaxMana, 60)])
             .ability(
-                Ability::new("Morning Dew").cast_time(400).effect(
+                Ability::new("Morning Dew")
+                    .description("Heals the two most wounded allies for 150, plus 15% of the health they are missing.")
+                    .cast_time(400)
+                    .effect(
                     Effect::heal(Amount::power(150).plus(Who::Target, ScaleBy::MissingHealth, 150))
                         .to(Selector::LowestHealthAllies(2)),
                 ),
@@ -302,6 +308,7 @@ pub fn units() -> Vec<UnitDef> {
             ])
             .ability(
                 Ability::new("Cinder Bite")
+                    .description("Bites its target for 200% attack damage and melts 40% of its armor for 4 seconds.")
                     .effect(
                         Effect::physical(Amount::flat(0).plus(Who::Source, ScaleBy::Stat(AttackDamage), 2000))
                             .with_crit()
@@ -323,7 +330,10 @@ pub fn units() -> Vec<UnitDef> {
                 (MaxMana, 90),
             ])
             .ability(
-                Ability::new("Piercing Reed").cast_time(350).effect(
+                Ability::new("Piercing Reed")
+                    .description("Shoots the farthest enemy for 120 physical damage plus 8% of its current health.")
+                    .cast_time(350)
+                    .effect(
                     Effect::physical(Amount::power(120).plus(Who::Target, ScaleBy::CurrentHealth, 80))
                         .to(Selector::FarthestEnemies(1)),
                 ),
@@ -343,10 +353,15 @@ pub fn units() -> Vec<UnitDef> {
 /// Items: three components and the items they combine into.
 pub fn items() -> Vec<ItemDef> {
     vec![
-        ItemDef::new("whetstone", "Whetstone").mods([AttackDamage.flat(15)]),
-        ItemDef::new("oak_charm", "Oak Charm").mods([MaxHealth.flat(150)]),
-        ItemDef::new("ember_core", "Ember Core").mods([AttackSpeed.percent(100)]),
+        ItemDef::new("whetstone", "Whetstone").description("A component.").mods([AttackDamage.flat(15)]),
+        ItemDef::new("oak_charm", "Oak Charm").description("A component.").mods([MaxHealth.flat(150)]),
+        ItemDef::new("ember_core", "Ember Core").description("A component.").mods([AttackSpeed.percent(100)]),
+        // Single use: give it to a unit to take all its items back.
+        ItemDef::new("lodestone", "Lodestone")
+            .description("Give it to a unit to take back all the items it holds.")
+            .consumable(Consumable::RemoveItems),
         ItemDef::new("barkplate", "Barkplate")
+            .description("Whoever damages the holder takes 20 magic damage back.")
             .recipe("oak_charm", "oak_charm")
             .mods([MaxHealth.flat(350), Armor.flat(20)])
             .passive(
@@ -354,6 +369,7 @@ pub fn items() -> Vec<ItemDef> {
                     .effect(Effect::magic(20).to(Selector::EventOther)),
             ),
         ItemDef::new("cinder_blade", "Cinder Blade")
+            .description("Attacks burn for 20 true damage a second for 2 seconds. The holder counts as Cinder.")
             .recipe("whetstone", "ember_core")
             // The third Cinder unit has to be made with this blade.
             .grants_trait("cinder")
@@ -363,6 +379,7 @@ pub fn items() -> Vec<ItemDef> {
                     .effect(Effect::damage_over_time(20, DamageKind::True, 2000).to(Selector::EventOther)),
             ),
         ItemDef::new("grove_sigil", "Grove Sigil")
+            .description("The holder counts as Grove.")
             .recipe("oak_charm", "whetstone")
             .mods([MaxHealth.flat(150), AttackDamage.flat(15)])
             .grants_trait("grove"),

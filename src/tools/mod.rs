@@ -18,4 +18,4 @@ pub mod scenario;
 mod sim;
 
 pub use lint::{Warning, lint};
-pub use sim::{SimReport, UnitRecord, simulate};
+pub use sim::{SimReport, UnitRecord, simulate, simulate_with};

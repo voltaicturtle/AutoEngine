@@ -38,9 +38,14 @@ pub enum Stat {
     DamageReduction,
     /// Share of damage dealt that is returned as healing.
     Lifesteal,
+    /// Chance, in thousandths, that a basic attack against the unit misses.
+    Dodge,
+    /// Cuts how long crowd control lasts on the unit, in thousandths (at
+    /// most 80%).
+    Tenacity,
 }
 
-pub const STAT_COUNT: usize = 16;
+pub const STAT_COUNT: usize = 18;
 
 impl Stat {
     pub const ALL: [Stat; STAT_COUNT] = [
@@ -60,6 +65,8 @@ impl Stat {
         Stat::DamageAmp,
         Stat::DamageReduction,
         Stat::Lifesteal,
+        Stat::Dodge,
+        Stat::Tenacity,
     ];
 
     const fn index(self) -> usize {
@@ -153,6 +160,13 @@ impl StatMod {
 
     pub const fn percent(stat: Stat, permille: i64) -> Self {
         StatMod { stat, flat: 0, permille }
+    }
+
+    /// Whether it makes the unit worse: a cut to any stat, except the cost
+    /// of casting, where a cut helps.
+    pub fn lowers(&self) -> bool {
+        let sign = if self.stat == Stat::MaxMana { -1 } else { 1 };
+        self.flat * sign < 0 || self.permille * sign < 0
     }
 }
 

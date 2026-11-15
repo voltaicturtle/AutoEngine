@@ -106,7 +106,7 @@ pub(crate) fn draw_asset_viewer(app: &mut App) {
     ground.ring(RING_LIFT, 0.50, 0.62, ui().friend);
     ground.draw();
     if let Some(model) = &viewer.model {
-        let pose = viewer.clip.filter(|_| animate).map(|clip| Pose { clip, time: (get_time() - viewer.clip_started) as f32, looped: true });
+        let pose = viewer.clip.filter(|_| animate).map(|clip| Pose::new(clip, (get_time() - viewer.clip_started) as f32, true));
         model.draw(Vec3::ZERO, viewer.angle, UNIT_HEIGHT, [1.0; 3], 0.0, pose);
         app.drawn.set((1, info.vertices));
     }

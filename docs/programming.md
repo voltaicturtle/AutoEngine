@@ -39,6 +39,8 @@ server.
 
 `autoengine api` prints every function and event. A test keeps that list in
 step with the engine.
+[guides/scripting.md](guides/scripting.md) explains each one with examples,
+and [guides/events.md](guides/events.md) lists every event's fields.
 
 
 ## Extending in Rust
@@ -50,6 +52,7 @@ step with the engine.
 | either of those on a hosted game | `Session::on_start` | `examples/host_a_game.rs` |
 | a networked game | `Server` and `GameClient` (see [networking.md](networking.md)) | `examples/network_game.rs` |
 | another transport than TCP | drive `Session` yourself | `examples/host_a_game.rs` |
+| saving and replaying whole matches | `MatchLog` | `examples/replay_a_match.rs` |
 | another front end | `ClientState` and `Playback` | the `client/` crate |
 
 Run an example with `cargo run --example first_fight`. They are built by
@@ -108,6 +111,27 @@ finish_round()  the round resolves, fights run, players without health are out
 The content's `Schedule` decides which kind each round is, so a game can
 mix fights with drafts, choices and its own custom rounds freely.
 
+Every input that moves the game along (round starts and ends, accepted
+commands, and grants) is recorded, so `MatchLog::of(&game)` can rebuild the
+game exactly. To hand a player something from outside the rules, such as an
+admin tool or a tournament reward, use `game.grant(player, Grant::Gold(10))`
+instead of `add_gold`, so the game can still be replayed. Round types and
+hooks may call `add_gold` and the like freely, since they run again on
+replay. `game.checksum()` fingerprints the state.
+
+Each `Player` carries `stats` (`PlayerStats`): gold earned and spent,
+rerolls, units bought and sold, fights won, lost and drawn, kills, damage
+taken, best streak and best star level. It is sent to clients with the rest
+of the player.
+
+`playback::fight_stats(&record.events)` (or `playback.stats()`) gives every
+unit's damage dealt and taken, healing and shielding done, kills, casts and
+dodges for a fight, which is what damage meters need. `Healed` and
+`Shielded` events name their source for this.
+
+Computer players live in `bot`: `bot::play_round_with(&mut game, &mut rng, |id| Difficulty::Hard)`,
+or `play_turn_as` for one player.
+
 ## Layers
 
 Each layer only uses the ones above it, so a project can take the fight
@@ -119,7 +143,7 @@ simulation alone, or everything up to the lobby, without the rest.
 | Fights | `effect`, `combat` | abilities built from effect blocks, and the tick-based fight simulation |
 | Content | `content`, `sample` | content defined in Rust and validated; a complete sample game |
 | Game | `game`, `round`, `bot`, `script` | shop, economy, round loop, round types, scripts, computer players |
-| Hosting | `protocol`, `session`, `net`, `replay` | messages, a hosted game with seats and timers, TCP, saved fights |
+| Hosting | `protocol`, `session`, `hub`, `ladder`, `net`, `replay`, `matchlog` | messages, a hosted game with seats and timers, many games on one server, ratings, TCP, saved fights and whole matches |
 | Display | `client`, `playback` | what a front end needs to show a game, with no rendering in it |
 | Tools | `tools` | the command line, checker, content tests, simulator, starter game and benchmarks |
 

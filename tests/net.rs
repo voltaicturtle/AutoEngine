@@ -402,3 +402,28 @@ fn a_connection_notices_a_server_that_has_gone_silent() {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+#[test]
+fn one_address_cannot_take_every_place() {
+    let server = host(2, ServerConfig { max_connections_per_ip: 2, ..ServerConfig::default() });
+    let mut ana = GameClient::join(server.addr().to_string(), "Ana");
+    let mut ben = GameClient::spectate(server.addr().to_string());
+    assert!(ana.wait_until(WAIT, |s| s.welcomed) && ben.wait_until(WAIT, |s| s.welcomed));
+    let lines = read_to_close(raw(&server, &[]));
+    assert!(lines[0].contains("too many connections from your address"), "{lines:?}");
+    assert_eq!(server.stats().refused, 1);
+}
+
+#[test]
+fn seat_tokens_are_not_predictable() {
+    let token = || {
+        let mut s = session(2);
+        s.handle(1, ClientMsg::Join { name: "Ana".into(), version: PROTOCOL_VERSION, token: None }, 0);
+        s.drain_outbox().into_iter().find_map(|(_, m)| match m {
+            ServerMsg::Welcome { token, .. } => token,
+            _ => None,
+        })
+    };
+    // Same seed, same moment, same process: still different.
+    assert_ne!(token(), token());
+}

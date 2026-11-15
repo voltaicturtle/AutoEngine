@@ -12,7 +12,21 @@ use crate::content::{ActiveTrait, AugmentDef, ContentSet, GameRules, ItemDef, Tr
 use crate::game::{CombatRecord, Command, GameEvent, Player, PlayerId};
 
 /// Bumped whenever the messages change incompatibly.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// The longest chat message the server passes on, in characters.
+pub const MAX_CHAT_CHARS: usize = 200;
+
+/// Tidies a chat message: control characters become spaces, runs of
+/// whitespace shrink to one, and it is cut to [`MAX_CHAT_CHARS`]. `None`
+/// if nothing is left.
+pub fn clean_chat(text: &str) -> Option<String> {
+    let spaced: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let words: Vec<&str> = spaced.split_whitespace().collect();
+    let joined = words.join(" ");
+    let cut: String = joined.chars().take(MAX_CHAT_CHARS).collect();
+    (!cut.is_empty()).then_some(cut)
+}
 
 /// Shortcuts for trying things out while building a game. They act on the
 /// sender's own seat.
@@ -82,6 +96,27 @@ pub enum ClientMsg {
     /// Asks for the whole event log of a fight that arrived as a
     /// [`ServerMsg::CombatSeed`] and did not play out the same here.
     ResendCombat { id: u32 },
+    /// Says something to everyone in the game (see [`clean_chat`]).
+    Chat { text: String },
+    /// On a server hosting many games: asks for [`ServerMsg::Rooms`].
+    ListRooms,
+    /// On a server hosting many games: opens a new game and enters it.
+    /// `seats` falls back to the server's choice.
+    CreateRoom {
+        name: String,
+        #[serde(default)]
+        seats: Option<usize>,
+    },
+    /// On a server hosting many games: enters a game; `Join` or `Spectate`
+    /// then takes a seat in it or watches it. Sending `Join` without
+    /// entering a room first enters the first game with an open seat, or a
+    /// new one.
+    EnterRoom { room: u32 },
+    /// Leaves the current game (a bot keeps a seat that was taken) and goes
+    /// back to the list of games.
+    LeaveRoom,
+    /// On a server that keeps a ladder: asks for [`ServerMsg::Standings`].
+    Standings,
     /// "Are you there?" The other end answers [`ServerMsg::Pong`].
     Ping,
     /// The answer to [`ServerMsg::Ping`]. The transport sends it by itself.
@@ -96,6 +131,9 @@ pub struct ContentInfo {
     pub traits: Vec<TraitDef>,
     pub items: Vec<ItemDef>,
     pub augments: Vec<AugmentDef>,
+    /// Names and descriptions in other languages.
+    #[serde(default)]
+    pub translations: crate::content::Translations,
 }
 
 impl ContentInfo {
@@ -106,12 +144,15 @@ impl ContentInfo {
             traits: content.traits().cloned().collect(),
             items: content.items().cloned().collect(),
             augments: content.augments().cloned().collect(),
+            translations: content.translations().clone(),
         }
     }
 
     /// Rebuilds a content set for lookups on the client.
     pub fn into_content(self) -> Result<ContentSet, crate::content::ContentError> {
-        ContentSet::new(self.units, self.traits, self.items, self.rules)?.with_augments(self.augments)
+        ContentSet::new(self.units, self.traits, self.items, self.rules)?
+            .with_augments(self.augments)?
+            .with_translations(self.translations)
     }
 }
 
@@ -139,6 +180,9 @@ pub struct PlayerStatus {
     pub xp_to_next: Option<u32>,
     /// Every trait on the player's board, with the breakpoint reached.
     pub traits: Vec<ActiveTrait>,
+    /// Times the player may still reroll what the round offers them.
+    #[serde(default)]
+    pub rerolls_left: u32,
 }
 
 /// A snapshot of the game as one client is allowed to see it.
@@ -160,6 +204,13 @@ pub struct GameView {
     /// One per player, in seat order.
     #[serde(default)]
     pub status: Vec<PlayerStatus>,
+    /// The host has stopped the clock; `remaining_ms` stands still.
+    #[serde(default)]
+    pub paused: bool,
+    /// Copies of each shop unit left in the shared pool (not counting those
+    /// sitting in shops).
+    #[serde(default)]
+    pub pool: std::collections::BTreeMap<String, u32>,
 }
 
 impl GameView {
@@ -184,6 +235,11 @@ pub struct ViewUpdate {
     /// Only the statuses that changed.
     #[serde(default)]
     pub status: Vec<PlayerStatus>,
+    #[serde(default)]
+    pub paused: bool,
+    /// The pool, only when it changed.
+    #[serde(default)]
+    pub pool: Option<std::collections::BTreeMap<String, u32>>,
 }
 
 impl GameView {
@@ -208,7 +264,9 @@ impl GameView {
             && self.round_kind == newer.round_kind
             && self.stage == newer.stage
             && self.awaiting == newer.awaiting
-            && self.options == newer.options;
+            && self.options == newer.options
+            && self.paused == newer.paused
+            && self.pool == newer.pool;
         if unchanged {
             return None;
         }
@@ -222,6 +280,8 @@ impl GameView {
             awaiting: newer.awaiting.clone(),
             options: newer.options.clone(),
             status,
+            paused: newer.paused,
+            pool: (self.pool != newer.pool).then(|| newer.pool.clone()),
         })
     }
 
@@ -234,6 +294,10 @@ impl GameView {
         self.stage = update.stage;
         self.awaiting = update.awaiting;
         self.options = update.options;
+        self.paused = update.paused;
+        if let Some(pool) = update.pool {
+            self.pool = pool;
+        }
         for player in update.players {
             let seat = player.id.0 as usize;
             match self.players.get_mut(seat) {
@@ -280,6 +344,29 @@ pub enum ServerMsg {
     Pong,
     /// The last message from this client was refused.
     Error { message: String },
+    /// Someone said something. `seat` is `None` for spectators and for the
+    /// server itself.
+    Chat { from: String, seat: Option<PlayerId>, text: String },
+    /// The games on a server hosting many.
+    Rooms(Vec<RoomInfo>),
+    /// The connection is now in this game, or in none.
+    InRoom { room: Option<u32> },
+    /// The ladder's best players, best first.
+    Standings(Vec<crate::ladder::Standing>),
+}
+
+/// One game on a server hosting many, as the list of games shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomInfo {
+    pub id: u32,
+    pub name: String,
+    pub seats: usize,
+    /// Seats taken by people.
+    pub players: usize,
+    /// Everyone connected: players and spectators.
+    pub connected: usize,
+    pub started: bool,
+    pub over: bool,
 }
 
 /// Whether an event may be shown to a viewer. Shops and private offers are
@@ -295,12 +382,7 @@ pub fn visible_to(event: &GameEvent, viewer: Option<PlayerId>) -> bool {
 /// A fingerprint of a fight's events (FNV-1a over their JSON), so a client
 /// that fought a fight again can check it got exactly the server's events.
 pub fn events_checksum(events: &[crate::combat::Event]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in encode(&events).bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+    crate::rng::fnv1a(encode(&events).as_bytes())
 }
 
 /// Encodes a message as one line of JSON, without the newline.

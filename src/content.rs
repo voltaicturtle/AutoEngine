@@ -75,6 +75,9 @@ pub struct UnitDef {
     /// looks at this.
     #[serde(default)]
     pub model: Option<ModelRef>,
+    /// Which enemy the unit goes after.
+    #[serde(default)]
+    pub targeting: crate::effect::Targeting,
 }
 
 /// A 3D model for a unit: display-only data that travels with the content
@@ -110,7 +113,15 @@ impl UnitDef {
             passives: Vec::new(),
             in_shop: true,
             model: None,
+            targeting: crate::effect::Targeting::Nearest,
         }
+    }
+
+    /// Which enemy the unit goes after, such as
+    /// `Targeting::Farthest` for an assassin.
+    pub fn targeting(mut self, targeting: crate::effect::Targeting) -> Self {
+        self.targeting = targeting;
+        self
     }
 
     pub fn cost(mut self, cost: u32) -> Self {
@@ -262,6 +273,9 @@ impl TraitDef {
 pub struct ItemDef {
     pub id: String,
     pub name: String,
+    /// What it does, for players to read.
+    #[serde(default)]
+    pub description: String,
     #[serde(default)]
     pub mods: Vec<StatMod>,
     #[serde(default)]
@@ -272,6 +286,24 @@ pub struct ItemDef {
     /// The two component items that combine into this one, if any.
     #[serde(default)]
     pub recipe: Option<(String, String)>,
+    /// Makes the item single-use: giving it to a unit does this instead of
+    /// equipping it, and the item is gone.
+    #[serde(default)]
+    pub consumable: Option<Consumable>,
+}
+
+/// What a single-use item does when it is given to a unit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Consumable {
+    /// Takes every item off the unit, back to the player's items.
+    RemoveItems,
+    /// Gives the player another one-star copy of the unit, from the pool.
+    Duplicate,
+    /// Swaps each item on the unit for a random other one of the same kind:
+    /// components for components, finished items for finished items.
+    Reforge,
+    /// Gold for the player; the unit does not matter.
+    Gold(i64),
 }
 
 impl ItemDef {
@@ -279,11 +311,25 @@ impl ItemDef {
         ItemDef {
             id: id.into(),
             name: name.into(),
+            description: String::new(),
             mods: Vec::new(),
             passives: Vec::new(),
             grants_traits: Vec::new(),
             recipe: None,
+            consumable: None,
         }
+    }
+
+    /// What it does, for players to read.
+    pub fn description(mut self, text: impl Into<String>) -> Self {
+        self.description = text.into();
+        self
+    }
+
+    /// Makes the item single-use (see [`Consumable`]).
+    pub fn consumable(mut self, consumable: Consumable) -> Self {
+        self.consumable = Some(consumable);
+        self
     }
 
     pub fn mods(mut self, mods: impl IntoIterator<Item = StatMod>) -> Self {
@@ -387,6 +433,25 @@ pub struct GameRules {
     pub base_damage_by_stage: Vec<i64>,
     /// Extra damage per enemy unit left standing.
     pub damage_per_survivor: i64,
+    /// Player fights avoid pairing someone with anyone they fought in
+    /// their last this-many player fights, when another pairing is possible.
+    pub avoid_rematch_rounds: u32,
+    /// Before the fights, empty places on a player's board (up to their
+    /// level's limit) are filled from the bench, strongest units first, so
+    /// forgetting to place a unit does not throw a round away.
+    pub auto_fill_board: bool,
+    /// How fights run: tick length, time limit, overtime and so on.
+    pub combat: crate::combat::CombatConfig,
+    /// Planning time for rounds of a kind (such as `"draft"`), in
+    /// milliseconds, instead of the time the server is set to.
+    pub planning_ms_by_kind: BTreeMap<String, u64>,
+    /// Times each player may swap the options a choice round offers them
+    /// for new ones, per round.
+    pub choice_rerolls: u32,
+    /// Augments one of which, picked at random, every player gets when the
+    /// game starts: a twist that makes each game a little different. Empty
+    /// for none.
+    pub lobby_modifiers: Vec<String>,
 }
 
 impl Default for GameRules {
@@ -432,6 +497,12 @@ impl Default for GameRules {
             default_pool_size: 10,
             base_damage_by_stage: vec![2, 3, 5, 8, 12, 17],
             damage_per_survivor: 1,
+            avoid_rematch_rounds: 2,
+            auto_fill_board: true,
+            combat: crate::combat::CombatConfig::default(),
+            planning_ms_by_kind: BTreeMap::new(),
+            choice_rerolls: 1,
+            lobby_modifiers: Vec::new(),
         }
     }
 }
@@ -467,6 +538,22 @@ pub struct AugmentDef {
     pub bonuses: Vec<Bonus>,
     #[serde(default)]
     pub gold: i64,
+    /// Given to the holder at the start of every round after it is picked.
+    #[serde(default)]
+    pub per_round: RoundGrant,
+}
+
+/// Things an augment hands out every round.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoundGrant {
+    pub gold: i64,
+    pub xp: u32,
+    /// Rerolls that cost nothing, used before any gold is spent. Unused ones
+    /// carry over.
+    pub free_rerolls: u32,
+    /// Random component items.
+    pub components: u32,
 }
 
 /// What a choice round offers.
@@ -567,7 +654,14 @@ fn default_star() -> u8 {
 
 impl AugmentDef {
     pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
-        AugmentDef { id: id.into(), name: name.into(), description: String::new(), bonuses: Vec::new(), gold: 0 }
+        AugmentDef {
+            id: id.into(),
+            name: name.into(),
+            description: String::new(),
+            bonuses: Vec::new(),
+            gold: 0,
+            per_round: RoundGrant::default(),
+        }
     }
 
     pub fn description(mut self, text: impl Into<String>) -> Self {
@@ -583,6 +677,13 @@ impl AugmentDef {
     /// Gold given once, when the augment is picked.
     pub fn gold(mut self, gold: i64) -> Self {
         self.gold = gold;
+        self
+    }
+
+    /// Something given every round from then on, such as
+    /// `RoundGrant { gold: 2, ..Default::default() }`.
+    pub fn per_round(mut self, grant: RoundGrant) -> Self {
+        self.per_round = grant;
         self
     }
 }
@@ -853,6 +954,22 @@ pub struct GameBuilder {
     rules: GameRules,
     scripts: BTreeMap<String, String>,
     hooks: Hooks,
+    translations: Translations,
+}
+
+/// Text in other languages: language code (such as `"fr"`) to key to text.
+/// Keys name a definition and one of its texts, `"unit.ashen_hound.name"`;
+/// see [`text_key`].
+pub type Translations = BTreeMap<String, BTreeMap<String, String>>;
+
+/// The kinds of definition that have translatable text.
+pub const TEXT_KINDS: [&str; 4] = ["unit", "trait", "item", "augment"];
+
+/// The translation key for one text of a definition: `kind` is one of
+/// [`TEXT_KINDS`] and `field` is `"name"` or `"description"`, or for units
+/// `"ability"` (the ability's name) or `"ability_description"`.
+pub fn text_key(kind: &str, id: &str, field: &str) -> String {
+    format!("{kind}.{id}.{field}")
 }
 
 impl GameBuilder {
@@ -985,6 +1102,24 @@ impl GameBuilder {
     }
 
     /// Validates everything and produces the content set.
+    /// Text in another language for one key, such as
+    /// `.translate("fr", "unit.ashen_hound.name", "Chien de cendre")`.
+    pub fn translate(mut self, language: &str, key: &str, text: impl Into<String>) -> Self {
+        self.translations.entry(language.to_string()).or_default().insert(key.to_string(), text.into());
+        self
+    }
+
+    /// Many texts in one language, as `(key, text)` pairs.
+    pub fn translations<K: Into<String>, T: Into<String>>(
+        mut self,
+        language: &str,
+        texts: impl IntoIterator<Item = (K, T)>,
+    ) -> Self {
+        let table = self.translations.entry(language.to_string()).or_default();
+        table.extend(texts.into_iter().map(|(k, t)| (k.into(), t.into())));
+        self
+    }
+
     pub fn build(self) -> Result<ContentSet, ContentError> {
         let set = ContentSet {
             units: index("unit", self.units, |u| &u.id)?,
@@ -995,6 +1130,7 @@ impl GameBuilder {
             rules: self.rules,
             scripts: BTreeMap::new(),
             hooks: self.hooks,
+            translations: self.translations,
         };
         set.validate()?;
         set.with_scripts(self.scripts)
@@ -1014,9 +1150,80 @@ pub struct ContentSet {
     scripts: BTreeMap<String, String>,
     /// Rust hooks registered with [`GameBuilder`].
     hooks: Hooks,
+    translations: Translations,
 }
 
 impl ContentSet {
+    /// Every translation, by language.
+    pub fn translations(&self) -> &Translations {
+        &self.translations
+    }
+
+    /// The languages there are translations for.
+    pub fn languages(&self) -> impl Iterator<Item = &str> {
+        self.translations.keys().map(String::as_str)
+    }
+
+    /// The same content with these translations instead, checked again.
+    pub fn with_translations(mut self, translations: Translations) -> Result<Self, ContentError> {
+        self.translations = translations;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// A definition's text in a language, falling back to the text the
+    /// definition itself carries. `None` if there is no such definition.
+    pub fn text(&self, language: Option<&str>, kind: &str, id: &str, field: &str) -> Option<String> {
+        let own = match (kind, field) {
+            ("unit", "name") => self.unit(id).map(|d| d.name.clone()),
+            ("unit", "ability") => self.unit(id).and_then(|d| d.ability.as_ref()).map(|a| a.name.clone()),
+            ("unit", "ability_description") => {
+                self.unit(id).and_then(|d| d.ability.as_ref()).map(|a| a.description.clone())
+            }
+            ("item", "description") => self.item(id).map(|d| d.description.clone()),
+            ("trait", "name") => self.trait_def(id).map(|d| d.name.clone()),
+            ("trait", "description") => self.trait_def(id).map(|d| d.description.clone()),
+            ("item", "name") => self.item(id).map(|d| d.name.clone()),
+            ("augment", "name") => self.augment(id).map(|d| d.name.clone()),
+            ("augment", "description") => self.augment(id).map(|d| d.description.clone()),
+            _ => None,
+        }?;
+        let translated = language
+            .and_then(|l| self.translations.get(l))
+            .and_then(|table| table.get(&text_key(kind, id, field)));
+        Some(translated.cloned().unwrap_or(own))
+    }
+
+    /// Every key a translation can give text for.
+    pub fn text_keys(&self) -> Vec<String> {
+        let mut keys = Vec::new();
+        for (id, unit) in &self.units {
+            keys.push(text_key("unit", id, "name"));
+            if unit.ability.is_some() {
+                keys.push(text_key("unit", id, "ability"));
+                keys.push(text_key("unit", id, "ability_description"));
+            }
+        }
+        for id in self.items.keys() {
+            keys.push(text_key("item", id, "name"));
+            keys.push(text_key("item", id, "description"));
+        }
+        for id in self.traits.keys() {
+            keys.push(text_key("trait", id, "name"));
+            keys.push(text_key("trait", id, "description"));
+        }
+        for id in self.augments.keys() {
+            keys.push(text_key("augment", id, "name"));
+            keys.push(text_key("augment", id, "description"));
+        }
+        keys
+    }
+
+    /// The name of whatever has this id (a unit, item, augment or trait, in
+    /// that order) in a language, or `None` if nothing does.
+    pub fn name_in(&self, language: Option<&str>, id: &str) -> Option<String> {
+        TEXT_KINDS.iter().find_map(|kind| self.text(language, kind, id, "name"))
+    }
     /// Starts defining a game in Rust.
     pub fn builder() -> GameBuilder {
         GameBuilder::new()
@@ -1059,6 +1266,7 @@ impl ContentSet {
             rules,
             scripts: BTreeMap::new(),
             hooks: Hooks::default(),
+            translations: Translations::new(),
         };
         set.validate()?;
         Ok(set)
@@ -1074,6 +1282,13 @@ impl ContentSet {
     /// Replaces the round schedule and re-validates.
     pub fn with_schedule(mut self, schedule: Schedule) -> Result<Self, ContentError> {
         self.schedule = schedule;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// The same content under other rules, checked again.
+    pub fn with_game_rules(mut self, rules: GameRules) -> Result<Self, ContentError> {
+        self.rules = rules;
         self.validate()?;
         Ok(self)
     }
@@ -1094,6 +1309,38 @@ impl ContentSet {
         }
         if r.copies_to_upgrade < 2 {
             return invalid("copies_to_upgrade must be at least 2".into());
+        }
+        for (language, table) in &self.translations {
+            for key in table.keys() {
+                let parts: Vec<&str> = key.splitn(3, '.').collect();
+                let known = match parts.as_slice() {
+                    [kind, id, field] => match *kind {
+                        "unit" => self.units.get(*id).is_some_and(|u| {
+                            *field == "name" || (u.ability.is_some() && matches!(*field, "ability" | "ability_description"))
+                        }),
+                        "item" => self.items.contains_key(*id) && matches!(*field, "name" | "description"),
+                        "trait" => self.traits.contains_key(*id) && matches!(*field, "name" | "description"),
+                        "augment" => self.augments.contains_key(*id) && matches!(*field, "name" | "description"),
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if !known {
+                    let all: Vec<String> = self.text_keys();
+                    return invalid(format!(
+                        "translation `{key}` in `{language}` names nothing in the content{}",
+                        suggestion(key, all.iter())
+                    ));
+                }
+            }
+        }
+        for id in &r.lobby_modifiers {
+            if !self.augments.contains_key(id) {
+                return invalid(format!("lobby modifier `{id}` is not an augment{}", suggestion(id, self.augments.keys())));
+            }
+        }
+        if r.combat.tick_ms == 0 || r.combat.max_duration_ms == 0 {
+            return invalid("fights need a positive tick_ms and max_duration_ms".into());
         }
         if r.economy.interest_per <= 0 {
             return invalid("interest_per must be positive".into());
@@ -1185,6 +1432,9 @@ impl ContentSet {
                 for part in [a, b] {
                     if !self.items.contains_key(part) {
                         return invalid(format!("{owner} is built from unknown item `{part}`{}", suggestion(part, self.items.keys())));
+                    }
+                    if self.items[part].consumable.is_some() {
+                        return invalid(format!("{owner} is built from `{part}`, which is used up instead of being equipped"));
                     }
                 }
             }
@@ -1324,6 +1574,7 @@ impl ContentSet {
             ability: def.ability.clone(),
             passives: def.passives.clone(),
             tags: def.traits.clone(),
+            targeting: def.targeting,
         })
     }
 
@@ -1397,7 +1648,7 @@ impl ContentSet {
     /// content set is registered so summons can find it.
     pub fn setup_combat(&self, seed: u64, teams: &[TeamSetup]) -> Result<Combat, ContentError> {
         let board = self.board();
-        let mut combat = Combat::new(board.clone(), seed);
+        let mut combat = Combat::with_config(board.clone(), seed, self.rules.combat.clone());
         for (name, hook) in &self.hooks.effects {
             let hook = hook.clone();
             combat.register_custom_effect(name.clone(), move |ctx| hook(ctx));

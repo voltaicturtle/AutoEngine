@@ -97,6 +97,24 @@ pub struct Pose {
     pub time: f32,
     /// Wrap around at the end, or hold the last frame.
     pub looped: bool,
+    /// A pose being faded out, so a change of clip does not snap.
+    pub blend: Option<Blend>,
+}
+
+/// The pose a model is leaving, and how much of it still shows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Blend {
+    pub clip: usize,
+    pub time: f32,
+    pub looped: bool,
+    /// From 1 (all the old pose) down to 0 (all the new one).
+    pub weight: f32,
+}
+
+impl Pose {
+    pub fn new(clip: usize, time: f32, looped: bool) -> Self {
+        Pose { clip, time, looped, blend: None }
+    }
 }
 
 /// Skeleton and animations of a model.
@@ -137,25 +155,45 @@ impl Rig {
             .or_else(|| self.clips.iter().position(|c| c.name.to_lowercase().contains(&wanted)))
     }
 
-    /// World matrix of every node, in the bind pose or at a moment of a clip.
-    pub fn globals(&self, pose: Option<Pose>) -> Vec<Mat4> {
-        let mut locals: Vec<Mat4> = self.nodes.iter().map(|n| n.local).collect();
-        if let Some(pose) = pose
-            && let Some(clip) = self.clips.get(pose.clip)
-        {
-            let time = if pose.looped && clip.duration > 0.0 {
-                pose.time.rem_euclid(clip.duration)
-            } else {
-                pose.time.clamp(0.0, clip.duration)
-            };
+    /// Every node's local scale, rotation and translation at a moment of a
+    /// clip (the bind pose where the clip does not animate it).
+    fn locals_at(&self, clip: usize, time: f32, looped: bool) -> Vec<(Vec3, Quat, Vec3)> {
+        let mut locals: Vec<(Vec3, Quat, Vec3)> =
+            self.nodes.iter().map(|n| n.local.to_scale_rotation_translation()).collect();
+        if let Some(clip) = self.clips.get(clip) {
+            let time = if looped && clip.duration > 0.0 { time.rem_euclid(clip.duration) } else { time.clamp(0.0, clip.duration) };
             for channel in &clip.channels {
-                let (scale, rotation, position) = locals[channel.node].to_scale_rotation_translation();
+                let (scale, rotation, position) = locals[channel.node];
                 let position = sample(&channel.positions, time, |a, b, t| a.lerp(b, t)).unwrap_or(position);
                 let rotation = sample(&channel.rotations, time, |a, b, t| a.slerp(b, t)).unwrap_or(rotation);
                 let scale = sample(&channel.scales, time, |a, b, t| a.lerp(b, t)).unwrap_or(scale);
-                locals[channel.node] = Mat4::from_scale_rotation_translation(scale, rotation, position);
+                locals[channel.node] = (scale, rotation, position);
             }
         }
+        locals
+    }
+
+    /// World matrix of every node, in the bind pose or at a moment of a clip
+    /// (blended with the pose being left, if any).
+    pub fn globals(&self, pose: Option<Pose>) -> Vec<Mat4> {
+        let locals: Vec<Mat4> = match pose {
+            None => self.nodes.iter().map(|n| n.local).collect(),
+            Some(pose) => {
+                let now = self.locals_at(pose.clip, pose.time, pose.looped);
+                let mixed = match pose.blend.filter(|b| b.weight > 0.0) {
+                    None => now,
+                    Some(b) => {
+                        let old = self.locals_at(b.clip, b.time, b.looped);
+                        let t = 1.0 - b.weight.min(1.0);
+                        old.iter()
+                            .zip(&now)
+                            .map(|((s0, r0, p0), (s1, r1, p1))| (s0.lerp(*s1, t), r0.slerp(*r1, t), p0.lerp(*p1, t)))
+                            .collect()
+                    }
+                };
+                mixed.into_iter().map(|(s, r, p)| Mat4::from_scale_rotation_translation(s, r, p)).collect()
+            }
+        };
         let mut globals: Vec<Mat4> = Vec::with_capacity(locals.len());
         for (i, node) in self.nodes.iter().enumerate() {
             let global = match node.parent {
@@ -709,13 +747,30 @@ mod tests {
     }
 
     #[test]
+    fn changing_clips_cross_fades() {
+        let model = load_geometry(&sample("emberlash_duelist.gltf")).unwrap();
+        let rig = model.rig.as_ref().unwrap();
+        let (attack, idle) = (rig.clip("attack").unwrap(), rig.clip("idle").unwrap());
+        let t = rig.clips[attack].duration * 0.5;
+        let verts = |pose: Pose| -> Vec<Vec3> { model.posed(Some(pose)).into_iter().flatten().map(|v| v.0).collect() };
+        let swing = verts(Pose::new(attack, t, false));
+        let rest = verts(Pose::new(idle, 0.0, true));
+        let fading = |weight| Pose { blend: Some(Blend { clip: attack, time: t, looped: false, weight }), ..Pose::new(idle, 0.0, true) };
+        let close = |a: &[Vec3], b: &[Vec3]| a.iter().zip(b).all(|(x, y)| x.distance(*y) < 1e-3);
+        assert!(close(&verts(fading(1.0)), &swing), "all of the old pose");
+        assert!(close(&verts(fading(0.0)), &rest), "all of the new pose");
+        let half = verts(fading(0.5));
+        assert!(!close(&half, &swing) && !close(&half, &rest), "in between");
+    }
+
+    #[test]
     fn a_clip_moves_the_vertices_its_bones_own() {
         let model = load_geometry(&sample("emberlash_duelist.gltf")).unwrap();
         let rig = model.rig.as_ref().unwrap();
         let attack = rig.clip("attack").unwrap();
         let rest: Vec<Vec3> = model.posed(None).into_iter().flatten().map(|v| v.0).collect();
         let at = |time: f32| -> Vec<Vec3> {
-            model.posed(Some(Pose { clip: attack, time, looped: false })).into_iter().flatten().map(|v| v.0).collect()
+            model.posed(Some(Pose::new(attack, time, false))).into_iter().flatten().map(|v| v.0).collect()
         };
         let mid = at(rig.clips[attack].duration * 0.5);
         let moved = rest.iter().zip(&mid).filter(|(a, b)| a.distance(**b) > 0.05).count();
@@ -725,11 +780,11 @@ mod tests {
         let end = at(rig.clips[attack].duration);
         assert!(end.iter().zip(&at(99.0)).all(|(a, b)| a.distance(*b) < 1e-4));
         let looped = |time: f32| -> Vec<Vec3> {
-            model.posed(Some(Pose { clip: attack, time, looped: true })).into_iter().flatten().map(|v| v.0).collect()
+            model.posed(Some(Pose::new(attack, time, true))).into_iter().flatten().map(|v| v.0).collect()
         };
         let d = rig.clips[attack].duration;
         assert!(looped(d * 0.5).iter().zip(&looped(d * 1.5)).all(|(a, b)| a.distance(*b) < 1e-3));
         // Normals stay unit length through skinning.
-        assert!(model.posed(Some(Pose { clip: attack, time: 0.1, looped: false })).iter().flatten().all(|v| (v.1.length() - 1.0).abs() < 1e-3));
+        assert!(model.posed(Some(Pose::new(attack, 0.1, false))).iter().flatten().all(|v| (v.1.length() - 1.0).abs() < 1e-3));
     }
 }

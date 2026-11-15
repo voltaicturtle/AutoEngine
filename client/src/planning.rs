@@ -89,14 +89,18 @@ pub(crate) fn draw_planning(app: &mut App, layout: &Layout) {
 
     // Item inventory.
     let mut pressed_item = None;
+    let mut hovered_item = None;
     for (i, item) in player.items.iter().enumerate().take(12) {
         let r = layout.item_slot(i);
         if dragged == Some(Drag::Item(i)) {
             continue;
         }
         draw_item(app, item, r);
-        if r.contains(mouse) && is_mouse_button_pressed(MouseButton::Left) {
-            pressed_item = Some(i);
+        if r.contains(mouse) {
+            hovered_item = Some(item.clone());
+            if is_mouse_button_pressed(MouseButton::Left) {
+                pressed_item = Some(i);
+            }
         }
     }
     if !player.items.is_empty() {
@@ -104,6 +108,9 @@ pub(crate) fn draw_planning(app: &mut App, layout: &Layout) {
     }
 
     if own {
+        if let Some(unit) = hovered.as_ref().filter(|_| app.pressed(Action::Sell) && app.drag.is_none()) {
+            app.command(Command::SellUnit { uid: unit.uid });
+        }
         if let Some(uid) = pressed_unit {
             app.drag = Some(Drag::Unit(uid));
         } else if let Some(i) = pressed_item {
@@ -131,6 +138,8 @@ pub(crate) fn draw_planning(app: &mut App, layout: &Layout) {
         None => {
             if let Some(unit) = hovered {
                 draw_unit_tooltip(app, &unit, mouse);
+            } else if let Some(item) = hovered_item {
+                draw_item_tooltip(app, &item, mouse);
             }
         }
     }
@@ -151,29 +160,96 @@ pub(crate) fn draw_item(app: &App, item: &str, r: Rect) {
     text_centered(&initials, r.x + r.w / 2.0, r.y + r.h / 2.0 + 6.0, 18.0, WHITE);
 }
 
-pub(crate) fn draw_unit_tooltip(app: &App, unit: &OwnedUnit, at: Vec2) {
-    let Some(content) = &app.net.state.content else { return };
-    let Some(def) = content.unit(&unit.unit) else { return };
-    let mut lines = vec![format!("{}  ({} star, cost {})", def.name, unit.star, def.cost)];
-    let traits: Vec<String> = def.traits.iter().map(|t| app.net.state.display_name(t)).collect();
-    if !traits.is_empty() {
-        lines.push(traits.join(", "));
+/// Splits text into lines no wider than `width` at `size`.
+fn wrap(text: &str, width: f32, size: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
+        if theme::text_width(&candidate, size) > width && !line.is_empty() {
+            lines.push(std::mem::replace(&mut line, word.to_string()));
+        } else {
+            line = candidate;
+        }
     }
-    if let Some(a) = &def.ability {
-        lines.push(format!("Ability: {}", a.name));
+    if !line.is_empty() {
+        lines.push(line);
     }
-    for item in &unit.items {
-        lines.push(format!("Item: {}", app.net.state.display_name(item)));
+    lines
+}
+
+/// A box of text near the mouse: a title, then lines (long ones wrapped).
+fn draw_tooltip(title: &str, lines: &[(String, Color)], at: Vec2) {
+    const SIZE: f32 = 17.0;
+    const MAX: f32 = 320.0;
+    let mut rows: Vec<(String, Color)> = vec![(title.to_string(), ui().text)];
+    for (text, color) in lines {
+        rows.extend(wrap(text, MAX, SIZE).into_iter().map(|l| (l, *color)));
     }
-    let width = lines.iter().map(|l| theme::text_width(l, 17.0)).fold(0.0, f32::max) + 20.0;
-    let height = lines.len() as f32 * 20.0 + 12.0;
+    let width = rows.iter().map(|(l, _)| theme::text_width(l, SIZE)).fold(0.0, f32::max) + 20.0;
+    let height = rows.len() as f32 * 20.0 + 12.0;
     let x = (at.x + 16.0).min(screen_width() - width - 4.0);
     let y = (at.y + 16.0).min(screen_height() - height - 4.0);
     draw_rectangle(x, y, width, height, Color::new(0.05, 0.06, 0.08, 0.95));
     draw_rectangle_lines(x, y, width, height, 1.0, ui().muted);
-    for (i, line) in lines.iter().enumerate() {
-        label(line, x + 10.0, y + 22.0 + i as f32 * 20.0, 17.0, if i == 0 { ui().text } else { ui().muted });
+    for (i, (line, color)) in rows.iter().enumerate() {
+        label(line, x + 10.0, y + 22.0 + i as f32 * 20.0, SIZE, *color);
     }
+}
+
+pub(crate) fn draw_unit_tooltip(app: &App, unit: &OwnedUnit, at: Vec2) {
+    let state = &app.net.state;
+    let Some(content) = &state.content else { return };
+    let Some(def) = content.unit(&unit.unit) else { return };
+    let language = state.language.as_deref();
+    let title = format!("{}  ({} star, cost {})", state.display_name(&def.id), unit.star, def.cost);
+    let mut lines = Vec::new();
+    let traits: Vec<String> = def.traits.iter().map(|t| state.display_name(t)).collect();
+    if !traits.is_empty() {
+        lines.push((traits.join(", "), ui().muted));
+    }
+    if def.ability.is_some() {
+        let name = content.text(language, "unit", &def.id, "ability").unwrap_or_default();
+        let mana = def.stats.get(&autoengine::stats::Stat::MaxMana).copied().unwrap_or(0);
+        lines.push((if mana > 0 { format!("{name} ({mana} mana)") } else { name }, ui().gold));
+        let description = content.text(language, "unit", &def.id, "ability_description").unwrap_or_default();
+        if !description.is_empty() {
+            lines.push((description, ui().muted));
+        }
+    }
+    for item in &unit.items {
+        lines.push((format!("Item: {}", state.display_name(item)), ui().muted));
+    }
+    draw_tooltip(&title, &lines, at);
+}
+
+/// What an item does, for the mouse hovering it.
+pub(crate) fn draw_item_tooltip(app: &App, item: &str, at: Vec2) {
+    let state = &app.net.state;
+    let Some(content) = &state.content else { return };
+    let Some(def) = content.item(item) else { return };
+    let mut lines = Vec::new();
+    let description = state.description("item", item);
+    if !description.is_empty() {
+        lines.push((description, ui().muted));
+    }
+    for m in &def.mods {
+        let amount = if m.permille != 0 { format!("{:+}%", m.permille / 10) } else { format!("{:+}", m.flat) };
+        lines.push((format!("{amount} {:?}", m.stat), ui().good));
+    }
+    if let Some((a, b)) = &def.recipe {
+        lines.push((format!("Made from {} and {}", state.display_name(a), state.display_name(b)), ui().muted));
+    }
+    // A component: what it makes with each other component.
+    for result in content.items().filter(|i| i.recipe.as_ref().is_some_and(|(a, b)| a == item || b == item)) {
+        let (a, b) = result.recipe.as_ref().unwrap();
+        let other = if a == item { b } else { a };
+        lines.push((format!("+ {} = {}", state.display_name(other), state.display_name(&result.id)), ui().gold));
+    }
+    if def.consumable.is_some() {
+        lines.push(("Used up when given to a unit".into(), ui().gold));
+    }
+    draw_tooltip(&state.display_name(item), &lines, at);
 }
 
 pub(crate) fn draw_shop(app: &mut App, layout: &Layout, player: &Player) {
@@ -197,30 +273,47 @@ pub(crate) fn draw_shop(app: &mut App, layout: &Layout, player: &Player) {
         } else {
             draw_unit_token(vec2(r.x + 28.0, r.y + 38.0), 18.0, &def.name, 1, 0, true, None);
         }
-        label(&def.name, r.x + 8.0, r.y + 76.0, 16.0, if affordable { ui().text } else { ui().muted });
+        label(&app.net.state.display_name(&def.id), r.x + 8.0, r.y + 76.0, 16.0, if affordable { ui().text } else { ui().muted });
         let traits: Vec<String> = def.traits.iter().map(|t| app.net.state.display_name(t)).collect();
         label(&traits.join(", "), r.x + 8.0, r.y + 94.0, 14.0, ui().muted);
         label(&format!("{}g", def.cost), r.x + r.w - 30.0, r.y + 42.0, 20.0, ui().gold);
+        // Copies still in the pool, besides this one.
+        if let Some(left) = app.net.state.view.as_ref().and_then(|v| v.pool.get(&def.id)) {
+            label(&format!("{left} left"), r.x + r.w - 50.0, r.y + 62.0, 13.0, ui().muted);
+        }
         if hover && is_mouse_button_pressed(MouseButton::Left) {
             buy = Some(i);
         }
     }
     let b = layout.buttons();
-    let reroll = button(&format!("Reroll ({}g)", economy.reroll_cost), b.x, b.y, b.w, 30.0, player.gold >= economy.reroll_cost);
-    let xp = button(&format!("Buy XP ({}g)", economy.xp_cost), b.x, b.y + 36.0, b.w, 30.0, player.gold >= economy.xp_cost);
-    let ready = button(if player.ready { "Ready!" } else { "Ready" }, b.x, b.y + 72.0, b.w, 34.0, !player.ready);
+    // Four buttons share the height next to the shop.
+    let gap = 4.0;
+    let h = ((b.h - 3.0 * gap) / 4.0).clamp(20.0, 34.0);
+    let row = |i: f32| b.y + i * (h + gap);
+    let can_reroll = player.free_rerolls > 0 || player.gold >= economy.reroll_cost;
+    let reroll_text = match player.free_rerolls {
+        0 => format!("Reroll ({}g)", economy.reroll_cost),
+        n => format!("Reroll ({n} free)"),
+    };
+    let reroll = button(&reroll_text, b.x, row(0.0), b.w, h, can_reroll);
+    let xp = button(&format!("Buy XP ({}g)", economy.xp_cost), b.x, row(1.0), b.w, h, player.gold >= economy.xp_cost);
+    let ready = button(if player.ready { "Ready!" } else { "Ready" }, b.x, row(2.0), b.w, h, !player.ready);
+    let lock = button(if player.shop_locked { "Shop locked" } else { "Lock shop" }, b.x, row(3.0), b.w, h, true);
     if let Some(slot) = buy {
         app.command(Command::BuyUnit { slot });
         app.play(Sfx::Buy);
     }
-    if reroll {
+    if reroll || (app.pressed(Action::Reroll) && can_reroll) {
         app.command(Command::Reroll);
     }
-    if xp {
+    if xp || (app.pressed(Action::BuyXp) && player.gold >= economy.xp_cost) {
         app.command(Command::BuyXp);
     }
-    if ready {
+    if ready || (app.pressed(Action::Ready) && !player.ready) {
         app.command(Command::Ready);
+    }
+    if lock || app.pressed(Action::LockShop) {
+        app.command(Command::SetShopLock { locked: !player.shop_locked });
     }
 }
 
@@ -281,7 +374,8 @@ pub(crate) fn draw_choice(app: &mut App, layout: &Layout) {
     let total_w = per_row * cw + (per_row - 1.0) * gap;
     let x0 = layout.board_mid_x - total_w / 2.0;
     let y0 = layout.view.area.y + 70.0;
-    draw_rectangle(x0 - 16.0, y0 - 44.0, total_w + 32.0, rows * (ch + gap) + 56.0, Color::new(0.04, 0.05, 0.07, 0.94));
+    let extra = if my_turn && view.status_of(me).is_some_and(|s| s.rerolls_left > 0) { 42.0 } else { 0.0 };
+    draw_rectangle(x0 - 16.0, y0 - 44.0, total_w + 32.0, rows * (ch + gap) + 56.0 + extra, Color::new(0.04, 0.05, 0.07, 0.94));
     text_centered(&title, layout.board_mid_x, y0 - 14.0, 24.0, if my_turn { ui().gold } else { ui().muted });
     let (mx, my) = mouse_position();
     let mut pick = None;
@@ -311,6 +405,14 @@ pub(crate) fn draw_choice(app: &mut App, layout: &Layout) {
         }
         if hover && is_mouse_button_pressed(MouseButton::Left) {
             pick = Some(i);
+        }
+    }
+    // A reroll button under the options while the round allows one.
+    let rerolls = view.status_of(me).map_or(0, |s| s.rerolls_left);
+    if my_turn && rerolls > 0 {
+        let by = y0 + rows * (ch + gap) + 4.0;
+        if button(&format!("Reroll ({rerolls})"), layout.board_mid_x - 70.0, by, 140.0, 32.0, true) {
+            app.command(Command::RerollPick);
         }
     }
     if let Some(option) = pick {

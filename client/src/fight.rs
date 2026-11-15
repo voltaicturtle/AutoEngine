@@ -16,11 +16,49 @@ pub(crate) struct Show {
     pub(crate) fx_seen_ms: u32,
     /// Whether the result has been announced with a sound.
     pub(crate) announced: bool,
+    /// Each unit's last pose, and the pose it is fading out of with when
+    /// the change began (replay seconds), so clips cross-fade.
+    pub(crate) anim: HashMap<UnitId, AnimState>,
+}
+
+/// A unit's last pose, and the pose it is fading out of with when that began.
+pub(crate) type AnimState = (Pose, Option<(Pose, f32)>);
+
+/// How long a change of animation clip takes to fade in, in seconds.
+const BLEND_SECONDS: f32 = 0.15;
+
+/// Fades from a unit's previous clip into `pose` when the clip changes.
+fn blended(anim: &mut HashMap<UnitId, AnimState>, id: UnitId, pose: Option<Pose>, now: f32) -> Option<Pose> {
+    let mut pose = pose?;
+    let entry = anim.entry(id).or_insert((pose, None));
+    if entry.0.clip != pose.clip {
+        entry.1 = Some((entry.0, now));
+    }
+    entry.0 = pose;
+    if let Some((from, at)) = entry.1 {
+        let weight = 1.0 - (now - at) / BLEND_SECONDS;
+        if weight > 0.0 {
+            pose.blend = Some(model::Blend { clip: from.clip, time: from.time, looped: from.looped, weight });
+        } else {
+            entry.1 = None;
+        }
+    }
+    Some(pose)
 }
 
 impl Show {
     pub(crate) fn new(playback: Playback, flipped: bool, title: String) -> Self {
-        Show { playback, flipped, time_ms: 0.0, title, done_for_ms: 0.0, facing: HashMap::new(), fx_seen_ms: 0, announced: false }
+        Show {
+            playback,
+            flipped,
+            time_ms: 0.0,
+            title,
+            done_for_ms: 0.0,
+            facing: HashMap::new(),
+            fx_seen_ms: 0,
+            announced: false,
+            anim: HashMap::new(),
+        }
     }
 }
 
@@ -186,6 +224,7 @@ pub(crate) fn draw_replay(app: &mut App, layout: &Layout) {
                     app.particles.burst(at + chest * 0.6, app.theme.effects.death);
                 }
             }
+            Flash::Miss { .. } => {}
         }
     }
     if show.playback.is_finished() && !show.announced {
@@ -247,6 +286,7 @@ pub(crate) fn draw_replay(app: &mut App, layout: &Layout) {
         } else {
             look.pose("idle", seconds + u.id.0 as f32 * 0.37, true)
         };
+        let pose = blended(&mut show.anim, u.id, pose, seconds);
         app.draw_model(&look, at, yaw, look.scale, tint, hit.get(&u.id).copied().unwrap_or(0.0), pose);
     }
     app.particles.draw(&view.camera);
@@ -264,8 +304,9 @@ pub(crate) fn draw_replay(app: &mut App, layout: &Layout) {
         let Some((head, _, size)) = head_of(&show.playback, u.id) else { continue };
         let full = u.max_health.max(1) as f32;
         draw_health_bar(head, (size * 1.1).clamp(28.0, 70.0), u.health as f32 / full, u.shield as f32 / full, u.team.0 == my_team);
-        if u.stunned_until_ms > now {
-            text_centered("stun", head.x, head.y - 8.0, 14.0, ui().gold);
+        let statuses = u.statuses_at(now);
+        if !statuses.is_empty() {
+            text_centered(&statuses.join(" "), head.x, head.y - 8.0, 14.0, ui().gold);
         }
     }
 
@@ -302,6 +343,12 @@ pub(crate) fn draw_replay(app: &mut App, layout: &Layout) {
                     text_centered(&format!("+{amount}"), p.x, p.y - age * 0.03, 17.0, Color::new(0.4, 1.0, 0.5, alpha));
                 }
             }
+            Flash::Miss { target } => {
+                if let Some((p, _, _)) = head_of(&show.playback, *target) {
+                    let alpha = (1.0 - age / 900.0).max(0.0);
+                    text_centered("miss", p.x, p.y - 12.0 - age * 0.03, 16.0, Color::new(0.85, 0.85, 0.85, alpha));
+                }
+            }
             Flash::Death { unit } if age < 500.0 => {
                 if let Some(at) = world_of(&show.playback, *unit) {
                     let p = view.project(at + vec3(0.0, 0.4, 0.0));
@@ -326,8 +373,41 @@ pub(crate) fn draw_replay(app: &mut App, layout: &Layout) {
             None => "Draw".to_string(),
         };
         text_centered(&result, layout.board_mid_x, footer_y, 36.0, ui().gold);
+        draw_damage_meter(&show.playback, layout, my_team);
+    } else if show.playback.in_overtime() {
+        text_centered(&format!("OVERTIME  {secs:.1}s"), layout.board_mid_x, footer_y, 22.0, ui().bad);
     } else {
         text_centered(&format!("{secs:.1}s   (Space to skip)"), layout.board_mid_x, footer_y, 18.0, ui().muted);
     }
     app.show = Some(show);
+}
+
+/// After a fight: how much damage each of the viewer's units dealt, as bars,
+/// with healing and shielding beside it.
+fn draw_damage_meter(playback: &autoengine::playback::Playback, layout: &Layout, my_team: u8) {
+    let stats: Vec<_> = playback.stats().into_iter().filter(|s| s.team.0 == my_team).collect();
+    if stats.is_empty() {
+        return;
+    }
+    let mut rows = stats;
+    rows.sort_by_key(|s| std::cmp::Reverse(s.damage_dealt));
+    rows.truncate(10);
+    let most = rows.iter().map(|s| s.damage_dealt.max(s.healing_done + s.shielding_done)).max().unwrap_or(1).max(1) as f32;
+    let area = layout.view.area;
+    let (w, row_h) = (260.0, 22.0);
+    let (x, y) = (area.x + 10.0, area.y + 44.0);
+    draw_rectangle(x, y, w, 30.0 + rows.len() as f32 * row_h, Color::new(0.0, 0.0, 0.0, 0.6));
+    label("Damage", x + 8.0, y + 20.0, 16.0, ui().text);
+    label("heal/shield", x + w - 82.0, y + 20.0, 13.0, ui().muted);
+    for (i, s) in rows.iter().enumerate() {
+        let ry = y + 28.0 + i as f32 * row_h;
+        let bar = (w - 90.0) * s.damage_dealt as f32 / most;
+        draw_rectangle(x + 8.0, ry + 2.0, bar, row_h - 6.0, Color::new(0.85, 0.45, 0.25, 0.55));
+        let name = if s.survived { s.name.clone() } else { format!("{} (fell)", s.name) };
+        label(&format!("{name}  {}", s.damage_dealt), x + 12.0, ry + 14.0, 13.0, ui().text);
+        let support = s.healing_done + s.shielding_done;
+        if support > 0 {
+            label(&support.to_string(), x + w - 70.0, ry + 14.0, 13.0, ui().good);
+        }
+    }
 }

@@ -10,7 +10,7 @@ font) is code: `Theme::default()` in `client/src/theme.rs`.
 | `Theme::default()` in `client/src/theme.rs` | Interface and board colours, the scene light, every particle effect, the font file |
 | `models/` | Unit models, in any format Assimp reads |
 | `icons/<item id>.png` | Item icons (items without one get a lettered badge) |
-| `sounds/<name>.wav` or `.ogg` | Replaces a built-in sound: `hit`, `cast`, `heal`, `death`, `buy`, `victory`, `defeat` |
+| `sounds/<name>.wav` or `.ogg` | Replaces a built-in sound: `hit`, `cast`, `heal`, `death`, `buy`, `victory`, `defeat`, `tick` (the last five seconds of planning) |
 
 ## Asset viewer
 
@@ -25,7 +25,7 @@ The model reloads when its file is saved.
 
 ## Keys
 
-Keys are set in the client's settings file (`autoengine-client.json`):
+Keys are set in the client's settings file (`autoengine/client.json` in the system's settings folder; see `docs/client.md`):
 
 ```json
 "keys": { "console": "Tab", "skip": "Enter" }

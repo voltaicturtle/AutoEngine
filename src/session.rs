@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use crate::bot;
 use crate::content::ContentSet;
-use crate::game::{CombatRecord, Game, Opponent, PlayerId};
+use crate::game::{CombatRecord, Game, Grant, Opponent, PlayerId};
+use crate::matchlog::{MatchLog, MatchLogError};
 use crate::replay::ReplayFile;
 use crate::protocol::DevCommand;
 use crate::protocol::{
@@ -32,6 +33,27 @@ fn may_see(role: Role, record: &CombatRecord) -> bool {
             record.home == me || record.away == Opponent::Player(me)
         }
     }
+}
+
+/// What [`Session::record_to`] saves: the match, and the seat tokens so
+/// its players can take their seats back after [`Session::resume`].
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SavedMatch {
+    pub log: MatchLog,
+    pub tokens: Vec<Option<String>>,
+}
+
+/// 64 bits the outside world cannot guess, for seat tokens: the standard
+/// library seeds every `RandomState` from the operating system, so hashing
+/// with a fresh one yields OS randomness. The clock and process id are mixed
+/// in as well.
+fn os_entropy() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    hasher.write_u128(nanos);
+    hasher.write_u32(std::process::id());
+    hasher.finish()
 }
 
 /// Something to run on a game when it starts.
@@ -107,9 +129,147 @@ pub struct Session {
     /// [`ClientMsg::ResendCombat`], and that round's number.
     shown: (u32, Vec<CombatRecord>),
     outbox: Vec<(ConnId, ServerMsg)>,
+    /// Whether chat is passed on; see [`Session::allow_chat`].
+    chat: bool,
+    /// How far behind spectators see the game; see [`Session::set_spectator_delay`].
+    spectator_delay_ms: u64,
+    /// Game messages held back for spectators: when to send, to whom, what.
+    delayed: std::collections::VecDeque<(u64, ConnId, ServerMsg)>,
+    /// The time last given by the transport.
+    now: u64,
+    /// Connections to close, for [`Session::take_closed`].
+    closing: Vec<ConnId>,
+    /// When the host paused the game, if it is paused.
+    paused_at: Option<u64>,
+    /// Names kicked from this game, which may not take a seat again.
+    kicked: std::collections::BTreeSet<String>,
+    bot_difficulty: bot::Difficulty,
+    /// The last few chat messages, for people who join later.
+    chat_history: std::collections::VecDeque<ServerMsg>,
+    /// When each connection last chatted, recent ones only, for the limit.
+    chat_times: BTreeMap<ConnId, std::collections::VecDeque<u64>>,
+    /// Rewrites or blocks chat lines; see [`Session::set_chat_filter`].
+    chat_filter: Option<ChatFilter>,
 }
 
+/// Chat messages kept for people who join later.
+const CHAT_HISTORY: usize = 20;
+
+/// At most this many chat lines from one connection...
+const CHAT_BURST: usize = 5;
+/// ...in this many milliseconds.
+const CHAT_WINDOW_MS: u64 = 10_000;
+
+/// See [`Session::set_chat_filter`].
+type ChatFilter = Box<dyn Fn(&str) -> Option<String> + Send>;
+
 impl Session {
+    /// How well the bots in this game play, including those keeping the
+    /// seat of someone who left. Normal by default.
+    pub fn set_bot_difficulty(&mut self, difficulty: bot::Difficulty) {
+        self.bot_difficulty = difficulty;
+    }
+
+    /// Removes whoever holds a seat, by name: they are told why and
+    /// disconnected, a bot plays the seat from then on, and they cannot
+    /// take it back. Before the game starts the seat opens again instead.
+    /// Returns whether anyone had that name.
+    pub fn kick(&mut self, name: &str, now: u64) -> bool {
+        let Some(seat) = self.seats.iter().position(|s| s.name.as_deref() == Some(name)) else { return false };
+        self.kicked.insert(name.to_string());
+        if let Some(conn) = self.seats[seat].conn {
+            self.send(conn, ServerMsg::Error { message: "you were removed from the game by the host".into() });
+            self.closing.push(conn);
+            self.disconnect(conn, now);
+        }
+        if self.has_started() {
+            self.seats[seat].token = None;
+        } else {
+            self.seats[seat] = Seat::default();
+            self.send_lobby();
+        }
+        true
+    }
+
+    /// Stops the clock: no round ends and no fight is cut short until
+    /// [`Session::unpause`]. Players can still shop and arrange. Returns
+    /// whether it paused (not before the start, after the end, or twice).
+    pub fn pause(&mut self, now: u64) -> bool {
+        if self.paused_at.is_some() || !matches!(self.phase, Phase::Planning { .. } | Phase::Showing { .. }) {
+            return false;
+        }
+        self.now = self.now.max(now);
+        self.paused_at = Some(now);
+        self.announce("the host has paused the game");
+        self.broadcast(now);
+        true
+    }
+
+    /// Starts the clock again where it stopped.
+    pub fn unpause(&mut self, now: u64) -> bool {
+        let Some(at) = self.paused_at.take() else { return false };
+        self.now = self.now.max(now);
+        let gap = now.saturating_sub(at);
+        match &mut self.phase {
+            Phase::Planning { deadline } => *deadline += gap,
+            Phase::Showing { until } => *until += gap,
+            _ => {}
+        }
+        self.announce("the game continues");
+        self.broadcast(now);
+        if matches!(self.phase, Phase::Planning { .. }) && self.game.as_ref().is_some_and(Game::all_ready) {
+            self.resolve(now);
+        }
+        true
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused_at.is_some()
+    }
+
+    /// Connections the session wants closed; see [`crate::net::Host::take_closed`].
+    pub fn take_closed(&mut self) -> Vec<ConnId> {
+        std::mem::take(&mut self.closing)
+    }
+
+    /// Shows spectators the game this many milliseconds late, so nobody
+    /// watching can tell a player what their opponents are doing. Chat and
+    /// the lobby are not delayed. Off (0) by default.
+    pub fn set_spectator_delay(&mut self, ms: u64) {
+        self.spectator_delay_ms = ms;
+    }
+
+    /// Turns chat on or off; it is on by default.
+    pub fn allow_chat(&mut self, allow: bool) {
+        self.chat = allow;
+    }
+
+    /// Passes every chat line through `filter` before anyone sees it: it
+    /// returns the line to show (changed or not), or `None` to drop it.
+    /// For word filters and the like. Lines from the server itself are not
+    /// filtered.
+    pub fn set_chat_filter(&mut self, filter: impl Fn(&str) -> Option<String> + Send + 'static) {
+        self.chat_filter = Some(Box::new(filter));
+    }
+
+    /// Sends a chat message to everyone from the server itself, such as an
+    /// announcement from whoever runs it.
+    pub fn announce(&mut self, text: &str) {
+        if let Some(text) = crate::protocol::clean_chat(text) {
+            self.post_chat(ServerMsg::Chat { from: "server".into(), seat: None, text });
+        }
+    }
+
+    fn post_chat(&mut self, message: ServerMsg) {
+        for conn in self.conns.keys().copied().collect::<Vec<_>>() {
+            self.send(conn, message.clone());
+        }
+        self.chat_history.push_back(message);
+        if self.chat_history.len() > CHAT_HISTORY {
+            self.chat_history.pop_front();
+        }
+    }
+
     /// Lets players use [`DevCommand`] cheats. For development only.
     pub fn allow_dev(&mut self, allow: bool) {
         self.dev = allow;
@@ -126,23 +286,17 @@ impl Session {
         }
         let id = PlayerId(seat as u8);
         let game = self.game.as_mut().expect("a started session has a game");
-        let known = match &command {
-            DevCommand::Unit(unit) => game.content().unit(unit).is_some(),
-            DevCommand::Item(item) => game.content().item(item).is_some(),
-            DevCommand::Augment(augment) => game.content().augment(augment).is_some(),
-            _ => true,
-        };
-        if !known {
-            return error(self, "there is nothing with that id");
-        }
-        match command {
-            DevCommand::Gold(n) => game.add_gold(id, n),
-            DevCommand::Xp(n) => game.add_xp(id, n),
-            DevCommand::Unit(unit) => game.add_unit(id, &unit, Vec::new()),
-            DevCommand::Item(item) => game.give_item(id, &item),
-            DevCommand::Augment(augment) => game.give_augment(id, &augment),
-            DevCommand::Hurt(n) => game.damage_player(id, n.max(0)),
+        let grant = match command {
+            DevCommand::Gold(n) => Grant::Gold(n),
+            DevCommand::Xp(n) => Grant::Xp(n),
+            DevCommand::Unit(unit) => Grant::Unit(unit),
+            DevCommand::Item(item) => Grant::Item(item),
+            DevCommand::Augment(augment) => Grant::Augment(augment),
+            DevCommand::Hurt(n) => Grant::Damage(n),
             DevCommand::Skip => return self.resolve(now),
+        };
+        if game.grant(id, grant).is_err() {
+            return error(self, "there is nothing with that id");
         }
         self.broadcast(now);
     }
@@ -155,9 +309,80 @@ impl Session {
         self.setup = Some(Box::new(setup));
     }
 
-    /// Saves every fight from now on as a replay file in `dir`.
+    /// Saves every fight from now on as a replay file in `dir`, and the
+    /// whole match so far as `match.json` after every change of round, so
+    /// a server that stops can [`Session::resume`] from it.
     pub fn record_to(&mut self, dir: impl Into<std::path::PathBuf>) {
         self.record_dir = Some(dir.into());
+    }
+
+    /// Where [`Session::record_to`] keeps the match in `dir`.
+    pub fn match_file(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("match.json")
+    }
+
+    fn save_match(&self) {
+        let (Some(dir), Some(game)) = (&self.record_dir, &self.game) else { return };
+        let saved = SavedMatch {
+            log: MatchLog::of(game),
+            tokens: self.seats.iter().map(|s| s.token.clone()).collect(),
+        };
+        let path = Self::match_file(dir);
+        let result = std::fs::create_dir_all(dir).and_then(|_| {
+            let json = serde_json::to_string(&saved).map_err(std::io::Error::other)?;
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, json)?;
+            std::fs::rename(tmp, &path)
+        });
+        if let Err(e) = result {
+            eprintln!("could not save the match to {}: {e}", path.display());
+        }
+    }
+
+    /// Loads what [`Session::record_to`] saved in `dir`.
+    pub fn load_match(dir: &std::path::Path) -> Result<SavedMatch, String> {
+        let path = Self::match_file(dir);
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Picks up a saved match instead of waiting in the lobby: the game is
+    /// replayed to where it was (running the [`Session::on_start`] setup
+    /// first), and its players can join again under their names with the
+    /// tokens they were given. Until they do, their seats wait; seats that
+    /// were bots stay bots. Call before anyone connects.
+    pub fn resume(&mut self, saved: SavedMatch, now: u64) -> Result<(), MatchLogError> {
+        assert!(!self.has_started(), "resume a session before it starts");
+        let mut setup = self.setup.take();
+        let game = saved.log.replay(self.content.clone(), |g| {
+            if let Some(setup) = &mut setup {
+                setup(g);
+            }
+        });
+        self.setup = setup;
+        let game = game?;
+        self.seats = saved
+            .log
+            .names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| Seat {
+                name: Some(name.clone()),
+                conn: None,
+                token: saved.tokens.get(i).cloned().flatten(),
+            })
+            .collect();
+        self.config.seats = self.seats.len();
+        self.phase = if game.is_over() {
+            Phase::Over
+        } else if game.in_round() {
+            Phase::Planning { deadline: now + self.planning_ms(&game) }
+        } else {
+            Phase::Showing { until: now }
+        };
+        self.events_sent = game.events().len();
+        self.game = Some(game);
+        Ok(())
     }
 
     pub fn new(content: impl Into<Arc<ContentSet>>, config: SessionConfig) -> Self {
@@ -172,24 +397,60 @@ impl Session {
             setup: None,
             phase: Phase::Lobby,
             bot_rng: Rng::new(config.seed ^ 0xB075),
-            token_rng: Rng::new(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0)
-                    ^ (std::process::id() as u64) << 32,
-            ),
+            token_rng: Rng::new(os_entropy()),
             events_sent: 0,
             views: BTreeMap::new(),
             full_fights: Default::default(),
             shown: (0, Vec::new()),
             outbox: Vec::new(),
+            chat: true,
+            spectator_delay_ms: 0,
+            delayed: Default::default(),
+            now: 0,
+            closing: Vec::new(),
+            paused_at: None,
+            kicked: Default::default(),
+            bot_difficulty: bot::Difficulty::Normal,
+            chat_history: Default::default(),
+            chat_times: BTreeMap::new(),
+            chat_filter: None,
             config,
         }
     }
 
     pub fn game(&self) -> Option<&Game> {
         self.game.as_ref()
+    }
+
+    /// Names in each seat; `None` for open seats.
+    pub fn seat_names(&self) -> Vec<Option<String>> {
+        self.seats.iter().map(|s| s.name.clone()).collect()
+    }
+
+    /// Seats held by a connected person.
+    pub fn players_connected(&self) -> usize {
+        self.seats.iter().filter(|s| s.conn.is_some()).count()
+    }
+
+    /// Connections, players and spectators together.
+    pub fn connections(&self) -> usize {
+        self.conns.len()
+    }
+
+    /// Final places of the people (not bots) in a finished game, by name.
+    /// Empty until the game is over.
+    pub fn human_results(&self) -> Vec<(String, u32)> {
+        let Some(game) = self.game.as_ref().filter(|g| g.is_over()) else { return Vec::new() };
+        game.players()
+            .iter()
+            .filter(|p| self.seats[p.id.0 as usize].token.is_some())
+            .filter_map(|p| Some((p.name.clone(), p.placement?)))
+            .collect()
+    }
+
+    /// Whether someone joining now would get a seat.
+    pub fn has_open_seat(&self) -> bool {
+        !self.has_started() && self.seats.iter().any(|s| s.name.is_none())
     }
 
     pub fn is_over(&self) -> bool {
@@ -206,7 +467,39 @@ impl Session {
     }
 
     fn send(&mut self, conn: ConnId, message: ServerMsg) {
-        self.outbox.push((conn, message));
+        let game_news = matches!(
+            message,
+            ServerMsg::State(_)
+                | ServerMsg::Update(_)
+                | ServerMsg::Events(_)
+                | ServerMsg::Combat(_)
+                | ServerMsg::CombatSeed { .. }
+        );
+        if self.spectator_delay_ms > 0 && game_news && self.conns.get(&conn) == Some(&Role::Spectator) {
+            self.delayed.push_back((self.now + self.spectator_delay_ms, conn, message));
+        } else {
+            self.outbox.push((conn, message));
+        }
+    }
+
+    /// How long players get to plan the current round: the content's time
+    /// for its kind, or the server's.
+    fn planning_ms(&self, game: &Game) -> u64 {
+        let by_kind = &game.content().rules().planning_ms_by_kind;
+        by_kind.get(game.round_kind()).copied().unwrap_or(self.config.planning_ms)
+    }
+
+    /// Lets go of held-back spectator messages that are due.
+    fn release_delayed(&mut self) {
+        while let Some((at, _, _)) = self.delayed.front() {
+            if *at > self.now {
+                break;
+            }
+            let (_, conn, message) = self.delayed.pop_front().unwrap();
+            if self.conns.contains_key(&conn) {
+                self.outbox.push((conn, message));
+            }
+        }
     }
 
     fn seat_of(&self, conn: ConnId) -> Option<usize> {
@@ -224,6 +517,7 @@ impl Session {
 
     /// Handles a message from a connection.
     pub fn handle(&mut self, conn: ConnId, message: ClientMsg, now: u64) {
+        self.now = self.now.max(now);
         match message {
             ClientMsg::Join { name, version, token } => {
                 if !self.check_version(conn, version) {
@@ -235,6 +529,9 @@ impl Session {
                 let name = name.trim().chars().take(24).collect::<String>();
                 if name.is_empty() {
                     return self.send(conn, ServerMsg::Error { message: "a name is required".into() });
+                }
+                if self.kicked.contains(&name) {
+                    return self.send(conn, ServerMsg::Error { message: "you were removed from this game".into() });
                 }
                 // The seat this player left (name and token must match),
                 // else an open seat (only before the game starts), else watch.
@@ -295,7 +592,41 @@ impl Session {
                     None => self.send(conn, ServerMsg::Error { message: "that fight is no longer kept".into() }),
                 }
             }
+            ClientMsg::Chat { text } => {
+                let Some(role) = self.conns.get(&conn).copied() else {
+                    return self.send(conn, ServerMsg::Error { message: "join or spectate before chatting".into() });
+                };
+                if !self.chat {
+                    return self.send(conn, ServerMsg::Error { message: "chat is turned off in this game".into() });
+                }
+                let Some(text) = crate::protocol::clean_chat(&text) else { return };
+                let times = self.chat_times.entry(conn).or_default();
+                times.retain(|t| now.saturating_sub(*t) < CHAT_WINDOW_MS);
+                if times.len() >= CHAT_BURST {
+                    return self.send(conn, ServerMsg::Error { message: "you are sending chat too fast; wait a moment".into() });
+                }
+                times.push_back(now);
+                let text = match &self.chat_filter {
+                    Some(filter) => match filter(&text).and_then(|t| crate::protocol::clean_chat(&t)) {
+                        Some(text) => text,
+                        None => return,
+                    },
+                    None => text,
+                };
+                let (from, seat) = match role {
+                    Role::Seat(i) => (self.seats[i].name.clone().unwrap_or_default(), Some(PlayerId(i as u8))),
+                    Role::Spectator => ("spectator".to_string(), None),
+                };
+                self.post_chat(ServerMsg::Chat { from, seat, text });
+            }
             // The transport answers pings; nothing here depends on them.
+            ClientMsg::ListRooms
+            | ClientMsg::CreateRoom { .. }
+            | ClientMsg::EnterRoom { .. }
+            | ClientMsg::LeaveRoom
+            | ClientMsg::Standings => {
+                self.send(conn, ServerMsg::Error { message: "this server hosts a single game".into() });
+            }
             ClientMsg::Ping => self.send(conn, ServerMsg::Pong),
             ClientMsg::Pong => {}
             ClientMsg::Command(command) => {
@@ -310,7 +641,7 @@ impl Session {
                     Ok(()) => {
                         self.bot_picks();
                         self.broadcast(now);
-                        if self.game.as_ref().unwrap().all_ready() {
+                        if self.paused_at.is_none() && self.game.as_ref().unwrap().all_ready() {
                             self.resolve(now);
                         }
                     }
@@ -322,6 +653,9 @@ impl Session {
 
     /// Call when a connection closes.
     pub fn disconnect(&mut self, conn: ConnId, now: u64) {
+        self.now = self.now.max(now);
+        self.delayed.retain(|(_, c, _)| *c != conn);
+        self.chat_times.remove(&conn);
         self.views.remove(&conn);
         self.full_fights.remove(&conn);
         let Some(role) = self.conns.remove(&conn) else { return };
@@ -338,11 +672,11 @@ impl Session {
             let game = self.game.as_mut().unwrap();
             let id = PlayerId(seat as u8);
             if game.player(id).alive {
-                bot::play_turn(game, id, &mut self.bot_rng);
+                bot::play_turn_as(game, id, &mut self.bot_rng, self.bot_difficulty);
             }
             self.bot_picks();
             self.broadcast(now);
-            if self.game.as_ref().unwrap().all_ready() {
+            if self.paused_at.is_none() && self.game.as_ref().unwrap().all_ready() {
                 self.resolve(now);
             }
         }
@@ -350,6 +684,11 @@ impl Session {
 
     /// Advances timers. Call regularly with a monotonic time in milliseconds.
     pub fn tick(&mut self, now: u64) {
+        self.now = self.now.max(now);
+        self.release_delayed();
+        if self.paused_at.is_some() {
+            return;
+        }
         match self.phase {
             Phase::Planning { deadline } if now >= deadline => self.resolve(now),
             Phase::Showing { until } if now >= until => self.next_round(now),
@@ -380,6 +719,9 @@ impl Session {
         };
         let content = Box::new(ContentInfo::from_content(&self.content));
         self.send(conn, ServerMsg::Welcome { version: PROTOCOL_VERSION, seat, token, content });
+        for message in self.chat_history.clone() {
+            self.send(conn, message);
+        }
         self.send_lobby();
         if self.game.is_some() {
             let view = self.view(seat, now);
@@ -424,13 +766,15 @@ impl Session {
         }
         for id in game.alive() {
             if self.seats[id.0 as usize].conn.is_none() {
-                bot::play_turn(game, id, &mut self.bot_rng);
+                bot::play_turn_as(game, id, &mut self.bot_rng, self.bot_difficulty);
             }
         }
-        self.phase = Phase::Planning { deadline: now + self.config.planning_ms };
+        let planning = self.planning_ms(self.game.as_ref().unwrap());
+        self.phase = Phase::Planning { deadline: now + planning };
         self.bot_picks();
+        self.save_match();
         self.broadcast(now);
-        if self.game.as_ref().unwrap().all_ready() {
+        if self.paused_at.is_none() && self.game.as_ref().unwrap().all_ready() {
             self.resolve(now);
         }
     }
@@ -445,7 +789,7 @@ impl Session {
                 break;
             }
             for id in bots {
-                bot::make_pick(game, id, &mut self.bot_rng);
+                bot::make_pick_as(game, id, &mut self.bot_rng, self.bot_difficulty);
             }
         }
     }
@@ -512,6 +856,7 @@ impl Session {
             }
         }
         self.shown = (round, combats);
+        self.save_match();
         self.broadcast(now);
     }
 
@@ -545,6 +890,8 @@ impl Session {
 
     fn view(&self, viewer: Option<PlayerId>, now: u64) -> GameView {
         let game = self.game.as_ref().expect("a started session has a game");
+        // While paused, time stands still at the moment of pausing.
+        let now = self.paused_at.unwrap_or(now);
         let phase = match self.phase {
             Phase::Lobby => ViewPhase::Lobby,
             Phase::Planning { deadline } => ViewPhase::Planning { remaining_ms: deadline.saturating_sub(now) },
@@ -573,6 +920,8 @@ impl Session {
             awaiting: game.awaiting(),
             options: viewer.map(|id| game.options(id)).unwrap_or_default(),
             status: game.players().iter().map(|p| status(game, p.id)).collect(),
+            paused: self.paused_at.is_some(),
+            pool: game.pool().clone(),
         }
     }
 
@@ -593,5 +942,6 @@ fn status(game: &Game, id: PlayerId) -> PlayerStatus {
         // Content is checked when it is loaded, so this cannot fail for a
         // board the game itself built.
         traits: game.content().active_traits(&game.team_setup(id).units).unwrap_or_default(),
+        rerolls_left: game.rerolls_left(id),
     }
 }

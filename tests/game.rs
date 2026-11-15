@@ -53,14 +53,16 @@ fn buying_and_selling_moves_gold_and_pool_copies() {
 
     g.apply(P0, Command::BuyUnit { slot }).unwrap();
     assert_eq!(g.player(P0).gold, 4 - cost);
-    assert_eq!(g.pool_count(&unit), pool_before - 1);
+    // The shop already held this copy out of the pool, so buying it leaves
+    // the pool as it was; selling puts it back.
+    assert_eq!(g.pool_count(&unit), pool_before);
     assert_eq!(g.player(P0).shop[slot], None);
     assert_eq!(g.apply(P0, Command::BuyUnit { slot }), Err(CommandError::EmptyShopSlot));
     let uid = g.player(P0).bench[0].as_ref().unwrap().uid;
 
     g.apply(P0, Command::SellUnit { uid }).unwrap();
     assert_eq!(g.player(P0).gold, 4);
-    assert_eq!(g.pool_count(&unit), pool_before);
+    assert_eq!(g.pool_count(&unit), pool_before + 1);
     assert_eq!(g.apply(P0, Command::SellUnit { uid }), Err(CommandError::UnknownUnit));
 
     // Not enough gold changes nothing.
@@ -267,7 +269,11 @@ fn draft_round_picks_in_health_order_and_returns_leftovers() {
     let mut g = Game::new(with_rounds(vec![RoundKindDef::Draft { extra: 1, max_cost: Some(1) }]), 9, &["a", "b", "c"]);
     g.damage_player(P2, 30);
     g.damage_player(P0, 10);
-    let pool_total = |g: &Game| g.content().units().map(|u| g.pool_count(&u.id)).sum::<u32>();
+    // Copies in the pool plus copies shops are holding.
+    let pool_total = |g: &Game| {
+        g.content().units().map(|u| g.pool_count(&u.id)).sum::<u32>()
+            + g.players().iter().map(|p| p.shop.iter().flatten().count() as u32).sum::<u32>()
+    };
     let before = pool_total(&g);
     g.begin_round().unwrap();
 
@@ -368,7 +374,11 @@ fn players_without_health_are_eliminated_and_the_last_one_wins() {
     field(&mut g, P0, "ironbark_warden", (3, 4));
     g.damage_player(P1, 99);
     g.damage_player(P2, 150);
-    let pool = g.pool_count("ashen_hound");
+    // Eliminated players' shops let go of their copies too.
+    let in_shops = |g: &Game, ids: [PlayerId; 2]| {
+        ids.iter().map(|id| g.player(*id).shop.iter().flatten().filter(|u| *u == "ashen_hound").count() as u32).sum::<u32>()
+    };
+    let pool = g.pool_count("ashen_hound") + in_shops(&g, [P1, P2]);
     assert!(g.take_from_pool("ashen_hound"));
     g.add_unit(P2, "ashen_hound", vec![]);
     g.finish_round().unwrap();
@@ -428,4 +438,413 @@ fn games_are_deterministic() {
     assert_eq!(a.players(), b.players());
     let c = bot_game(22, 4);
     assert_ne!(a.events(), c.events());
+}
+
+#[test]
+fn shops_only_offer_copies_that_exist() {
+    // Two copies of each unit and eight shops of five: most slots must stay
+    // empty, and no unit may be shown more often than it has copies.
+    let mut rules = autoengine::content::GameRules::default();
+    rules.pool_sizes.clear();
+    rules.default_pool_size = 2;
+    let base = autoengine::sample::content();
+    let content = ContentSet::new(base.units().cloned().collect(), base.traits().cloned().collect(), base.items().cloned().collect(), rules)
+        .unwrap()
+        .with_schedule(Schedule::new([RoundDef::new("fight", 1, RoundKindDef::pvp())]))
+        .unwrap();
+    let names: Vec<String> = (0..8).map(|i| format!("p{i}")).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut g = Game::new(content, 4, &names);
+
+    let check = |g: &Game| {
+        for unit in g.content().units().filter(|u| u.in_shop) {
+            let shown: u32 = g.players().iter().map(|p| p.shop.iter().flatten().filter(|o| **o == unit.id).count() as u32).sum();
+            let owned: u32 = g.players().iter().map(|p| p.units().filter(|u| u.unit == unit.id).map(|u| 3u32.pow(u.star as u32 - 1)).sum::<u32>()).sum();
+            assert_eq!(shown + owned + g.pool_count(&unit.id), 2, "{}: shown {shown}, owned {owned}", unit.id);
+        }
+    };
+    check(&g);
+    for round in 0..3 {
+        g.begin_round().unwrap();
+        check(&g);
+        for p in 0..8u8 {
+            let id = PlayerId(p);
+            // Everything a shop shows can be bought (gold permitting).
+            g.add_gold(id, 100);
+            for slot in 0..g.player(id).shop.len() {
+                if g.player(id).shop[slot].is_some() && g.player(id).bench.iter().any(Option::is_none) {
+                    assert_eq!(g.apply(id, Command::BuyUnit { slot }), Ok(()), "round {round}, player {p}, slot {slot}");
+                }
+            }
+            let _ = g.apply(id, Command::Reroll);
+            check(&g);
+        }
+        g.finish_round().unwrap();
+    }
+}
+
+#[test]
+fn a_player_who_forfeits_goes_out_last_when_the_round_ends() {
+    use autoengine::game::{Command, CommandError, GameEvent, PlayerId};
+    let content = std::sync::Arc::new(autoengine::sample::content());
+    let mut g = autoengine::game::Game::new(content, 3, &["a", "b", "c"]);
+    // Every copy is in the pool, in a shop or owned (all one-star here).
+    let copies = |g: &autoengine::game::Game| -> u32 {
+        let pool: u32 = g.content().units().map(|u| g.pool_count(&u.id)).sum();
+        let shown = g.players().iter().flat_map(|p| p.shop.iter().flatten()).count() as u32;
+        let owned = g.players().iter().map(|p| p.units().count() as u32).sum::<u32>();
+        pool + shown + owned
+    };
+    g.begin_round().unwrap();
+    let total = copies(&g);
+    g.apply(PlayerId(1), Command::BuyUnit { slot: 0 }).unwrap();
+    g.apply(PlayerId(1), Command::Forfeit).unwrap();
+    assert!(g.player(PlayerId(1)).ready && g.player(PlayerId(1)).alive);
+    assert_eq!(g.apply(PlayerId(1), Command::Reroll), Err(CommandError::Forfeited));
+    assert!(g.events().iter().any(|e| matches!(e, GameEvent::PlayerForfeited { player } if *player == PlayerId(1))));
+    g.finish_round().unwrap();
+    let p = g.player(PlayerId(1));
+    assert!(!p.alive);
+    assert_eq!(p.placement, Some(3));
+    assert!(p.health > 0, "out despite health left");
+    // Their unit and shop went back to the pool.
+    assert_eq!(p.units().count(), 0);
+    assert!(p.shop.iter().all(Option::is_none));
+    assert_eq!(copies(&g), total);
+    assert!(!g.is_over());
+
+    // The last one standing wins when the other gives up.
+    g.begin_round().unwrap();
+    g.apply(PlayerId(0), Command::Forfeit).unwrap();
+    g.finish_round().unwrap();
+    assert!(g.is_over());
+    assert_eq!(g.winner(), Some(PlayerId(2)));
+    assert_eq!(g.player(PlayerId(0)).placement, Some(2));
+}
+
+#[test]
+fn forfeiting_during_a_draft_makes_the_pick_so_nobody_waits() {
+    use autoengine::content::{RoundDef, RoundKindDef, Schedule};
+    use autoengine::game::Command;
+    let draft = RoundDef { name: "draft".into(), stage: 1, kind: RoundKindDef::Draft { extra: 0, max_cost: None } };
+    let content = autoengine::sample::content().with_schedule(Schedule { rounds: vec![draft], repeat_from: 0 }).unwrap();
+    let mut g = autoengine::game::Game::new(content, 1, &["a", "b", "c"]);
+    g.begin_round().unwrap();
+    let first = g.awaiting()[0];
+    g.apply(first, Command::Forfeit).unwrap();
+    assert!(!g.awaiting().contains(&first));
+    assert!(!g.awaiting().is_empty(), "the next player's turn");
+    assert_eq!(g.player(first).units().count(), 1);
+}
+
+#[test]
+fn player_stats_add_up() {
+    let content = std::sync::Arc::new(autoengine::sample::content());
+    let start = content.rules().economy.starting_gold;
+    let health = content.rules().starting_health;
+    let mut g = autoengine::game::Game::new(content, 8, &["a", "b", "c", "d"]);
+    let mut rng = autoengine::rng::Rng::new(2);
+    while !g.is_over() {
+        autoengine::bot::play_round(&mut g, &mut rng).unwrap();
+    }
+    for p in g.players() {
+        let s = &p.stats;
+        assert_eq!(start + s.gold_earned - s.gold_spent, p.gold, "{}: {s:?}", p.name);
+        assert_eq!(health - s.damage_taken, p.health, "{}", p.name);
+        assert!(s.units_bought > 0 && s.rounds > 0 && s.best_star >= 1);
+        assert!(s.fights_won + s.fights_lost + s.fights_drawn >= s.rounds / 2);
+    }
+    let winner = g.player(g.winner().unwrap());
+    assert!(winner.stats.rounds >= g.players().iter().map(|p| p.stats.rounds).max().unwrap());
+    assert!(g.players().iter().any(|p| p.stats.best_streak >= 2));
+    assert!(g.players().iter().map(|p| p.stats.kills).sum::<u32>() > 0);
+}
+
+/// A schedule of player fights only.
+fn pvp_only(players: &[&str], rules: impl FnOnce(&mut autoengine::content::GameRules)) -> autoengine::game::Game {
+    use autoengine::content::{RoundDef, RoundKindDef, Schedule};
+    let pvp = RoundDef { name: "fight".into(), stage: 1, kind: RoundKindDef::Pvp };
+    let mut content = autoengine::sample::content().with_schedule(Schedule { rounds: vec![pvp], repeat_from: 0 }).unwrap();
+    let mut r = content.rules().clone();
+    rules(&mut r);
+    content = content.with_game_rules(r).unwrap();
+    autoengine::game::Game::new(content, 5, players)
+}
+
+#[test]
+fn players_do_not_meet_the_same_opponent_again_soon() {
+    use autoengine::game::{GameEvent, Opponent};
+    let mut g = pvp_only(&["a", "b", "c", "d"], |_| {});
+    let mut rng = autoengine::rng::Rng::new(1);
+    let mut meetings: Vec<Vec<(u8, u8)>> = Vec::new();
+    for _ in 0..6 {
+        autoengine::bot::play_round(&mut g, &mut rng).unwrap();
+        let round: Vec<(u8, u8)> = g
+            .drain_events()
+            .iter()
+            .filter_map(|e| match e {
+                GameEvent::CombatFinished { home, away: Opponent::Player(away), .. } => {
+                    Some((home.0.min(away.0), home.0.max(away.0)))
+                }
+                _ => None,
+            })
+            .collect();
+        meetings.push(round);
+        if g.alive().len() < 4 {
+            break;
+        }
+    }
+    assert!(meetings.len() >= 3);
+    // With four players and two rounds remembered, everyone meets each of
+    // the other three in turn.
+    for window in meetings.windows(3) {
+        for pair in &window[2] {
+            assert!(!window[0].contains(pair) && !window[1].contains(pair), "{meetings:?}");
+        }
+    }
+    assert_eq!(g.recent_opponents(autoengine::game::PlayerId(0)).len(), 2);
+
+    // Turned off, players are paired in the shuffled order with no memory.
+    let g = pvp_only(&["a", "b"], |r| r.avoid_rematch_rounds = 0);
+    assert!(g.recent_opponents(autoengine::game::PlayerId(0)).is_empty());
+}
+
+#[test]
+fn pairing_leaves_the_fewest_rematches() {
+    use autoengine::game::PlayerId;
+    let mut g = pvp_only(&["a", "b", "c", "d", "e"], |r| r.avoid_rematch_rounds = 3);
+    // Fight a few rounds so there is history, then check the chosen
+    // pairing is the cheapest of all.
+    let mut rng = autoengine::rng::Rng::new(9);
+    for _ in 0..3 {
+        autoengine::bot::play_round(&mut g, &mut rng).unwrap();
+    }
+    let alive = g.alive();
+    let (pairs, odd) = autoengine::round::pair_up(&g, &alive);
+    assert_eq!(pairs.len(), alive.len() / 2);
+    assert_eq!(odd.is_some(), alive.len() % 2 == 1);
+    let cost = |pairs: &[(PlayerId, PlayerId)]| -> u32 { pairs.iter().map(|(a, b)| g.rematch_cost(*a, *b) + g.rematch_cost(*b, *a)).sum() };
+    let chosen = cost(&pairs);
+    // Brute force over every ordering's sequential pairing.
+    fn permutations(items: Vec<PlayerId>) -> Vec<Vec<PlayerId>> {
+        if items.len() <= 1 {
+            return vec![items];
+        }
+        let mut out = Vec::new();
+        for i in 0..items.len() {
+            let mut rest = items.clone();
+            let x = rest.remove(i);
+            for mut perm in permutations(rest) {
+                perm.insert(0, x);
+                out.push(perm);
+            }
+        }
+        out
+    }
+    let cheapest = permutations(alive.clone())
+        .into_iter()
+        .map(|order| cost(&order.as_chunks::<2>().0.iter().map(|c| (c[0], c[1])).collect::<Vec<_>>()))
+        .min()
+        .unwrap();
+    assert_eq!(chosen, cheapest);
+}
+
+#[test]
+fn empty_board_places_are_filled_from_the_bench_before_fights() {
+    use autoengine::game::{Command, PlayerId, Slot};
+    let mut g = pvp_only(&["a", "b"], |_| {});
+    g.begin_round().unwrap();
+    let a = PlayerId(0);
+    g.grant(a, autoengine::game::Grant::Unit("ashen_hound".into())).unwrap();
+    // Take everything off the board.
+    let on_board: Vec<u32> = g.player(a).board.values().map(|u| u.uid).collect();
+    for (i, uid) in on_board.into_iter().enumerate() {
+        g.apply(a, Command::MoveUnit { uid, to: Slot::Bench(i + 3) }).unwrap();
+    }
+    assert!(g.player(a).board.is_empty());
+    g.finish_round().unwrap();
+    assert_eq!(g.player(a).board.len(), g.board_limit(a).min(g.player(a).units().count()));
+
+    let mut g = pvp_only(&["a", "b"], |r| r.auto_fill_board = false);
+    g.begin_round().unwrap();
+    g.grant(a, autoengine::game::Grant::Unit("ashen_hound".into())).unwrap();
+    g.finish_round().unwrap();
+    assert!(g.player(a).board.is_empty());
+}
+
+#[test]
+fn single_use_items_do_their_thing_and_are_gone() {
+    use autoengine::content::{Consumable, ItemDef};
+    use autoengine::game::{Command, CommandError, GameEvent, Grant, PlayerId};
+    let base = autoengine::sample::content();
+    let mut builder = autoengine::content::ContentSet::builder().rules(base.rules().clone()).schedule(base.schedule().clone());
+    for u in base.units() {
+        builder = builder.unit(u.clone());
+    }
+    for t in base.traits() {
+        builder = builder.trait_def(t.clone());
+    }
+    for i in base.items() {
+        builder = builder.item(i.clone());
+    }
+    let content = builder
+        .item(ItemDef::new("magnet", "Magnet").consumable(Consumable::RemoveItems))
+        .item(ItemDef::new("mirror", "Mirror").consumable(Consumable::Duplicate))
+        .item(ItemDef::new("anvil", "Anvil").consumable(Consumable::Reforge))
+        .item(ItemDef::new("purse", "Purse").consumable(Consumable::Gold(7)))
+        .build()
+        .unwrap();
+    assert!(!autoengine::game::Game::new(content.clone(), 1, &["a"]).component_items().contains(&"magnet".to_string()));
+
+    let mut g = autoengine::game::Game::new(content, 1, &["a", "b"]);
+    let a = PlayerId(0);
+    g.begin_round().unwrap();
+    g.grant(a, Grant::Unit("ashen_hound".into())).unwrap();
+    let uid = g.player(a).units().find(|u| u.unit == "ashen_hound").unwrap().uid;
+    let component = g.component_items()[0].clone();
+    let index = |g: &autoengine::game::Game, id: &str| g.player(a).items.iter().position(|i| i == id).unwrap();
+
+    // Nothing to remove yet: refused, and the magnet stays.
+    g.grant(a, Grant::Item("magnet".into())).unwrap();
+    let refused = g.apply(a, Command::EquipItem { item: index(&g, "magnet"), uid });
+    assert!(matches!(refused, Err(CommandError::CannotUse(_))));
+    g.grant(a, Grant::Item(component.clone())).unwrap();
+    g.apply(a, Command::EquipItem { item: index(&g, &component), uid }).unwrap();
+    g.apply(a, Command::EquipItem { item: index(&g, "magnet"), uid }).unwrap();
+    assert!(g.player(a).unit(uid).unwrap().items.is_empty());
+    assert_eq!(g.player(a).items, vec![component.clone()]);
+    assert!(g.events().iter().any(|e| matches!(e, GameEvent::ItemUsed { item, .. } if item == "magnet")));
+
+    // A reforged component becomes a different component.
+    g.apply(a, Command::EquipItem { item: 0, uid }).unwrap();
+    g.grant(a, Grant::Item("anvil".into())).unwrap();
+    g.apply(a, Command::EquipItem { item: index(&g, "anvil"), uid }).unwrap();
+    let now = &g.player(a).unit(uid).unwrap().items;
+    assert_eq!(now.len(), 1);
+    assert_ne!(now[0], component);
+    assert!(g.component_items().contains(&now[0]));
+
+    // A copy from the pool.
+    let pool = g.pool_count("ashen_hound");
+    g.grant(a, Grant::Item("mirror".into())).unwrap();
+    g.apply(a, Command::EquipItem { item: index(&g, "mirror"), uid }).unwrap();
+    assert_eq!(g.pool_count("ashen_hound"), pool - 1);
+    assert_eq!(g.player(a).units().filter(|u| u.unit == "ashen_hound").count(), 2);
+
+    let gold = g.player(a).gold;
+    g.grant(a, Grant::Item("purse".into())).unwrap();
+    g.apply(a, Command::EquipItem { item: index(&g, "purse"), uid }).unwrap();
+    assert_eq!(g.player(a).gold, gold + 7);
+    assert!(g.player(a).items.is_empty());
+}
+
+#[test]
+fn single_use_items_cannot_be_recipe_parts() {
+    use autoengine::content::{Consumable, ItemDef};
+    let base = autoengine::sample::content();
+    let mut builder = autoengine::content::ContentSet::builder();
+    for u in base.units() {
+        builder = builder.unit(u.clone());
+    }
+    for t in base.traits() {
+        builder = builder.trait_def(t.clone());
+    }
+    let err = builder
+        .item(ItemDef::new("magnet", "Magnet").consumable(Consumable::RemoveItems))
+        .item(ItemDef::new("rod", "Rod"))
+        .item(ItemDef::new("odd", "Odd").recipe("magnet", "rod"))
+        .build()
+        .unwrap_err();
+    assert!(err.to_string().contains("used up"), "{err}");
+}
+
+#[test]
+fn choice_offers_can_be_rerolled_a_limited_number_of_times() {
+    use autoengine::content::{ChoiceOffer, RoundDef, RoundKindDef, Schedule};
+    use autoengine::game::{Command, CommandError, PlayerId};
+    let choice = RoundDef { name: "pick".into(), stage: 1, kind: RoundKindDef::Choice { options: 2, offer: ChoiceOffer::Augments } };
+    let content = autoengine::sample::content().with_schedule(Schedule { rounds: vec![choice], repeat_from: 0 }).unwrap();
+    let mut g = autoengine::game::Game::new(content, 4, &["a", "b"]);
+    g.begin_round().unwrap();
+    let a = PlayerId(0);
+    assert_eq!(g.rerolls_left(a), 1);
+    let before = g.options(a);
+    g.apply(a, Command::RerollPick).unwrap();
+    let after = g.options(a);
+    assert_eq!(after.len(), 2);
+    assert!(after.iter().all(|o| !before.contains(o)), "{before:?} then {after:?}");
+    assert_eq!(g.rerolls_left(a), 0);
+    assert_eq!(g.apply(a, Command::RerollPick), Err(CommandError::NoRerollsLeft));
+    // After picking there is nothing to reroll.
+    g.apply(PlayerId(1), Command::Pick { option: 0 }).unwrap();
+    assert_eq!(g.rerolls_left(PlayerId(1)), 0);
+    assert_eq!(g.apply(PlayerId(1), Command::RerollPick), Err(CommandError::NothingToPick));
+    let picked = after[1].clone().unwrap();
+    g.apply(a, Command::Pick { option: 1 }).unwrap();
+    assert!(g.player(a).augments.contains(&picked));
+}
+
+#[test]
+fn augments_can_pay_out_every_round() {
+    use autoengine::content::{AugmentDef, RoundGrant};
+    use autoengine::game::{Command, Grant, PlayerId};
+    let base = autoengine::sample::content();
+    let mut builder = autoengine::content::ContentSet::builder().rules(base.rules().clone()).schedule(base.schedule().clone());
+    for u in base.units() {
+        builder = builder.unit(u.clone());
+    }
+    for t in base.traits() {
+        builder = builder.trait_def(t.clone());
+    }
+    for i in base.items() {
+        builder = builder.item(i.clone());
+    }
+    let content = builder
+        .augment(AugmentDef::new("patron", "Patron").per_round(RoundGrant { gold: 3, xp: 1, free_rerolls: 2, components: 1 }))
+        .build()
+        .unwrap();
+    let mut g = autoengine::game::Game::new(content, 3, &["a", "b"]);
+    let (a, b) = (PlayerId(0), PlayerId(1));
+    g.begin_round().unwrap();
+    g.grant(a, Grant::Augment("patron".into())).unwrap();
+    g.finish_round().unwrap();
+    let (gold_a, gold_b) = (g.player(a).gold, g.player(b).gold);
+    let (items_a, items_b) = (g.player(a).items.len(), g.player(b).items.len());
+    g.begin_round().unwrap();
+    // Same income otherwise, so the difference is the augment (plus interest
+    // and streaks, which only add).
+    assert!(g.player(a).gold - gold_a >= g.player(b).gold - gold_b + 3 - 1);
+    assert_eq!(g.player(a).items.len(), items_a + 1 + (g.player(b).items.len() - items_b));
+    assert_eq!(g.player(a).free_rerolls, 2);
+    // Free rerolls go first and cost nothing.
+    let gold = g.player(a).gold;
+    g.apply(a, Command::Reroll).unwrap();
+    g.apply(a, Command::Reroll).unwrap();
+    assert_eq!((g.player(a).gold, g.player(a).free_rerolls), (gold, 0));
+    g.apply(a, Command::Reroll).unwrap();
+    assert_eq!(g.player(a).gold, gold - g.content().rules().economy.reroll_cost);
+    assert_eq!(g.player(a).stats.rerolls, 3);
+}
+
+#[test]
+fn a_lobby_modifier_gives_everyone_the_same_twist() {
+    use autoengine::game::GameEvent;
+    let base = autoengine::sample::content();
+    let augments: Vec<String> = base.augments().map(|a| a.id.clone()).take(3).collect();
+    let mut rules = base.rules().clone();
+    rules.lobby_modifiers = augments.clone();
+    let content = std::sync::Arc::new(base.clone().with_game_rules(rules.clone()).unwrap());
+    let mut seen = std::collections::BTreeSet::new();
+    for seed in 0..12 {
+        let g = autoengine::game::Game::new(content.clone(), seed, &["a", "b", "c"]);
+        let pick = g.lobby_modifier().unwrap().to_string();
+        assert!(augments.contains(&pick));
+        assert!(g.players().iter().all(|p| p.augments == vec![pick.clone()]));
+        assert!(g.events().iter().any(|e| matches!(e, GameEvent::LobbyModifier { augment } if *augment == pick)));
+        seen.insert(pick);
+    }
+    assert!(seen.len() > 1, "different games get different twists");
+    assert!(autoengine::game::Game::new(base.clone(), 1, &["a"]).lobby_modifier().is_none());
+    rules.lobby_modifiers = vec!["nothing_like_this".into()];
+    assert!(base.with_game_rules(rules).unwrap_err().to_string().contains("lobby modifier"));
 }

@@ -50,6 +50,8 @@ fn last_state(messages: &[ServerMsg]) -> Option<GameView> {
                     awaiting: Vec::new(),
                     options: Vec::new(),
                     status: Vec::new(),
+                    paused: false,
+                    pool: Default::default(),
                 });
                 base.patch(u.clone());
             }
@@ -379,7 +381,15 @@ fn recorded_fights_can_be_loaded_and_verified() {
         s.tick(now);
         s.drain_outbox();
     }
-    let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+    // The whole match is saved next to the fights, and replays to the end.
+    let saved = Session::load_match(&dir).unwrap();
+    let game = saved.log.replay(content(), |_| {}).unwrap();
+    assert!(game.is_over());
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| *p != Session::match_file(&dir))
+        .collect();
     files.sort();
     assert!(files.len() >= 2, "every fight is saved");
     for file in &files {
@@ -426,4 +436,213 @@ fn developer_commands_need_the_server_to_allow_them() {
     let round = s.game().unwrap().round_index();
     s.handle(1, ClientMsg::Dev(DevCommand::Skip), 5);
     assert!(s.game().unwrap().round_index() > round || !s.game().unwrap().in_round());
+}
+
+#[test]
+fn chat_reaches_everyone_and_late_joiners_see_recent_lines() {
+    let chats = |messages: &[ServerMsg]| -> Vec<(String, String)> {
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                ServerMsg::Chat { from, text, .. } => Some((from.clone(), text.clone())),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut s = session(3);
+    s.handle(1, join("Ana"), 0);
+    s.handle(2, join("Bo"), 0);
+    s.drain_outbox();
+    // Strangers cannot talk; text is tidied and empty lines are dropped.
+    s.handle(9, ClientMsg::Chat { text: "hi".into() }, 0);
+    assert_eq!(errors(&inbox(&mut s, 9)).len(), 1);
+    s.handle(1, ClientMsg::Chat { text: "  good\n\tluck  ".into() }, 0);
+    s.handle(1, ClientMsg::Chat { text: " \n ".into() }, 0);
+    s.handle(2, ClientMsg::Chat { text: "x".repeat(500) }, 0);
+    let all = s.drain_outbox();
+    let to_ana = chats(&inbox_of(&all, 1));
+    assert_eq!(to_ana.len(), 2);
+    assert_eq!(to_ana[0], ("Ana".to_string(), "good luck".to_string()));
+    assert_eq!(to_ana[1].1.len(), autoengine::protocol::MAX_CHAT_CHARS);
+    assert_eq!(chats(&inbox_of(&all, 2)), to_ana);
+
+    // A spectator gets the history and can talk too; so can the server.
+    s.handle(3, ClientMsg::Spectate { version: PROTOCOL_VERSION }, 0);
+    assert_eq!(chats(&inbox(&mut s, 3)), to_ana);
+    s.handle(3, ClientMsg::Chat { text: "go Bo".into() }, 0);
+    s.announce("restarting soon");
+    let heard = chats(&inbox(&mut s, 1));
+    assert_eq!(heard, vec![("spectator".into(), "go Bo".into()), ("server".into(), "restarting soon".into())]);
+
+    s.allow_chat(false);
+    s.handle(1, ClientMsg::Chat { text: "anyone?".into() }, 0);
+    let messages = inbox(&mut s, 1);
+    assert!(chats(&messages).is_empty() && errors(&messages)[0].contains("off"));
+
+    // The client state shows chat in its log.
+    let mut state = autoengine::client::ClientState::new();
+    state.apply(ServerMsg::Chat { from: "Ana".into(), seat: Some(PlayerId(0)), text: "hello".into() });
+    assert_eq!(state.chat.back(), Some(&("Ana".to_string(), "hello".to_string())));
+    assert_eq!(state.log.back().map(String::as_str), Some("Ana: hello"));
+    state.say("  ");
+    state.say("hey");
+    assert_eq!(state.requests, vec![ClientMsg::Chat { text: "hey".into() }]);
+}
+
+#[test]
+fn spectators_can_be_shown_the_game_late() {
+    let mut s = session(2);
+    s.set_spectator_delay(10_000);
+    s.handle(1, join("Ana"), 0);
+    s.handle(2, ClientMsg::Spectate { version: PROTOCOL_VERSION }, 0);
+    s.drain_outbox();
+    s.handle(1, ClientMsg::Start, 1_000);
+    s.handle(1, ClientMsg::Chat { text: "hi".into() }, 1_000);
+    let now = s.drain_outbox();
+    assert!(last_state(&inbox_of(&now, 1)).is_some(), "the player sees the game at once");
+    let watcher = inbox_of(&now, 2);
+    assert!(last_state(&watcher).is_none(), "the spectator does not, yet");
+    assert!(watcher.iter().any(|m| matches!(m, ServerMsg::Chat { .. })), "chat is not delayed");
+    assert!(watcher.iter().any(|m| matches!(m, ServerMsg::Lobby { .. })));
+    s.tick(10_999);
+    assert!(last_state(&inbox(&mut s, 2)).is_none());
+    s.tick(11_000);
+    let late = inbox(&mut s, 2);
+    let view = last_state(&late).expect("ten seconds later");
+    assert_eq!(view.round_index, 0);
+}
+
+#[test]
+fn rounds_of_a_kind_can_have_their_own_planning_time() {
+    use autoengine::content::{RoundDef, RoundKindDef, Schedule};
+    let pvp = RoundDef { name: "fight".into(), stage: 1, kind: RoundKindDef::Pvp };
+    let content = autoengine::sample::content().with_schedule(Schedule { rounds: vec![pvp], repeat_from: 0 }).unwrap();
+    let mut rules = content.rules().clone();
+    rules.planning_ms_by_kind.insert("pvp".into(), 5_000);
+    let content = content.with_game_rules(rules).unwrap();
+    let mut s = Session::new(content, SessionConfig { seats: 2, seed: 7, planning_ms: 30_000, wait_for_playback: false, after_combat_ms: 0 });
+    s.handle(1, join("Ana"), 0);
+    s.handle(1, ClientMsg::Start, 0);
+    let view = last_state(&inbox(&mut s, 1)).unwrap();
+    assert_eq!(view.phase, ViewPhase::Planning { remaining_ms: 5_000 });
+    s.tick(4_999);
+    assert_eq!(s.game().unwrap().round_index(), 0);
+    s.tick(5_000);
+    s.tick(5_001);
+    assert_eq!(s.game().unwrap().round_index(), 1);
+}
+
+#[test]
+fn the_host_can_kick_a_player() {
+    let mut s = session(3);
+    s.handle(1, join("Ana"), 0);
+    s.handle(2, join("Troll"), 0);
+    // Before the start the seat opens again, and the name stays out.
+    assert!(s.kick("Troll", 0));
+    assert!(!s.kick("Nobody", 0));
+    assert_eq!(s.take_closed(), vec![2]);
+    assert_eq!(s.seat_names()[1], None);
+    s.drain_outbox();
+    s.handle(3, join("Troll"), 0);
+    assert_eq!(errors(&inbox(&mut s, 3)), vec!["you were removed from this game"]);
+
+    // During the game a bot keeps the seat, and the token stops working.
+    s.handle(4, join("Bo"), 0);
+    let token = inbox(&mut s, 4).iter().find_map(|m| match m {
+        ServerMsg::Welcome { token, .. } => token.clone(),
+        _ => None,
+    });
+    s.handle(1, ClientMsg::Start, 0);
+    assert!(s.kick("Bo", 10));
+    assert!(s.seat_is_bot(1));
+    s.drain_outbox();
+    s.handle(5, ClientMsg::Join { name: "Bo".into(), version: PROTOCOL_VERSION, token }, 20);
+    assert_eq!(errors(&inbox(&mut s, 5)), vec!["you were removed from this game"]);
+}
+
+#[test]
+fn chat_is_rate_limited_filtered_and_mutable() {
+    let mut s = session(2);
+    s.handle(1, join("Ana"), 0);
+    s.handle(2, join("Bo"), 0);
+    s.set_chat_filter(|text| if text.contains("spoiler") { None } else { Some(text.replace("darn", "d**n")) });
+    s.drain_outbox();
+    let said = |s: &mut Session, conn, text: &str, now| {
+        s.handle(conn, ClientMsg::Chat { text: text.into() }, now);
+        s.drain_outbox()
+    };
+    let heard = |out: &[(ConnId, ServerMsg)]| -> Vec<String> {
+        inbox_of(out, 2).into_iter().filter_map(|m| match m { ServerMsg::Chat { text, .. } => Some(text), _ => None }).collect()
+    };
+    assert_eq!(heard(&said(&mut s, 1, "oh darn", 0)), vec!["oh d**n"]);
+    assert!(heard(&said(&mut s, 1, "big spoiler here", 0)).is_empty());
+    for i in 0..3 {
+        assert_eq!(heard(&said(&mut s, 1, &format!("line {i}"), 100)).len(), 1);
+    }
+    // That is five lines in ten seconds; the sixth is refused.
+    let out = said(&mut s, 1, "one more", 200);
+    assert!(heard(&out).is_empty());
+    assert!(errors(&inbox_of(&out, 1))[0].contains("too fast"));
+    assert_eq!(heard(&said(&mut s, 1, "later", 10_001)).len(), 1);
+
+    let mut state = autoengine::client::ClientState::new();
+    state.muted.insert("Troll".into());
+    state.apply(ServerMsg::Chat { from: "Troll".into(), seat: None, text: "spam".into() });
+    state.apply(ServerMsg::Chat { from: "Ana".into(), seat: None, text: "hi".into() });
+    assert_eq!(state.chat.len(), 1);
+}
+
+#[test]
+fn the_host_can_pause_the_clock() {
+    let mut s = session(2);
+    s.handle(1, join("Ana"), 0);
+    assert!(!s.pause(0), "nothing to pause before the start");
+    s.handle(1, ClientMsg::Start, 0);
+    s.drain_outbox();
+    assert!(s.pause(10_000));
+    assert!(!s.pause(10_000));
+    let view = last_state(&inbox(&mut s, 1)).unwrap();
+    assert!(view.paused);
+    assert_eq!(view.phase, ViewPhase::Planning { remaining_ms: 20_000 });
+    // Long past the deadline, and everyone ready: still waiting.
+    s.handle(1, ClientMsg::Command(Command::Ready), 50_000);
+    s.tick(100_000);
+    assert_eq!(s.game().unwrap().round_index(), 0);
+    assert!(s.game().unwrap().in_round());
+    // Players can still act while paused.
+    assert!(errors(&inbox(&mut s, 1)).is_empty());
+    // Unpausing with everyone ready ends the round at once.
+    assert!(s.unpause(100_000));
+    assert!(!s.game().unwrap().in_round() || s.game().unwrap().round_index() > 0);
+
+    // Unpaused with time left, the deadline moves by the pause.
+    let mut s = session(2);
+    s.handle(1, join("Ana"), 0);
+    s.handle(1, ClientMsg::Start, 0);
+    s.pause(10_000);
+    s.unpause(70_000);
+    s.tick(89_999);
+    assert_eq!(s.game().unwrap().round_index(), 0);
+    s.tick(90_000);
+    s.tick(90_001);
+    assert_eq!(s.game().unwrap().round_index(), 1);
+}
+
+#[test]
+fn clients_see_how_many_copies_are_left() {
+    let mut s = session(2);
+    s.handle(1, join("Ana"), 0);
+    s.handle(1, ClientMsg::Start, 0);
+    let messages = inbox(&mut s, 1);
+    let view = last_state(&messages).unwrap();
+    let game = s.game().unwrap();
+    assert_eq!(&view.pool, game.pool());
+    assert!(!view.pool.is_empty());
+    // Buying changes nothing in the pool (the shop held the copy), but a
+    // reroll puts copies back and takes others: the update carries it.
+    s.handle(1, ClientMsg::Command(Command::Reroll), 0);
+    let mut messages = messages;
+    messages.extend(inbox(&mut s, 1));
+    let view = last_state(&messages).unwrap();
+    assert_eq!(&view.pool, s.game().unwrap().pool());
 }

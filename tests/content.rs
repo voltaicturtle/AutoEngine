@@ -38,7 +38,7 @@ fn sample_content_loads_and_is_indexed() {
     let c = sample();
     assert_eq!(c.units().count(), 9);
     assert_eq!(c.traits().count(), 5);
-    assert_eq!(c.items().count(), 6);
+    assert_eq!(c.items().count(), 7);
     assert_eq!(c.board().len(), 56);
     let warden = c.unit("ironbark_warden").unwrap();
     assert_eq!(warden.cost, 2);
@@ -340,4 +340,51 @@ fn the_guide_example_for_conditions_and_stacks_works() {
         .iter()
         .any(|e| matches!(&e.kind, EventKind::StacksChanged { stack, .. } if stack == "frenzy"));
     assert!(stacked);
+}
+
+#[test]
+fn content_can_be_translated() {
+    use autoengine::content::{ContentSet, TraitDef, UnitDef};
+    let build = |extra: &[(&str, &str)]| {
+        let mut b = ContentSet::builder()
+            .unit(UnitDef::new("hound", "Ash Hound").cost(1).traits(["beast"]))
+            .trait_def(TraitDef::new("beast", "Beast").description("Wild things.").breakpoint(1, []))
+            .translate("fr", "unit.hound.name", "Chien de cendre")
+            .translations("fr", [("trait.beast.name", "Bête")]);
+        for (k, v) in extra {
+            b = b.translate("fr", k, *v);
+        }
+        b.build()
+    };
+    let content = build(&[]).unwrap();
+    assert_eq!(content.languages().collect::<Vec<_>>(), vec!["fr"]);
+    assert_eq!(content.name_in(Some("fr"), "hound").as_deref(), Some("Chien de cendre"));
+    assert_eq!(content.name_in(None, "hound").as_deref(), Some("Ash Hound"));
+    assert_eq!(content.name_in(Some("de"), "hound").as_deref(), Some("Ash Hound"), "unknown languages fall back");
+    assert_eq!(content.text(Some("fr"), "trait", "beast", "description").as_deref(), Some("Wild things."));
+
+    // The checker points out what is missing.
+    let warnings = autoengine::tools::lint(&content, None);
+    assert!(warnings.iter().any(|w| w.subject == "language fr" && w.message.contains("trait.beast.description")), "{warnings:?}");
+
+    // Keys must name something real.
+    let err = build(&[("unit.huond.name", "?")]).unwrap_err().to_string();
+    assert!(err.contains("unit.huond.name") && err.contains("unit.hound.name"), "{err}");
+    assert!(build(&[("unit.hound.description", "?")]).is_err(), "units have no description");
+
+    // Clients get the translations and show their language.
+    let info = autoengine::protocol::ContentInfo::from_content(&content);
+    let json = autoengine::protocol::encode(&info);
+    let back: autoengine::protocol::ContentInfo = autoengine::protocol::decode(&json).unwrap();
+    let mut state = autoengine::client::ClientState::new();
+    state.content = Some(back.into_content().unwrap());
+    assert_eq!(state.display_name("hound"), "Ash Hound");
+    state.language = Some("fr".into());
+    assert_eq!(state.display_name("hound"), "Chien de cendre");
+    assert_eq!(state.display_name("beast"), "Bête");
+    assert_eq!(state.description("trait", "beast"), "Wild things.");
+
+    // Translating changes no rules, so saved matches still replay.
+    let plain = build(&[]).unwrap().with_translations(Default::default()).unwrap();
+    assert_eq!(autoengine::matchlog::content_fingerprint(&plain), autoengine::matchlog::content_fingerprint(&content));
 }

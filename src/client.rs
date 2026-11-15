@@ -32,6 +32,18 @@ pub struct ClientState {
     pub combats: VecDeque<CombatRecord>,
     /// Recent happenings as text, oldest first.
     pub log: VecDeque<String>,
+    /// The language to show content names in, if the content has it.
+    pub language: Option<String>,
+    /// On a server hosting many games: the game this client is in, and the
+    /// last list of games it was sent.
+    pub room: Option<u32>,
+    pub rooms: Vec<crate::protocol::RoomInfo>,
+    /// The ladder, when it was last asked for.
+    pub standings: Vec<crate::ladder::Standing>,
+    /// Names whose chat this client hides.
+    pub muted: std::collections::BTreeSet<String>,
+    /// Recent chat as `(who, text)`, oldest first.
+    pub chat: VecDeque<(String, String)>,
     /// The last refusal from the server, until the client clears it.
     pub error: Option<String>,
     /// Messages this state wants sent to the server, oldest first. Whoever
@@ -103,6 +115,40 @@ impl ClientState {
             }
             ServerMsg::Combat(record) => self.combats.push_back(record),
             ServerMsg::Error { message } => self.error = Some(message),
+            ServerMsg::Rooms(rooms) => self.rooms = rooms,
+            ServerMsg::Standings(rows) => self.standings = rows,
+            ServerMsg::InRoom { room } => {
+                if room != self.room {
+                    // A different game: nothing about the old one applies.
+                    *self = ClientState {
+                        room,
+                        rooms: std::mem::take(&mut self.rooms),
+                        content: self.content.take(),
+                        language: self.language.take(),
+                        muted: std::mem::take(&mut self.muted),
+                        ..ClientState::default()
+                    };
+                }
+            }
+            ServerMsg::Chat { from, .. } if self.muted.contains(&from) => {}
+            ServerMsg::Chat { from, text, .. } => {
+                // Chat shows in the log too, among what happens.
+                self.log.push_back(format!("{from}: {text}"));
+                while self.log.len() > LOG_LINES {
+                    self.log.pop_front();
+                }
+                self.chat.push_back((from, text));
+                while self.chat.len() > LOG_LINES {
+                    self.chat.pop_front();
+                }
+            }
+        }
+    }
+
+    /// Queues a chat message for the server.
+    pub fn say(&mut self, text: &str) {
+        if let Some(text) = crate::protocol::clean_chat(text) {
+            self.requests.push(ClientMsg::Chat { text });
         }
     }
 
@@ -121,15 +167,18 @@ impl ClientState {
             .unwrap_or_else(|| format!("Player {}", id.0 + 1))
     }
 
-    /// The display name of a unit, item, trait or augment id.
+    /// The display name of a unit, item, trait or augment id, in
+    /// [`ClientState::language`] when the content has it.
     pub fn display_name(&self, id: &str) -> String {
         let Some(c) = &self.content else { return id.to_string() };
-        c.unit(id)
-            .map(|u| u.name.clone())
-            .or_else(|| c.item(id).map(|i| i.name.clone()))
-            .or_else(|| c.augment(id).map(|a| a.name.clone()))
-            .or_else(|| c.trait_def(id).map(|t| t.name.clone()))
-            .unwrap_or_else(|| id.to_string())
+        c.name_in(self.language.as_deref(), id).unwrap_or_else(|| id.to_string())
+    }
+
+    /// The description of a trait or augment, in [`ClientState::language`]
+    /// when the content has it; empty if it has none.
+    pub fn description(&self, kind: &str, id: &str) -> String {
+        let Some(c) = &self.content else { return String::new() };
+        c.text(self.language.as_deref(), kind, id, "description").unwrap_or_default()
     }
 
     /// A line of text for events worth telling the player about.
@@ -143,6 +192,9 @@ impl ClientState {
             GameEvent::ChoiceMade { player, choice, .. } => {
                 let pretty: Vec<String> = choice.split(" + ").map(|part| self.display_name(part)).collect();
                 format!("{} picked {}", name(player), pretty.join(" with "))
+            }
+            GameEvent::ItemUsed { player, item, .. } => {
+                format!("{} used {}", name(player), self.display_name(item))
             }
             GameEvent::ItemCombined { player, item, .. } => {
                 format!("{} completed {}", name(player), self.display_name(item))
@@ -162,6 +214,11 @@ impl ClientState {
             }
             GameEvent::PlayerDamaged { player, amount, health } => {
                 format!("{} took {amount} damage ({} left)", name(player), (*health).max(0))
+            }
+            GameEvent::PlayerForfeited { player } => format!("{} forfeited", name(player)),
+            GameEvent::LobbyModifier { augment } => {
+                let text = self.description("augment", augment);
+                format!("This game: {}. {text}", self.display_name(augment))
             }
             GameEvent::PlayerEliminated { player, placement } => {
                 format!("{} was eliminated in place {placement}", name(player))

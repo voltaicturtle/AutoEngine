@@ -121,6 +121,7 @@ fn ability_casts_when_mana_fills_and_scales_with_power() {
     )
     .with_ability(Ability {
         name: "Bolt".into(),
+        description: String::new(),
         cast_time_ms: 200,
         effects: vec![EffectSpec::new(
             Selector::CurrentTarget,

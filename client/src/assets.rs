@@ -22,7 +22,7 @@ impl Look {
 
     /// A moment of the named clip, if the model has it.
     pub(crate) fn pose(&self, clip: &str, time: f32, looped: bool) -> Option<Pose> {
-        self.model.clip(clip).filter(|_| self.animate).map(|clip| Pose { clip, time, looped })
+        self.model.clip(clip).filter(|_| self.animate).map(|clip| Pose::new(clip, time, looped))
     }
 }
 

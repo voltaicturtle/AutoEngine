@@ -276,6 +276,14 @@ impl GameClient {
         }
     }
 
+    /// On a server hosting many games, joins (or watches) this one instead
+    /// of the first with an open seat.
+    pub fn in_room(mut self, room: u32) -> Self {
+        self.state.room = Some(room);
+        // The attempt already under way sends EnterRoom once it connects.
+        self
+    }
+
     /// Asks the server for fights with their whole event log instead of
     /// fighting them again locally. Only useful for measuring or debugging.
     pub fn with_full_fights(mut self) -> Self {
@@ -331,7 +339,14 @@ impl GameClient {
                         },
                         None => ClientMsg::Spectate { version: PROTOCOL_VERSION },
                     };
-                    let mut sent = conn.send(&hello);
+                    // Back into the same game on a server hosting many.
+                    let mut sent = match self.state.room {
+                        Some(room) => conn.send(&ClientMsg::EnterRoom { room }),
+                        None => Ok(()),
+                    };
+                    if sent.is_ok() {
+                        sent = conn.send(&hello);
+                    }
                     if self.full_fights && sent.is_ok() {
                         sent = conn.send(&ClientMsg::Options { full_fights: true });
                     }

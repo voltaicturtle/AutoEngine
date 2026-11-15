@@ -1,0 +1,5 @@
+# Shortcuts: `cargo play` opens the client on a local sample game,
+# `cargo game <command>` runs the developer command line (`cargo game help`).
+[alias]
+play = "run -p autoengine-client -- --local"
+game = "run -p AutoEngine --bin autoengine --"

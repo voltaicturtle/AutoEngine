@@ -91,7 +91,39 @@ cargo run -- sim --json            # the same numbers for a spreadsheet or scrip
 ```
 
 `sim` shows, for each unit and trait, how often it fought, how often it won
-and where boards that used it placed.
+and where boards that used it placed. It plays games on every CPU core at
+once, and the report is the same however many cores there are, so
+`sim --games 1000` takes seconds.
+
+Bots come in three levels: `--bots easy`, `normal` (the default) or `hard`.
+`lobby --bots mixed` seats all three. Easy bots buy what they can and never
+reroll. Hard bots field the lineup with the most trait breakpoints, give
+items to their best units, pick the option worth most to them and spend
+their savings once they can't level any further. With the sample content
+they win about three games in four against normal bots. Run `sim` with hard
+bots to see how your content holds up under stronger play.
+
+Two rules in `GameRules` keep games fair without anyone thinking about them.
+`avoid_rematch_rounds` (default 2) pairs player fights so nobody faces
+someone they fought in their last two fights, if any pairing allows it.
+`auto_fill_board` (default on) moves bench units onto empty board places
+before the fights, so a player who forgot to place a unit still fields a
+full board.
+
+`choice_rerolls` (default 1) is how many times per choice round each player
+may swap their options for new ones (`Command::RerollPick`; the client shows
+a Reroll button).
+
+`lobby_modifiers` lists augments, one of which (picked at random) every
+player gets when the game starts: a twist such as "everyone heals 10% more"
+that makes each game a little different. `game.lobby_modifier()` says which,
+and clients log it at the start.
+
+`planning_ms_by_kind` gives rounds of a kind their own planning time, such
+as `("draft", 15_000)`. Other rounds use the time the server is set to.
+
+`lobby --save game.json` keeps the whole game, and
+`match game.json --rounds` plays it back round by round.
 
 ## 6. Add rules
 
@@ -129,18 +161,21 @@ cargo run -- replay replays/*.json  # do saved fights still play out the same?
 
 ## Content reference
 
+The [content guides](guides/README.md) cover every call, effect, event and
+rule in detail, with tested examples. This section is a summary.
+
 Everything is defined with constructors and chainable setters, and checked
 when `build()` runs. `src/sample.rs` in this repository is a complete,
 original example:
 
 | Function | Contents |
 | --- | --- |
-| `units()` | `UnitDef`: cost, traits, stats, ability, passives, 3D model |
+| `units()` | `UnitDef`: cost, traits, stats, ability (with a `description` for tooltips), passives, targeting, 3D model |
 | `traits()` | `TraitDef`: the bonuses each breakpoint grants |
-| `items()` | `ItemDef`: stat bonuses, passives, granted traits, recipes |
-| `augments()` | `AugmentDef`: lasting team-wide modifiers |
+| `items()` | `ItemDef`: description, stat bonuses, passives, granted traits, recipes, single use |
+| `augments()` | `AugmentDef`: lasting team-wide modifiers, gold up front, and gold, experience, free rerolls or components every round (`per_round`) |
 | `schedule()` | `Schedule` of `RoundDef`s: Pvp, Pve, Draft, Choice and custom rounds |
-| `GameRules` | board size, item limit, star levels, economy, levels and shop odds (all have defaults) |
+| `GameRules` | board size, item limit, star levels, economy, levels, shop odds, rematch avoidance and board auto-fill (all have defaults) |
 | `sample_match()` | two boards to fight each other |
 | `tests()` | fights with expected results |
 
@@ -156,7 +191,7 @@ Beyond stat bonuses, content can express more complex rules:
 
 - **Conditions** gate a whole passive (`Passive::when`) or one effect per
   target (`EffectSpec::when`): `HealthBelow`, `HealthAbove`,
-  `Stunned`, `Shielded`, `HasTag`, `StacksAtLeast`, `AlliesWithTagAtLeast`,
+  `Stunned`, `Shielded`, `HasDebuff`, `HasTag`, `StacksAtLeast`, `AlliesWithTagAtLeast`,
   a seeded `Chance`, and `Not` / `All` / `Any` to combine them.
 - **Stacks** are named counters on a unit. `AddStacks` can be capped with
   `max`, and each stack can grant stats with `mods_per_stack`. `ClearStacks`
@@ -167,6 +202,72 @@ Beyond stat bonuses, content can express more complex rules:
   number of distinct units with the trait.
 - **Movement**: `Effect::knockback(n)` pushes a unit straight away from the
   source, and `Effect::leap()` jumps the source next to its target.
+- **Crowd control and statuses**: `Effect::stun(ms)`, `silence(ms)` (no
+  casting, though mana still builds), `disarm(ms)` (no attacks),
+  `root(ms)` (no walking) and `taunt(ms)` (the selected enemies must attack
+  the source). `wound(permille, ms)` cuts healing, with the strongest wound
+  applying, and `invulnerable(ms)` blocks all damage. `Effect::cleanse()`
+  removes every debuff: crowd control, wounds, damage over time and stat
+  changes that lower a stat. `Condition::HasDebuff` checks for one.
+  `unstoppable(ms)` makes a unit ignore new debuffs while it lasts. The
+  `Tenacity` stat shortens crowd control (stun, silence, disarm, root and
+  taunt) by its thousandths, up to 80%.
+- **Finishing and positioning**: `Effect::execute(permille)` kills a unit at
+  or below that share of its health, unless it is invulnerable.
+  `Effect::pull(n)` drags a unit up to `n` hexes toward the source.
+- **Targeting**: `UnitDef::targeting(Targeting::Farthest)` sends a unit
+  after the farthest enemy (assassins). The others are `LowestHealth`,
+  `HighestDamage`, `LowestArmor` and the default, `Nearest`. Taunts still
+  take priority.
+- **More targets**: `Selector::RandomEnemies(n)` (seeded, like everything
+  else), `HighestStatEnemies { stat, n }` and `HighestStatAllies { stat, n }`,
+  for example to buff the ally with the most attack damage.
+- **More triggers**: `Trigger::OnCrit` (the other unit is the one hit) and
+  `Trigger::OnShieldBroken` (the other unit is the one that broke it).
+- **Dodge**: the `Dodge` stat is a chance, in thousandths, for basic attacks
+  to miss. A miss gives no on-hit effects, and the client shows "miss".
+- **Single-use items**: `ItemDef::new("magnet", "Magnet").consumable(Consumable::RemoveItems)`.
+  Giving one to a unit uses it up instead of equipping it: `RemoveItems`
+  returns the unit's items to the player, `Duplicate` adds another copy of
+  the unit from the pool, `Reforge` swaps each item for another of the same
+  kind, and `Gold(n)` pays out. Single-use items never drop as random
+  components and cannot be part of a recipe. The sample has one, the
+  Lodestone.
+
+`combat.targets(unit, &selector)` returns what a selector would pick right
+now, which is handy for previews and tests.
+
+### Fight rules
+
+`GameRules::combat` (a `CombatConfig`) sets the tick length, the time limit
+(60 seconds by default, after which a fight is a draw) and **overtime**.
+From `overtime_after_ms` (30 seconds) on, all damage grows by
+`overtime_damage_per_second` thousandths (250) every second, so two boards
+that cannot finish each other still produce a winner. Clients show
+"OVERTIME" from that point. Set `overtime_after_ms` to 0 to turn it off.
+These rules travel with the content, so clients replay fights exactly.
+
+### Other languages
+
+Names and descriptions can be given in more languages:
+
+```rust
+ContentSet::builder()
+    // ... units, traits, items, augments ...
+    .translate("fr", "unit.ashen_hound.name", "Chien de cendre")
+    .translations("fr", [("trait.ember.name", "Braise"), ("trait.ember.description", "...")])
+```
+
+Keys are `unit.ID.name`, `unit.ID.ability`, `unit.ID.ability_description`,
+`item.ID.name`, `item.ID.description`, `trait.ID.name`,
+`trait.ID.description`, `augment.ID.name` and `augment.ID.description`. A key
+that names nothing fails the build, with a suggestion if it looks like a
+typo. `check` lists the texts each language is still missing; those show in
+the original language. Clients receive every language. Set
+`ClientState::language` (in the graphical client, `"language": "fr"` in the
+settings file) to show one, and `display_name` and `description` use it.
+Translations change no rules, so saved matches still replay after
+translating. The client's own buttons and labels are English for now.
 
 ```rust
 use autoengine::effect::{Condition, Effect, Passive, Selector, Trigger, Who};

@@ -2,7 +2,7 @@
 //!
 //! Each effect is read from `sounds/<name>.wav` or `sounds/<name>.ogg` in
 //! the assets folder (`hit`, `cast`, `heal`, `death`, `buy`, `victory`,
-//! `defeat`). An effect with no file is synthesised instead, so the game
+//! `defeat`, `tick`). An effect with no file is synthesised instead, so the game
 //! makes noise before any audio has been recorded. Playback needs the `audio` cargo feature, which is off by default
 //! because it needs the system's audio library to build and a sound device
 //! to run. Without it every call here does nothing.
@@ -18,6 +18,8 @@ pub enum Sfx {
     Buy,
     Victory,
     Defeat,
+    /// The last seconds of planning ticking away.
+    Tick,
 }
 
 impl Sfx {
@@ -31,6 +33,7 @@ impl Sfx {
             Sfx::Buy => "buy",
             Sfx::Victory => "victory",
             Sfx::Defeat => "defeat",
+            Sfx::Tick => "tick",
         }
     }
 }
@@ -40,7 +43,7 @@ pub fn file_bytes(assets: &std::path::Path, sfx: Sfx) -> Option<Vec<u8>> {
     ["wav", "ogg"].iter().find_map(|ext| std::fs::read(assets.join("sounds").join(format!("{}.{ext}", sfx.name()))).ok())
 }
 
-pub const ALL: [Sfx; 7] = [Sfx::Hit, Sfx::Cast, Sfx::Heal, Sfx::Death, Sfx::Buy, Sfx::Victory, Sfx::Defeat];
+pub const ALL: [Sfx; 8] = [Sfx::Hit, Sfx::Cast, Sfx::Heal, Sfx::Death, Sfx::Buy, Sfx::Victory, Sfx::Defeat, Sfx::Tick];
 
 const RATE: u32 = 22_050;
 
@@ -57,6 +60,7 @@ pub fn synth(sfx: Sfx) -> Vec<f32> {
         Sfx::Buy => (0.09, Box::new(move |_, t| tone(1200.0, t) * 0.4 * (1.0 - t / 0.09))),
         Sfx::Victory => (0.9, Box::new(move |_, t| tone([523.0, 659.0, 784.0][((t / 0.3) as usize).min(2)], t) * 0.5 * (1.0 - t / 0.9).sqrt())),
         Sfx::Defeat => (0.9, Box::new(move |_, t| tone([392.0, 330.0, 262.0][((t / 0.3) as usize).min(2)], t) * 0.5 * (1.0 - t / 0.9).sqrt())),
+        Sfx::Tick => (0.05, Box::new(move |_, t| tone(1800.0, t) * 0.3 * (1.0 - t / 0.05))),
     };
     let count = (seconds * RATE as f32) as usize;
     (0..count).map(|i| wave(i, i as f32 / RATE as f32).clamp(-1.0, 1.0)).collect()

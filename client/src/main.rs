@@ -13,17 +13,20 @@
 //! `fight` (fight playback), `assets` (models and icons), `viewer` (the asset
 //! viewer), `menu` and `console`. `docs/client.md` has the full list.
 //!
-//! Usage: `autoengine-client [--addr 127.0.0.1:7777] [--name NAME] [--spectate]
+//! Usage: `autoengine-client [--local] [--addr 127.0.0.1:7777] [--name NAME] [--spectate]
 //!         [--assets DIR] [--settings FILE] [--replay FILE] [--view FILE] [--autoplay] [--no-ready]
 //!         [--menu] [--stats] [--screenshot SECONDS:FILE]...`
+//!
+//! `--local` hosts the sample game inside the client (developer commands
+//! on, bots in the empty seats) and joins it: one command to try the game.
 //!
 //! `--view FILE` opens the asset viewer on a model file: it shows the model
 //! with its statistics, plays its animation clips, previews the particle
 //! effects, and reloads when the file changes.
 //!
 //! `--replay FILE` watches a fight the server saved (`--record`) without
-//! connecting to anything. Settings live in `autoengine-client.json` (see
-//! `settings.rs`) and can be changed from the menu.
+//! connecting to anything. Settings live in the system's settings folder
+//! (see `settings::default_path`) and can be changed from the menu.
 //!
 //! Controls: drag units between the bench and your half of the board, drag a
 //! unit onto the shop to sell it, drag items onto units, click shop cards to
@@ -104,12 +107,12 @@ struct Options {
 }
 
 fn parse_options() -> Result<Options, String> {
-    let usage = "usage: autoengine-client [--addr HOST:PORT] [--name NAME] [--spectate] [--assets DIR] [--settings FILE] [--replay FILE] [--view FILE] [--autoplay] \
+    let usage = "usage: autoengine-client [--local] [--addr HOST:PORT] [--name NAME] [--spectate] [--assets DIR] [--settings FILE] [--replay FILE] [--view FILE] [--autoplay] \
                  [--no-ready] [--menu] [--stats] [--screenshot SECONDS:FILE]...";
     let mut o = Options {
         addr: None,
         name: None,
-        settings: PathBuf::from("autoengine-client.json"),
+        settings: settings::default_path(),
         replay: None,
         view: None,
         menu: false,
@@ -126,6 +129,10 @@ fn parse_options() -> Result<Options, String> {
         let mut value = || args.next().ok_or(usage.to_string());
         match arg.as_str() {
             "--addr" => o.addr = Some(value()?),
+            "--local" => {
+                o.addr = Some(host_local_game()?);
+                o.assets = PathBuf::from(autoengine::sample::ASSETS);
+            }
             "--name" => o.name = Some(value()?),
             "--settings" => o.settings = PathBuf::from(value()?),
             "--replay" => o.replay = Some(PathBuf::from(value()?)),
@@ -146,6 +153,21 @@ fn parse_options() -> Result<Options, String> {
         }
     }
     Ok(o)
+}
+
+/// Starts a server for the sample game on a free local port, on its own
+/// thread for as long as the client runs, and returns its address.
+fn host_local_game() -> Result<String, String> {
+    use autoengine::net::Server;
+    use autoengine::session::{Session, SessionConfig};
+    let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
+    let mut session = Session::new(autoengine::sample::content(), SessionConfig { seed, ..SessionConfig::default() });
+    session.allow_dev(true);
+    let server = Server::bind("127.0.0.1:0").map_err(|e| format!("cannot start a local game: {e}"))?.spawn(session);
+    let addr = server.addr().to_string();
+    // The server thread stops when the client process exits.
+    std::mem::forget(server);
+    Ok(addr)
 }
 
 /// Options, settings and any problem reading the settings file; or the
@@ -189,6 +211,8 @@ struct App {
     error_shown_at: f64,
     /// Time left in the current phase as last reported, and when that was.
     countdown: (u64, f64),
+    /// The last whole second of planning a warning tick was played for.
+    ticked_at: i64,
     models: RefCell<Models>,
     /// Camera angle around the board, and distance as a multiple of the
     /// distance that just fits the board.
@@ -207,6 +231,12 @@ struct App {
     viewer: Option<Viewer>,
     /// The cheat console's input line while it is open.
     console: Option<String>,
+    /// The chat input line while it is open.
+    chat: Option<String>,
+    /// The forfeit button was pressed once and waits for a second press.
+    confirm_forfeit: bool,
+    /// When the list of games was last asked for.
+    rooms_asked_at: f64,
     /// Units and vertices drawn this frame, for the statistics overlay.
     drawn: Cell<(usize, usize)>,
     /// Recent frame times in milliseconds.
@@ -227,6 +257,7 @@ impl App {
         } else {
             GameClient::join(addr, self.options.name.clone().unwrap_or_else(|| self.settings.name.clone()))
         };
+        self.net.state.language = Some(self.settings.language.clone()).filter(|l| !l.is_empty());
     }
 
     /// The look of a unit given its content id.
@@ -256,14 +287,15 @@ impl App {
 
     /// Puts the theme (see `theme.rs`) into effect, loading its font file if
     /// it names one.
-    fn apply_theme(&mut self) {
+    pub(crate) fn apply_theme(&mut self) {
         let font = self.theme.font.as_ref().and_then(|file| {
             let path = self.options.assets.join(file);
             let loaded = std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| load_ttf_font_from_bytes(&b).map_err(|e| e.to_string()));
             loaded.map_err(|e| self.connect_error = Some(format!("font {}: {e}", path.display()))).ok()
         });
         theme::set_font(font);
-        theme::set_palette(self.theme.palette);
+        let palette = if self.settings.colorblind { self.theme.palette.colorblind_safe() } else { self.theme.palette };
+        theme::set_palette(palette);
         model::set_light(self.theme.light.direction, self.theme.light.ambient, self.theme.light.diffuse);
     }
 
@@ -285,7 +317,8 @@ impl App {
     /// Whether the key bound to an action was pressed this frame. Typing
     /// in the console does not set off other actions.
     fn pressed(&self, action: Action) -> bool {
-        (self.console.is_none() || action == Action::Console) && is_key_pressed(self.settings.key(action))
+        let typing = self.console.is_some() || self.chat.is_some();
+        (!typing || (action == Action::Console && self.chat.is_none())) && is_key_pressed(self.settings.key(action))
     }
 
     fn play(&mut self, sfx: Sfx) {
@@ -314,6 +347,43 @@ impl App {
         view.players.get(id.0 as usize)
     }
 
+    /// Ticks once a second through the last five seconds of planning.
+    fn warn_time_running_out(&mut self) {
+        let Some(view) = &self.net.state.view else { return };
+        let planning = matches!(view.phase, ViewPhase::Planning { .. }) && !view.paused && self.show.is_none();
+        let left = self.countdown.0 as f64 / 1000.0 - (get_time() - self.countdown.1);
+        let second = left.ceil() as i64;
+        let ready = self.me().is_some_and(|p| p.ready);
+        if planning && !ready && (1..=5).contains(&second) && second != self.ticked_at {
+            self.ticked_at = second;
+            self.play(Sfx::Tick);
+        }
+    }
+
+    /// Looks at the next living player's board (or the previous one), and
+    /// back at our own after the last.
+    fn scout(&mut self, back: bool) {
+        let Some(view) = &self.net.state.view else { return };
+        let me = self.net.state.seat;
+        let others: Vec<PlayerId> = view.players.iter().filter(|p| p.alive && Some(p.id) != me).map(|p| p.id).collect();
+        if others.is_empty() {
+            return;
+        }
+        // Positions: our own board (or the first player's, for spectators) is
+        // "before the first other".
+        let at = self.viewing.and_then(|v| others.iter().position(|p| *p == v));
+        let next = match (at, back) {
+            (None, false) => Some(0),
+            (None, true) => Some(others.len() - 1),
+            (Some(i), false) => (i + 1 < others.len()).then_some(i + 1),
+            (Some(i), true) => i.checked_sub(1),
+        };
+        self.viewing = next.map(|i| others[i]);
+        if self.viewing.is_none() && me.is_none() {
+            self.viewing = Some(others[0]);
+        }
+    }
+
     fn viewing_self(&self) -> bool {
         self.net.state.seat.is_some() && (self.viewing.is_none() || self.viewing == self.net.state.seat)
     }
@@ -325,7 +395,8 @@ impl App {
                 ViewPhase::Planning { remaining_ms } | ViewPhase::Showing { remaining_ms } => remaining_ms,
                 _ => 0,
             };
-            if remaining != self.countdown.0 {
+            // A paused clock stands still.
+            if remaining != self.countdown.0 || view.paused {
                 self.countdown = (remaining, get_time());
             }
         }
@@ -470,6 +541,9 @@ async fn main() {
         sounds: Sounds::load(&options.assets).await,
         viewer: options.view.clone().map(Viewer::new),
         console: None,
+        chat: None,
+        confirm_forfeit: false,
+        rooms_asked_at: -10.0,
         menu_open: options.menu,
         replay,
         drawn: Cell::new((0, 0)),
@@ -482,6 +556,7 @@ async fn main() {
         connect_error: None,
         error_shown_at: 0.0,
         countdown: (0, 0.0),
+        ticked_at: -1,
         models: RefCell::new(Models { assets: options.assets.clone(), files: HashMap::new(), figures: HashMap::new() }),
         camera_yaw: 0.0,
         camera_zoom: 1.0,
@@ -526,6 +601,11 @@ async fn main() {
             app.menu_open = !app.menu_open;
         }
         update_console(&mut app);
+        update_chat(&mut app);
+        app.warn_time_running_out();
+        if app.pressed(Action::Scout) {
+            app.scout(is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift));
+        }
         if app.pressed(Action::Stats) {
             app.settings.show_stats = !app.settings.show_stats;
             app.save_settings();
@@ -559,6 +639,7 @@ async fn main() {
             draw_stats(&app, &layout);
         }
         draw_console(&app, &layout);
+        draw_chat(&app, &layout);
         draw_banner(&app);
 
         if let Some((at, _)) = shots.peek()
@@ -618,6 +699,51 @@ fn draw_lobby(app: &mut App) {
     } else {
         text_centered("Spectating: waiting for the game to start", w / 2.0, y + 24.0, 20.0, ui().muted);
     }
+    draw_room_list(app);
+}
+
+/// On a server hosting many games: the other games, to enter one or open
+/// a new one. Refreshed every few seconds while the lobby shows.
+fn draw_room_list(app: &mut App) {
+    let Some(current) = app.net.state.room else { return };
+    if get_time() - app.rooms_asked_at > 3.0 {
+        app.rooms_asked_at = get_time();
+        app.send(ClientMsg::ListRooms);
+    }
+    let (w, h) = (screen_width(), screen_height());
+    let (pw, x) = (300.0, w - 320.0);
+    if x < w / 2.0 + 190.0 {
+        return; // no room beside the seats
+    }
+    let rooms = app.net.state.rooms.clone();
+    panel(x, h * 0.32, pw, 60.0 + rooms.len().min(10) as f32 * 40.0 + 56.0, ui().panel);
+    label("Games on this server", x + 14.0, h * 0.32 + 30.0, 20.0, ui().text);
+    let name = app.options.name.clone().unwrap_or_else(|| app.settings.name.clone());
+    let join = |app: &mut App| {
+        let (version, token) = (autoengine::protocol::PROTOCOL_VERSION, None);
+        if app.options.spectate {
+            app.send(ClientMsg::Spectate { version });
+        } else {
+            app.send(ClientMsg::Join { name: name.clone(), version, token });
+        }
+    };
+    for (i, room) in rooms.iter().take(10).enumerate() {
+        let y = h * 0.32 + 50.0 + i as f32 * 40.0;
+        let here = room.id == current;
+        let state = if room.over { "over" } else if room.started { "playing" } else { "waiting" };
+        let text = format!("{}  {}/{}  {state}", room.name, room.players, room.seats);
+        label(&text, x + 14.0, y + 22.0, 16.0, if here { ui().gold } else { ui().text });
+        if !here && !room.over && button("Enter", x + pw - 84.0, y, 70.0, 32.0, true) {
+            app.send(ClientMsg::EnterRoom { room: room.id });
+            join(app);
+        }
+    }
+    let y = h * 0.32 + 56.0 + rooms.len().min(10) as f32 * 40.0;
+    if button("New game", x + 14.0, y, pw - 28.0, 40.0, true) {
+        let title = format!("{name}'s game");
+        app.send(ClientMsg::CreateRoom { name: title, seats: None });
+        join(app);
+    }
 }
 
 fn draw_game(app: &mut App, layout: &Layout) {
@@ -642,6 +768,7 @@ fn draw_top_bar(app: &App) {
     label(&format!("Round {}  ({})", view.round_name, view.round_kind), 16.0, 29.0, 24.0, ui().text);
     let phase = match view.phase {
         ViewPhase::Lobby => "Lobby".to_string(),
+        _ if view.paused => "Paused".to_string(),
         ViewPhase::Planning { .. } if app.show.is_some() => "Fight".to_string(),
         ViewPhase::Planning { .. } => {
             let left = app.countdown.0 as f64 / 1000.0 - (get_time() - app.countdown.1);
@@ -680,7 +807,7 @@ fn draw_traits(app: &App, layout: &Layout) {
         let Some(def) = content.trait_def(&t.id) else { continue };
         let steps: Vec<String> = def.breakpoints.iter().map(|b| b.count.to_string()).collect();
         let color = if t.tier.is_some() { ui().gold } else { ui().muted };
-        label(&format!("{}  {}", t.count, def.name), 14.0, y, 20.0, color);
+        label(&format!("{}  {}", t.count, app.net.state.display_name(&def.id)), 14.0, y, 20.0, color);
         label(&format!("({})", steps.join(" / ")), 150.0, y, 16.0, ui().muted);
         y += 26.0;
     }
@@ -788,21 +915,42 @@ fn draw_game_over(app: &App) {
         return;
     }
     let (w, h) = (screen_width(), screen_height());
-    draw_rectangle(w / 2.0 - 240.0, h / 2.0 - 200.0, 480.0, 400.0, Color::new(0.04, 0.05, 0.07, 0.96));
+    let pw = 760.0_f32.min(w - 32.0);
+    let left = w / 2.0 - pw / 2.0;
+    draw_rectangle(left, h / 2.0 - 210.0, pw, 420.0, Color::new(0.04, 0.05, 0.07, 0.96));
     let title = match winner {
         Some(id) if Some(id) == app.net.state.seat => "You win!".to_string(),
         Some(id) => format!("{} wins", app.net.state.player_name(id)),
         None => "Game over".to_string(),
     };
-    text_centered(&title, w / 2.0, h / 2.0 - 150.0, 40.0, ui().gold);
+    text_centered(&title, w / 2.0, h / 2.0 - 160.0, 40.0, ui().gold);
+    // One row per player, best place first, with how their game went.
+    let columns = [("", 0.0), ("", 34.0), ("level", 230.0), ("fights", 300.0), ("kills", 390.0), ("gold", 460.0), ("rerolls", 540.0), ("stars", 630.0)];
+    let scale = pw / 760.0;
+    let header_y = h / 2.0 - 112.0;
+    for (name, x) in columns {
+        label(name, left + 24.0 + x * scale, header_y, 15.0, ui().muted);
+    }
     let mut players: Vec<&Player> = view.players.iter().collect();
     players.sort_by_key(|p| p.placement.unwrap_or(u32::MAX));
     for (i, p) in players.iter().enumerate() {
-        let y = h / 2.0 - 100.0 + i as f32 * 30.0;
+        let y = header_y + 32.0 + i as f32 * 30.0;
         let color = if Some(p.id) == app.net.state.seat { ui().gold } else { ui().text };
-        label(&format!("{}.", p.placement.unwrap_or(0)), w / 2.0 - 180.0, y, 22.0, ui().muted);
-        label(&p.name, w / 2.0 - 140.0, y, 22.0, color);
-        label(&format!("level {}", p.level), w / 2.0 + 80.0, y, 18.0, ui().muted);
+        let s = &p.stats;
+        let cells = [
+            format!("{}.", p.placement.unwrap_or(0)),
+            p.name.clone(),
+            p.level.to_string(),
+            format!("{}-{}", s.fights_won, s.fights_lost + s.fights_drawn),
+            s.kills.to_string(),
+            s.gold_earned.to_string(),
+            s.rerolls.to_string(),
+            "*".repeat(s.best_star as usize),
+        ];
+        for (cell, (_, x)) in cells.iter().zip(columns) {
+            let shade = if x == 0.0 { ui().muted } else { color };
+            label(cell, left + 24.0 + x * scale, y, 20.0, shade);
+        }
     }
 }
 

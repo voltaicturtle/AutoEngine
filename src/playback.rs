@@ -32,11 +32,26 @@ pub struct UnitView {
     pub alive: bool,
     pub casting: bool,
     pub stunned_until_ms: u32,
+    /// Statuses on the unit by [`StatusKind::name`](crate::effect::StatusKind::name),
+    /// each with when it ends; see [`UnitView::statuses_at`].
+    pub statuses: Vec<(&'static str, u32)>,
     /// Named stack counters (see `Effect::AddStacks`), without the empty ones.
     pub stacks: BTreeMap<String, u32>,
 }
 
 impl UnitView {
+    /// Names of the statuses the unit has at `time_ms`, each once, in the
+    /// order they were applied.
+    pub fn statuses_at(&self, time_ms: u32) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        for (name, until) in &self.statuses {
+            if *until > time_ms && !names.contains(name) {
+                names.push(*name);
+            }
+        }
+        names
+    }
+
     /// Position in fractional axial coordinates `(q, r)`, easing between
     /// hexes while a move is being animated.
     pub fn position_at(&self, time_ms: u32) -> (f32, f32) {
@@ -54,6 +69,8 @@ pub enum Flash {
     Heal { target: UnitId, amount: i64 },
     Cast { unit: UnitId },
     Death { unit: UnitId },
+    /// A basic attack on `target` missed.
+    Miss { target: UnitId },
 }
 
 /// The state of a replay at its current time.
@@ -68,6 +85,8 @@ pub struct Playback {
     flashes: Vec<(u32, Flash)>,
     winner: Option<Team>,
     ended: bool,
+    /// When overtime began, if it has.
+    overtime_at_ms: Option<u32>,
 }
 
 impl Playback {
@@ -82,6 +101,7 @@ impl Playback {
             flashes: Vec::new(),
             winner: record.winner,
             ended: false,
+            overtime_at_ms: None,
         };
         playback.advance_to(0);
         playback
@@ -119,6 +139,7 @@ impl Playback {
                         alive: true,
                         casting: false,
                         stunned_until_ms: 0,
+                        statuses: Vec::new(),
                         stacks: BTreeMap::new(),
                     },
                 );
@@ -131,6 +152,8 @@ impl Playback {
                 }
             }
             EventKind::Attacked { source, target } => self.flashes.push((at, Flash::Attack { source, target })),
+            EventKind::Dodged { target, .. } => self.flashes.push((at, Flash::Miss { target })),
+            EventKind::Overtime => self.overtime_at_ms = Some(at),
             EventKind::Damaged { target, amount, absorbed, kind, crit, .. } => {
                 if let Some(u) = self.units.get_mut(&target) {
                     u.health = (u.health - amount).max(0);
@@ -138,14 +161,14 @@ impl Playback {
                 }
                 self.flashes.push((at, Flash::Damage { target, amount, absorbed, kind, crit }));
             }
-            EventKind::Healed { target, amount } => {
+            EventKind::Healed { target, amount, .. } => {
                 if let Some(u) = self.units.get_mut(&target) {
                     u.health = (u.health + amount).min(u.max_health.max(u.health + amount));
                     u.max_health = u.max_health.max(u.health);
                 }
                 self.flashes.push((at, Flash::Heal { target, amount }));
             }
-            EventKind::Shielded { target, amount } => {
+            EventKind::Shielded { target, amount, .. } => {
                 if let Some(u) = self.units.get_mut(&target) {
                     u.shield += amount;
                 }
@@ -162,8 +185,25 @@ impl Playback {
                 self.flashes.push((at, Flash::Cast { unit }));
             }
             EventKind::StatusApplied { target, status, duration_ms, .. } => {
-                if let (Some(u), crate::effect::StatusKind::Stun) = (self.units.get_mut(&target), status) {
-                    u.stunned_until_ms = u.stunned_until_ms.max(at + duration_ms);
+                if let Some(u) = self.units.get_mut(&target) {
+                    if status == crate::effect::StatusKind::Stun {
+                        u.stunned_until_ms = u.stunned_until_ms.max(at + duration_ms);
+                    }
+                    u.statuses.push((status.name(), at + duration_ms));
+                }
+            }
+            EventKind::StatusExpired { target, status } => {
+                // The one ending soonest goes; it ends now (a cleanse can
+                // end it early).
+                if let Some(u) = self.units.get_mut(&target) {
+                    let name = status.name();
+                    let soonest = u.statuses.iter().enumerate().filter(|(_, (n, _))| *n == name).min_by_key(|(_, (_, until))| *until);
+                    if let Some((i, _)) = soonest {
+                        u.statuses.remove(i);
+                    }
+                    if status == crate::effect::StatusKind::Stun {
+                        u.stunned_until_ms = u.statuses.iter().filter(|(n, _)| *n == name).map(|(_, until)| *until).max().unwrap_or(at).min(u.stunned_until_ms);
+                    }
                 }
             }
             EventKind::Died { unit, .. } => {
@@ -185,7 +225,7 @@ impl Playback {
                 }
             }
             EventKind::Ended { .. } => self.ended = true,
-            EventKind::PassiveTriggered { .. } | EventKind::StatusExpired { .. } => {}
+            EventKind::PassiveTriggered { .. } => {}
         }
     }
 
@@ -208,6 +248,17 @@ impl Playback {
     }
 
     /// Every unit that has appeared so far, including the fallen.
+    /// Every unit's numbers for the whole fight (see [`fight_stats`]).
+    pub fn stats(&self) -> Vec<UnitFightStats> {
+        fight_stats(&self.events)
+    }
+
+    /// Whether the fight is in overtime by now (see
+    /// [`CombatConfig::overtime_after_ms`](crate::combat::CombatConfig)).
+    pub fn in_overtime(&self) -> bool {
+        self.overtime_at_ms.is_some()
+    }
+
     pub fn units(&self) -> impl Iterator<Item = &UnitView> {
         self.units.values()
     }
@@ -230,4 +281,77 @@ impl Playback {
         let now = self.time_ms;
         self.flashes.retain(|(at, _)| now.saturating_sub(*at) <= window_ms);
     }
+}
+
+/// How one unit did in a fight, for damage meters after the fight.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UnitFightStats {
+    pub unit: UnitId,
+    pub team: Team,
+    pub name: String,
+    /// Damage dealt, shields included.
+    pub damage_dealt: i64,
+    /// Damage taken, shields included.
+    pub damage_taken: i64,
+    /// Health restored to anyone, itself included.
+    pub healing_done: i64,
+    /// Shields given to anyone, itself included.
+    pub shielding_done: i64,
+    pub kills: u32,
+    pub casts: u32,
+    /// Basic attacks it dodged.
+    pub dodges: u32,
+    pub survived: bool,
+}
+
+/// Every unit's numbers for a fight, from its events: spawn order, which
+/// puts the home team first.
+pub fn fight_stats(events: &[Event]) -> Vec<UnitFightStats> {
+    let mut stats: BTreeMap<UnitId, UnitFightStats> = BTreeMap::new();
+    for event in events {
+        match &event.kind {
+            EventKind::Spawned { unit, team, name, .. } => {
+                stats.insert(*unit, UnitFightStats { unit: *unit, team: *team, name: name.clone(), survived: true, ..Default::default() });
+            }
+            EventKind::Damaged { source, target, amount, absorbed, .. } => {
+                let total = amount + absorbed;
+                if let Some(s) = stats.get_mut(source).filter(|_| source != target) {
+                    s.damage_dealt += total;
+                }
+                if let Some(s) = stats.get_mut(target) {
+                    s.damage_taken += total;
+                }
+            }
+            EventKind::Healed { source, amount, .. } => {
+                if let Some(s) = stats.get_mut(source) {
+                    s.healing_done += amount;
+                }
+            }
+            EventKind::Shielded { source, amount, .. } => {
+                if let Some(s) = stats.get_mut(source) {
+                    s.shielding_done += amount;
+                }
+            }
+            EventKind::CastFinished { unit } => {
+                if let Some(s) = stats.get_mut(unit) {
+                    s.casts += 1;
+                }
+            }
+            EventKind::Dodged { target, .. } => {
+                if let Some(s) = stats.get_mut(target) {
+                    s.dodges += 1;
+                }
+            }
+            EventKind::Died { unit, killer } => {
+                if let Some(s) = stats.get_mut(unit) {
+                    s.survived = false;
+                }
+                if let Some(s) = stats.get_mut(killer).filter(|_| killer != unit) {
+                    s.kills += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    stats.into_values().collect()
 }

@@ -22,7 +22,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::effect::{
-    Amount, Anchor, Condition, DamageKind, Effect, EffectSpec, ScaleBy, Selector, StatusKind, Trigger,
+    Amount, Anchor, Condition, DamageKind, Effect, EffectSpec, ScaleBy, Selector, StatusKind, Targeting, Trigger,
     UnitTemplate, Who,
 };
 use crate::hex::{Hex, HexBoard};
@@ -30,11 +30,11 @@ use crate::rng::Rng;
 use crate::stats::{Stat, StatMod, Stats};
 
 /// Identifies a unit within one combat. Ids are assigned in spawn order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct UnitId(pub u32);
 
 /// Identifies a side. Units on different teams are enemies.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Team(pub u8);
 
 /// Progress needed for one attack or one step: speeds are in thousandths per
@@ -58,8 +58,10 @@ pub type CustomEffectFn = dyn Fn(&mut EffectContext<'_>) + Send + Sync;
 /// rules as [`CustomEffectFn`] apply.
 pub type CustomConditionFn = dyn Fn(&ConditionContext<'_>) -> bool + Send + Sync;
 
-/// Tunable rules of the simulation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Tunable rules of the simulation. A game sets them in
+/// [`GameRules::combat`](crate::content::GameRules).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CombatConfig {
     /// Length of one simulation step.
     pub tick_ms: u32,
@@ -73,6 +75,13 @@ pub struct CombatConfig {
     pub resist_constant: i64,
     /// Cap on the `DamageReduction` stat, in permille.
     pub max_damage_reduction: i64,
+    /// From this point on all damage grows every second, so fights between
+    /// two boards that cannot finish each other still end. `0` turns
+    /// overtime off.
+    pub overtime_after_ms: u32,
+    /// How much more damage every second of overtime adds, in thousandths:
+    /// at 250, damage is doubled four seconds in.
+    pub overtime_damage_per_second: i64,
 }
 
 impl Default for CombatConfig {
@@ -84,6 +93,8 @@ impl Default for CombatConfig {
             mana_from_damage_cap: 40,
             resist_constant: 100,
             max_damage_reduction: 900,
+            overtime_after_ms: 30_000,
+            overtime_damage_per_second: 250,
         }
     }
 }
@@ -175,7 +186,15 @@ impl CombatUnit {
         self.cast_remaining_ms.is_some()
     }
     pub fn is_stunned(&self) -> bool {
-        self.statuses.iter().any(|s| matches!(s.kind, StatusKind::Stun))
+        self.has_status(|s| matches!(s, StatusKind::Stun))
+    }
+    /// Whether any status on the unit matches.
+    pub fn has_status(&self, matches: impl Fn(&StatusKind) -> bool) -> bool {
+        self.statuses.iter().any(|s| matches(&s.kind))
+    }
+    /// The statuses on the unit, with the time each has left.
+    pub fn statuses(&self) -> impl Iterator<Item = (&StatusKind, u32)> {
+        self.statuses.iter().map(|s| (&s.kind, s.remaining_ms))
     }
     /// Every stack the unit has, by name.
     pub fn all_stacks(&self) -> impl Iterator<Item = (&str, u32)> {
@@ -198,6 +217,11 @@ pub enum EventKind {
     /// Moved by an effect (knockback, leap, a custom hook) rather than by
     /// walking.
     Displaced { unit: UnitId, from: Hex, to: Hex },
+    /// A basic attack missed because the target dodged it.
+    Dodged { source: UnitId, target: UnitId },
+    /// The fight has gone on long enough that damage starts to grow (see
+    /// [`CombatConfig::overtime_after_ms`]).
+    Overtime,
     Attacked { source: UnitId, target: UnitId },
     Damaged {
         source: UnitId,
@@ -209,8 +233,9 @@ pub enum EventKind {
         kind: DamageKind,
         crit: bool,
     },
-    Healed { target: UnitId, amount: i64 },
-    Shielded { target: UnitId, amount: i64 },
+    /// `source` is whoever did the healing (the unit itself for lifesteal).
+    Healed { source: UnitId, target: UnitId, amount: i64 },
+    Shielded { source: UnitId, target: UnitId, amount: i64 },
     CastStarted { unit: UnitId },
     CastFinished { unit: UnitId },
     PassiveTriggered { unit: UnitId, passive: usize },
@@ -329,6 +354,12 @@ impl Combat {
     pub fn unit_at(&self, hex: Hex) -> Option<UnitId> {
         self.board.index(hex).and_then(|i| self.occupancy[i])
     }
+    /// The units a selector would pick for `source` right now, for tools,
+    /// tests and front ends that want to preview an ability.
+    pub fn targets(&self, source: UnitId, selector: &Selector) -> Vec<UnitId> {
+        self.select(selector, source, None)
+    }
+
     pub fn outcome(&self) -> Option<&Outcome> {
         self.outcome.as_ref()
     }
@@ -426,6 +457,10 @@ impl Combat {
             self.drain_triggers();
         }
         self.tick += 1;
+        let overtime = self.config.overtime_after_ms;
+        if overtime > 0 && self.time_ms() > overtime && self.time_ms() - self.config.tick_ms <= overtime {
+            self.emit(EventKind::Overtime);
+        }
         let acting = self.units.len();
         for i in 0..acting {
             if self.units[i].alive {
@@ -479,7 +514,8 @@ impl Combat {
 
         // Start a cast when mana is full.
         let max_mana = self.u(id).stat(Stat::MaxMana);
-        if max_mana > 0 && self.u(id).mana >= max_mana && self.u(id).template.ability.is_some() {
+        let silenced = self.u(id).has_status(|s| matches!(s, StatusKind::Silence));
+        if max_mana > 0 && self.u(id).mana >= max_mana && self.u(id).template.ability.is_some() && !silenced {
             let cast_time = self.u(id).template.ability.as_ref().unwrap().cast_time_ms;
             self.u_mut(id).mana = 0;
             self.emit(EventKind::CastStarted { unit: id });
@@ -499,6 +535,9 @@ impl Combat {
         let range = self.u(id).stat(Stat::Range).max(1) as u32;
 
         if pos.distance(target_pos) <= range {
+            if self.u(id).has_status(|s| matches!(s, StatusKind::Disarm)) {
+                return;
+            }
             let speed = self.u(id).stat(Stat::AttackSpeed);
             self.u_mut(id).attack_progress += speed * tick_ms as i64;
             while self.u(id).attack_progress >= PROGRESS_FULL {
@@ -511,6 +550,9 @@ impl Combat {
                 self.basic_attack(id, target);
             }
         } else {
+            if self.u(id).has_status(|s| matches!(s, StatusKind::Root)) {
+                return;
+            }
             let speed = self.u(id).stat(Stat::MoveSpeed);
             self.u_mut(id).move_progress += speed * tick_ms as i64;
             if self.u(id).move_progress >= PROGRESS_FULL {
@@ -598,18 +640,32 @@ impl Combat {
     }
 
     fn acquire_target(&mut self, id: UnitId) -> Option<UnitId> {
+        // The latest taunt from a living enemy decides.
+        let taunter = self.u(id).statuses.iter().rev().find_map(|s| {
+            let alive_enemy = self.u(s.source).alive && self.u(s.source).team != self.u(id).team;
+            (matches!(s.kind, StatusKind::Taunt) && alive_enemy).then_some(s.source)
+        });
+        if let Some(t) = taunter {
+            self.u_mut(id).target = Some(t);
+            return Some(t);
+        }
         if let Some(t) = self.u(id).target
             && self.u(t).alive
         {
             return Some(t);
         }
         let me = self.u(id);
-        let target = self
-            .units
-            .iter()
-            .filter(|o| o.alive && o.team != me.team)
-            .min_by_key(|o| (me.pos.distance(o.pos), o.id))
-            .map(|o| o.id);
+        let enemies = self.units.iter().filter(|o| o.alive && o.team != me.team);
+        // Ties go to the nearest, then the lowest id.
+        let near = |o: &CombatUnit| (me.pos.distance(o.pos), o.id);
+        let target = match me.template.targeting {
+            Targeting::Nearest => enemies.min_by_key(|o| near(o)),
+            Targeting::Farthest => enemies.min_by_key(|o| (std::cmp::Reverse(me.pos.distance(o.pos)), o.id)),
+            Targeting::LowestHealth => enemies.min_by_key(|o| (o.health, near(o))),
+            Targeting::HighestDamage => enemies.min_by_key(|o| (std::cmp::Reverse(o.stat(Stat::AttackDamage)), near(o))),
+            Targeting::LowestArmor => enemies.min_by_key(|o| (o.stat(Stat::Armor), near(o))),
+        }
+        .map(|o| o.id);
         self.u_mut(id).target = target;
         target
     }
@@ -653,6 +709,11 @@ impl Combat {
         let damage = self.u(id).stat(Stat::AttackDamage);
         let mana = self.u(id).stat(Stat::ManaPerAttack);
         self.add_mana(id, mana);
+        let dodge = self.u(target).stat(Stat::Dodge);
+        if dodge > 0 && self.rng.chance(dodge.min(1000) as u64, 1000) {
+            self.emit(EventKind::Dodged { source: id, target });
+            return;
+        }
         self.deal_damage(id, target, damage, DamageKind::Physical, true, true);
         self.fire(id, Some(target), |t| matches!(t, Trigger::OnAttack));
     }
@@ -745,6 +806,7 @@ impl Combat {
                 who(w).is_some_and(|id| health_permille(self.u(id)) > *permille as i64)
             }
             Condition::Stunned(w) => who(w).is_some_and(|id| self.u(id).is_stunned()),
+            Condition::HasDebuff(w) => who(w).is_some_and(|id| self.u(id).has_status(StatusKind::is_debuff)),
             Condition::Shielded(w) => who(w).is_some_and(|id| self.u(id).shield() > 0),
             Condition::HasTag { who: w, tag } => who(w).is_some_and(|id| self.u(id).has_tag(tag)),
             Condition::StacksAtLeast { who: w, stack, count } => {
@@ -811,6 +873,20 @@ impl Combat {
             Selector::AlliesWithTag(tag) => {
                 ids(&mut allies().filter(|o| o.template.tags.iter().any(|t| t == tag)))
             }
+            Selector::RandomEnemies(n) => {
+                // The fight's dice, forked so choosing does not move them.
+                let mut dice = self.rng.clone().fork((self.tick as u64) << 16 | source.0 as u64);
+                let mut pool = ids(&mut enemies());
+                dice.shuffle(&mut pool);
+                pool.truncate(*n as usize);
+                pool
+            }
+            Selector::HighestStatEnemies { stat, n } => {
+                take_sorted(enemies(), *n, |o| std::cmp::Reverse(o.stat(*stat)))
+            }
+            Selector::HighestStatAllies { stat, n } => {
+                take_sorted(allies(), *n, |o| std::cmp::Reverse(o.stat(*stat)))
+            }
         }
     }
 
@@ -849,7 +925,7 @@ impl Combat {
             }
             Effect::Heal { amount } => {
                 let raw = self.eval(amount, source, target);
-                self.heal(target, raw);
+                self.heal(source, target, raw);
             }
             Effect::Shield { amount, duration_ms } => {
                 let value = self.eval(amount, source, target);
@@ -857,11 +933,25 @@ impl Combat {
                     self.u_mut(target)
                         .shields
                         .push(ShieldInstance { amount: value, remaining_ms: *duration_ms });
-                    self.emit(EventKind::Shielded { target, amount: value });
+                    self.emit(EventKind::Shielded { source, target, amount: value });
                 }
             }
             Effect::GainMana { amount } => self.add_mana(target, *amount),
             Effect::ApplyStatus { status, duration_ms } => {
+                let t = self.u(target);
+                if status.is_debuff() && t.has_status(|s| matches!(s, StatusKind::Unstoppable)) {
+                    return;
+                }
+                let crowd_control = matches!(
+                    status,
+                    StatusKind::Stun | StatusKind::Silence | StatusKind::Disarm | StatusKind::Root | StatusKind::Taunt
+                );
+                let duration_ms = &if crowd_control {
+                    let tenacity = t.stat(Stat::Tenacity).clamp(0, 800) as u32;
+                    duration_ms - duration_ms * tenacity / 1000
+                } else {
+                    *duration_ms
+                };
                 if *duration_ms == 0 {
                     return;
                 }
@@ -881,6 +971,47 @@ impl Combat {
                 });
             }
             Effect::ModifyStats { mods } => self.change_stats(target, mods, true),
+            Effect::Execute { permille } => {
+                let t = self.u(target);
+                if t.health * 1000 <= t.stat(Stat::MaxHealth) * *permille as i64 {
+                    let all = t.health + t.shield();
+                    self.deal_damage(source, target, all.max(1) * 10, DamageKind::True, false, direct);
+                }
+            }
+            Effect::Pull { hexes } => {
+                if source == target {
+                    return;
+                }
+                let origin = self.u(source).pos;
+                let mut pos = self.u(target).pos;
+                for _ in 0..*hexes {
+                    if pos.distance(origin) <= 1 {
+                        break;
+                    }
+                    let line = pos.line_to(origin);
+                    match line.get(1) {
+                        Some(&next) if self.is_free(next) => pos = next,
+                        _ => break,
+                    }
+                }
+                self.displace(target, pos);
+            }
+            Effect::Cleanse => {
+                let mut removed = Vec::new();
+                self.u_mut(target).statuses.retain(|s| {
+                    let debuff = s.kind.is_debuff();
+                    if debuff {
+                        removed.push(s.kind.clone());
+                    }
+                    !debuff
+                });
+                for kind in removed {
+                    if let StatusKind::StatMods(mods) = &kind {
+                        self.change_stats(target, mods, false);
+                    }
+                    self.emit(EventKind::StatusExpired { target, status: kind });
+                }
+            }
             Effect::Summon { unit, count } => {
                 let Some(template) = self.library.get(unit).cloned() else {
                     return;
@@ -1004,16 +1135,26 @@ impl Combat {
         unit.mana = (unit.mana + amount).clamp(0, max);
     }
 
-    fn heal(&mut self, id: UnitId, amount: i64) {
+    fn heal(&mut self, source: UnitId, id: UnitId, amount: i64) {
         let unit = self.u_mut(id);
         if !unit.alive || amount <= 0 {
             return;
         }
+        let wound = unit
+            .statuses
+            .iter()
+            .filter_map(|s| match s.kind {
+                StatusKind::Wound { permille } => Some(permille.min(1000) as i64),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let amount = amount * (1000 - wound) / 1000;
         let max = unit.stats.get(Stat::MaxHealth);
         let healed = amount.min(max - unit.health).max(0);
         unit.health += healed;
         if healed > 0 {
-            self.emit(EventKind::Healed { target: id, amount: healed });
+            self.emit(EventKind::Healed { source, target: id, amount: healed });
         }
     }
 
@@ -1032,6 +1173,9 @@ impl Combat {
         if !self.u(target).alive || raw <= 0 {
             return;
         }
+        if self.u(target).has_status(|s| matches!(s, StatusKind::Invulnerable)) {
+            return;
+        }
         let (crit_chance, crit_damage, amp, lifesteal) = {
             let s = self.u(source);
             (
@@ -1047,6 +1191,11 @@ impl Combat {
             amount = amount * crit_damage.max(1000) / 1000;
         }
         amount = amount * (1000 + amp) / 1000;
+        let overtime = self.config.overtime_after_ms;
+        if overtime > 0 && self.time_ms() > overtime {
+            let seconds = ((self.time_ms() - overtime) / 1000 + 1) as i64;
+            amount = amount * (1000 + self.config.overtime_damage_per_second * seconds) / 1000;
+        }
 
         let k = self.config.resist_constant.max(1);
         let t = self.u(target);
@@ -1075,15 +1224,23 @@ impl Combat {
                 break;
             }
         }
+        let shields_before = unit.shields.len();
         unit.shields.retain(|s| s.amount > 0);
+        let broken = shields_before - unit.shields.len();
         let absorbed = amount - left;
         unit.health -= left;
         let health = unit.health;
         let max_health = unit.stats.get(Stat::MaxHealth);
         self.emit(EventKind::Damaged { source, target, amount: left, absorbed, kind, crit });
+        if crit && source != target {
+            self.fire(source, Some(target), |t| matches!(t, Trigger::OnCrit));
+        }
+        for _ in 0..broken {
+            self.fire(target, Some(source), |t| matches!(t, Trigger::OnShieldBroken));
+        }
 
         if lifesteal > 0 && source != target {
-            self.heal(source, amount * lifesteal / 1000);
+            self.heal(source, source, amount * lifesteal / 1000);
         }
 
         if health <= 0 {

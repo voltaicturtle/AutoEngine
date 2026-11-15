@@ -108,6 +108,21 @@ impl Default for Theme {
     }
 }
 
+impl Palette {
+    /// The same palette with colours people with red-green colour
+    /// blindness can tell apart (from the Okabe-Ito set): blue against
+    /// orange for the two sides, bluish green against vermilion for good
+    /// and bad.
+    pub fn colorblind_safe(mut self) -> Palette {
+        self.friend = rgb(86, 180, 233);
+        self.enemy = rgb(230, 159, 0);
+        self.good = rgb(0, 158, 115);
+        self.bad = rgb(213, 94, 0);
+        self.accent = rgb(86, 180, 233);
+        self
+    }
+}
+
 thread_local! {
     static PALETTE: Cell<Palette> = Cell::new(Theme::default().palette);
     static FONT: RefCell<Option<Font>> = const { RefCell::new(None) };
@@ -154,5 +169,16 @@ mod tests {
         dark.background = BLACK;
         set_palette(dark);
         assert_eq!(ui().background, BLACK);
+    }
+
+    #[test]
+    fn the_colorblind_palette_changes_only_the_problem_colours() {
+        let plain = Theme::default().palette;
+        let safe = plain.colorblind_safe();
+        assert_ne!(safe.friend, plain.friend);
+        assert_ne!(safe.enemy, plain.enemy);
+        assert_ne!(safe.good, safe.bad);
+        assert_eq!(safe.background, plain.background);
+        assert_eq!(safe.text, plain.text);
     }
 }

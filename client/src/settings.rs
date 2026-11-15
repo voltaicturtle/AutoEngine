@@ -4,7 +4,7 @@
 //! missing file is not an error. The file is rewritten whenever a setting
 //! changes in the pause menu.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use std::collections::BTreeMap;
 
@@ -31,9 +31,15 @@ pub struct Settings {
     pub show_stats: bool,
     /// How fast a right-drag turns the camera, as a percentage.
     pub camera_turn_percent: u32,
+    /// Colours that people with red-green colour blindness can tell apart.
+    pub colorblind: bool,
+    /// Language code to show the game's names in (such as `fr`), if the
+    /// game has that language; empty for the game's own text.
+    pub language: String,
     /// Which key does what: action name to key name. Actions are `menu`,
-    /// `stats`, `skip`, `camera_reset` and `console`; see [`key_code`] for
-    /// the key names. Actions left out keep their default key.
+    /// `stats`, `skip`, `camera_reset`, `console`, `chat`, `reroll`,
+    /// `buy_xp`, `sell`, `lock_shop`, `ready` and `scout`; see [`key_code`] for the
+    /// key names. Actions left out keep their default key.
     pub keys: BTreeMap<String, String>,
 }
 
@@ -45,10 +51,32 @@ pub enum Action {
     Skip,
     CameraReset,
     Console,
+    Chat,
+    Reroll,
+    BuyXp,
+    /// Sells the unit under the mouse.
+    Sell,
+    LockShop,
+    Ready,
+    /// Looks at the next player's board (with Shift, the previous one).
+    Scout,
 }
 
 impl Action {
-    pub const ALL: [Action; 5] = [Action::Menu, Action::Stats, Action::Skip, Action::CameraReset, Action::Console];
+    pub const ALL: [Action; 12] = [
+        Action::Menu,
+        Action::Stats,
+        Action::Skip,
+        Action::CameraReset,
+        Action::Console,
+        Action::Chat,
+        Action::Reroll,
+        Action::BuyXp,
+        Action::Sell,
+        Action::LockShop,
+        Action::Ready,
+        Action::Scout,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -57,6 +85,13 @@ impl Action {
             Action::Skip => "skip",
             Action::CameraReset => "camera_reset",
             Action::Console => "console",
+            Action::Chat => "chat",
+            Action::Reroll => "reroll",
+            Action::BuyXp => "buy_xp",
+            Action::Sell => "sell",
+            Action::LockShop => "lock_shop",
+            Action::Ready => "ready",
+            Action::Scout => "scout",
         }
     }
 
@@ -67,6 +102,13 @@ impl Action {
             Action::Skip => "Space",
             Action::CameraReset => "Home",
             Action::Console => "F1",
+            Action::Chat => "Enter",
+            Action::Reroll => "D",
+            Action::BuyXp => "F",
+            Action::Sell => "E",
+            Action::LockShop => "L",
+            Action::Ready => "R",
+            Action::Scout => "Tab",
         }
     }
 }
@@ -116,6 +158,30 @@ pub fn key_code(name: &str) -> Option<KeyCode> {
     })
 }
 
+/// Where the settings file goes when `--settings` does not say: the
+/// operating system's place for program settings (`%APPDATA%` on Windows,
+/// `~/Library/Application Support` on macOS, `$XDG_CONFIG_HOME` or
+/// `~/.config` elsewhere), in an `autoengine` folder. A file already in the
+/// folder the client starts from wins, so older setups keep working.
+pub fn default_path() -> PathBuf {
+    let local = PathBuf::from("autoengine-client.json");
+    if local.is_file() {
+        return local;
+    }
+    let env = |name| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let base = if cfg!(windows) {
+        env("APPDATA")
+    } else if cfg!(target_os = "macos") {
+        env("HOME").map(|h| h.join("Library/Application Support"))
+    } else {
+        env("XDG_CONFIG_HOME").or_else(|| env("HOME").map(|h| h.join(".config")))
+    };
+    match base {
+        Some(dir) => dir.join("autoengine").join("client.json"),
+        None => local,
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -130,6 +196,8 @@ impl Default for Settings {
             animations: true,
             show_stats: false,
             camera_turn_percent: 100,
+            language: String::new(),
+            colorblind: false,
             keys: Action::ALL.iter().map(|a| (a.name().to_string(), a.default_key().to_string())).collect(),
         }
     }
@@ -185,6 +253,9 @@ impl Settings {
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)?;
+        }
         std::fs::write(path, self.to_text() + "\n")
     }
 }
@@ -192,6 +263,17 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_go_in_the_system_folder_and_its_folder_is_made() {
+        let path = default_path();
+        assert!(path.ends_with("autoengine/client.json") || path == Path::new("autoengine-client.json"), "{}", path.display());
+        let dir = std::env::temp_dir().join(format!("autoengine-settings-{}", std::process::id()));
+        let file = dir.join("nested").join("client.json");
+        Settings::default().save(&file).unwrap();
+        assert!(file.is_file());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn settings_survive_a_round_trip() {

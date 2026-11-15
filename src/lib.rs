@@ -23,8 +23,8 @@
 //! ```
 //!
 //! The `examples/` folder has longer ones: a whole game played by bots, a
-//! round type and a rule written in Rust, a game hosted in-process, and a
-//! server with two players over TCP.
+//! round type and a rule written in Rust, a game hosted in-process, a
+//! server with two players over TCP, and a match saved and played back.
 //!
 //! # Layers
 //!
@@ -38,7 +38,7 @@
 //! | Fights | [`effect`], [`combat`] | abilities built from effect blocks, and the tick-based fight simulation |
 //! | Content | [`content`], [`sample`] | units, traits, items, augments and rounds, defined in Rust; a complete sample game |
 //! | Game | [`game`], [`round`], [`bot`], `script` | the lobby: shop, economy, round loop, pluggable round types, scripts, computer players |
-//! | Hosting | [`protocol`], [`session`], [`net`], [`replay`] | messages, a hosted game with seats and timers, TCP, saved fights |
+//! | Hosting | [`protocol`], [`session`], [`hub`], [`ladder`], [`net`], [`replay`], [`matchlog`] | messages, a hosted game with seats and timers, many games on one server, ratings, TCP, saved fights and whole matches |
 //! | Display | [`client`], [`playback`] | what a front end needs to show a game, with no rendering in it |
 //! | Tools | [`tools`] | the command line, content checker, content tests, balance simulator, starter game, benchmarks |
 //!
@@ -53,6 +53,8 @@
 //! | a rule that reacts to events in Rust | [`game::GameHook`] and [`game::Game::add_hook`] |
 //! | either of those on a hosted game | [`session::Session::on_start`] |
 //! | a networked game | [`net::Server`] and [`net::GameClient`] |
+//! | many games on one server | [`hub::Hub`] |
+//! | saving, checking or resuming a whole match | [`matchlog::MatchLog`] and [`session::Session::resume`] |
 //! | another transport than TCP | drive [`session::Session`] yourself: `handle`, `tick`, `drain_outbox` |
 //! | another front end | [`client::ClientState`] and [`playback::Playback`] |
 //!
@@ -68,6 +70,9 @@ pub mod content;
 pub mod effect;
 pub mod game;
 pub mod hex;
+pub mod hub;
+pub mod ladder;
+pub mod matchlog;
 pub mod net;
 pub mod playback;
 pub mod protocol;
@@ -94,4 +99,34 @@ pub mod prelude {
     pub use crate::net::{GameClient, Server, ServerConfig};
     pub use crate::session::{Session, SessionConfig};
     pub use crate::stats::Stat;
+}
+
+/// The content guides in `docs/guides`, so `cargo test` compiles and runs
+/// every Rust example in them.
+#[cfg(doctest)]
+mod guides {
+    #[doc = include_str!("../docs/guides/README.md")]
+    struct Readme;
+    #[doc = include_str!("../docs/guides/units.md")]
+    struct Units;
+    #[doc = include_str!("../docs/guides/effects.md")]
+    struct Effects;
+    #[doc = include_str!("../docs/guides/traits.md")]
+    struct Traits;
+    #[doc = include_str!("../docs/guides/items.md")]
+    struct Items;
+    #[doc = include_str!("../docs/guides/augments.md")]
+    struct Augments;
+    #[doc = include_str!("../docs/guides/rounds.md")]
+    struct Rounds;
+    #[doc = include_str!("../docs/guides/events.md")]
+    struct Events;
+    #[doc = include_str!("../docs/guides/scripting.md")]
+    struct Scripting;
+    #[doc = include_str!("../docs/guides/rules.md")]
+    struct Rules;
+    #[doc = include_str!("../docs/guides/fights.md")]
+    struct Fights;
+    #[doc = include_str!("../docs/guides/testing.md")]
+    struct Testing;
 }

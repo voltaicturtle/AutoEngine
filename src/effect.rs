@@ -115,6 +115,56 @@ pub enum StatusKind {
     StatMods(Vec<StatMod>),
     /// Damage every tick, expressed per second.
     DamageOverTime { per_second: Amount, kind: DamageKind },
+    /// Cannot start casting. Mana still builds up.
+    Silence,
+    /// Cannot make basic attacks, but can move and cast.
+    Disarm,
+    /// Cannot move, but can attack what is in range and cast.
+    Root,
+    /// Must attack the unit that applied it while that unit lives.
+    Taunt,
+    /// Healing received is cut by this many thousandths. The strongest
+    /// wound on a unit applies.
+    Wound { permille: u32 },
+    /// Takes no damage.
+    Invulnerable,
+    /// New debuffs do not take hold (see [`StatusKind::is_debuff`]).
+    Unstoppable,
+}
+
+impl StatusKind {
+    /// Whether the status hurts the unit it is on, so that
+    /// [`Effect::Cleanse`] removes it. Stat changes count when any of them
+    /// lowers a stat.
+    pub fn is_debuff(&self) -> bool {
+        match self {
+            StatusKind::Stun
+            | StatusKind::Silence
+            | StatusKind::Disarm
+            | StatusKind::Root
+            | StatusKind::Taunt
+            | StatusKind::Wound { .. }
+            | StatusKind::DamageOverTime { .. } => true,
+            StatusKind::StatMods(mods) => mods.iter().any(StatMod::lowers),
+            StatusKind::Invulnerable | StatusKind::Unstoppable => false,
+        }
+    }
+
+    /// A short name for logs and tooltips.
+    pub fn name(&self) -> &'static str {
+        match self {
+            StatusKind::Stun => "stunned",
+            StatusKind::StatMods(_) => "stat-modified",
+            StatusKind::DamageOverTime { .. } => "afflicted",
+            StatusKind::Silence => "silenced",
+            StatusKind::Disarm => "disarmed",
+            StatusKind::Root => "rooted",
+            StatusKind::Taunt => "taunted",
+            StatusKind::Wound { .. } => "wounded",
+            StatusKind::Invulnerable => "invulnerable",
+            StatusKind::Unstoppable => "unstoppable",
+        }
+    }
 }
 
 /// What happens to each selected unit.
@@ -154,6 +204,14 @@ pub enum Effect {
     },
     /// Resets a named stack to zero and removes the stats it granted.
     ClearStacks { stack: String },
+    /// Removes every debuff from the unit (see [`StatusKind::is_debuff`]).
+    Cleanse,
+    /// Kills the unit outright if its health is at or below this many
+    /// thousandths of its maximum. Invulnerable units are spared.
+    Execute { permille: u32 },
+    /// Drags the unit up to `hexes` steps toward the source, stopping next
+    /// to it or at another unit.
+    Pull { hexes: u32 },
     /// Pushes the unit up to `hexes` steps directly away from the source.
     Knockback { hexes: u32 },
     /// The source jumps to the free hex closest to the selected unit, and
@@ -207,6 +265,48 @@ impl Effect {
 
     pub fn stun(duration_ms: u32) -> Self {
         Effect::ApplyStatus { status: StatusKind::Stun, duration_ms }
+    }
+
+    pub fn silence(duration_ms: u32) -> Self {
+        Effect::ApplyStatus { status: StatusKind::Silence, duration_ms }
+    }
+
+    pub fn disarm(duration_ms: u32) -> Self {
+        Effect::ApplyStatus { status: StatusKind::Disarm, duration_ms }
+    }
+
+    pub fn root(duration_ms: u32) -> Self {
+        Effect::ApplyStatus { status: StatusKind::Root, duration_ms }
+    }
+
+    /// Forces the selected enemies to attack the source.
+    pub fn taunt(duration_ms: u32) -> Self {
+        Effect::ApplyStatus { status: StatusKind::Taunt, duration_ms }
+    }
+
+    /// Cuts healing received by `permille` thousandths.
+    pub fn wound(permille: u32, duration_ms: u32) -> Self {
+        Effect::ApplyStatus { status: StatusKind::Wound { permille }, duration_ms }
+    }
+
+    pub fn invulnerable(duration_ms: u32) -> Self {
+        Effect::ApplyStatus { status: StatusKind::Invulnerable, duration_ms }
+    }
+
+    pub fn cleanse() -> Self {
+        Effect::Cleanse
+    }
+
+    pub fn unstoppable(duration_ms: u32) -> Self {
+        Effect::ApplyStatus { status: StatusKind::Unstoppable, duration_ms }
+    }
+
+    pub fn execute(permille: u32) -> Self {
+        Effect::Execute { permille }
+    }
+
+    pub fn pull(hexes: u32) -> Self {
+        Effect::Pull { hexes }
     }
 
     /// Temporary stat changes (positive or negative), reverted afterwards.
@@ -317,6 +417,12 @@ pub enum Selector {
     AlliesWithin { anchor: Anchor, radius: u32 },
     /// Allies whose template carries the given tag (trait, role, ...).
     AlliesWithTag(String),
+    /// Up to `n` enemies picked at random (from the fight's seeded dice).
+    RandomEnemies(u32),
+    /// The `n` enemies with the most of a stat.
+    HighestStatEnemies { stat: Stat, n: u32 },
+    /// The `n` allies (the source included) with the most of a stat.
+    HighestStatAllies { stat: Stat, n: u32 },
 }
 
 /// A yes/no question asked when a passive fires or an effect resolves.
@@ -334,6 +440,8 @@ pub enum Condition {
     HealthAbove { who: Who, permille: u32 },
     Stunned(Who),
     Shielded(Who),
+    /// The unit has at least one debuff (see [`StatusKind::is_debuff`]).
+    HasDebuff(Who),
     HasTag { who: Who, tag: String },
     /// The unit has at least `count` of a named stack.
     StacksAtLeast { who: Who, stack: String, count: u32 },
@@ -427,6 +535,9 @@ impl EffectSpec {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ability {
     pub name: String,
+    /// What it does, for players to read.
+    #[serde(default)]
+    pub description: String,
     /// Time the unit spends casting before the effects resolve.
     #[serde(default)]
     pub cast_time_ms: u32,
@@ -435,7 +546,13 @@ pub struct Ability {
 
 impl Ability {
     pub fn new(name: impl Into<String>) -> Self {
-        Ability { name: name.into(), cast_time_ms: 0, effects: Vec::new() }
+        Ability { name: name.into(), description: String::new(), cast_time_ms: 0, effects: Vec::new() }
+    }
+
+    /// What it does, for players to read.
+    pub fn description(mut self, text: impl Into<String>) -> Self {
+        self.description = text.into();
+        self
     }
 
     pub fn cast_time(mut self, ms: u32) -> Self {
@@ -462,6 +579,11 @@ pub enum Trigger {
     OnKill,
     OnDeath,
     OnAllyDeath,
+    /// The unit landed a critical hit; the other unit is the one hit.
+    OnCrit,
+    /// One of the unit's shields was used up by damage; the other unit is
+    /// the one that broke it.
+    OnShieldBroken,
     /// Repeats on a fixed interval while the owner is alive.
     Every { interval_ms: u32 },
     /// The owner's health drops to or below this share of its maximum.
@@ -523,6 +645,24 @@ pub struct UnitTemplate {
     pub passives: Vec<Passive>,
     /// Free-form labels (traits, roles) that selectors can match on.
     pub tags: Vec<String>,
+    /// Which enemy the unit goes after when it needs a new target.
+    pub targeting: Targeting,
+}
+
+/// How a unit picks its target when it has none (or its target died).
+/// Taunts still win.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Targeting {
+    #[default]
+    Nearest,
+    /// The enemy farthest away: assassins that dive the back line.
+    Farthest,
+    /// The enemy with the least health left.
+    LowestHealth,
+    /// The enemy with the most attack damage.
+    HighestDamage,
+    /// The enemy with the least armor.
+    LowestArmor,
 }
 
 impl UnitTemplate {
@@ -534,6 +674,7 @@ impl UnitTemplate {
             ability: None,
             passives: Vec::new(),
             tags: Vec::new(),
+            targeting: Targeting::Nearest,
         }
     }
 
@@ -554,6 +695,17 @@ impl UnitTemplate {
 
     pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
         self.tags.push(tag.into());
+        self
+    }
+
+    pub fn with_targeting(mut self, targeting: Targeting) -> Self {
+        self.targeting = targeting;
+        self
+    }
+
+    /// Sets one base stat.
+    pub fn with_stat(mut self, stat: crate::stats::Stat, value: i64) -> Self {
+        self.stats = self.stats.with(stat, value);
         self
     }
 }

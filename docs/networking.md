@@ -27,7 +27,86 @@ let session = server.stop()?;                               // hand back the gam
 ```
 
 `Server::run(session, &stop)` does the same on the calling thread. Add
-round types and hooks to a hosted game with `Session::on_start`.
+round types and hooks to a hosted game with `Session::on_start`. Other
+settings on a session: `set_bot_difficulty(Difficulty::Hard)` for the bots
+in empty seats, `allow_chat(false)` to turn chat off, `announce("...")` to
+post a message from the server, `allow_dev(true)` for cheats,
+`set_spectator_delay(ms)` to show spectators the game late (chat and the
+lobby are not delayed), and `kick(name, now)`, which removes a player. A
+kicked player is disconnected, a bot keeps their seat, and their name can't
+take a seat in that game again.
+
+### Running a server
+
+`serve` takes commands typed into its terminal: `status` (the game, or every
+room on a hub), `say TEXT` (a chat message from the server), `kick NAME`,
+`pause` and `resume` (on a hub, `pause 2` for game 2), and `quit`. While a
+game is paused no round ends, though players can still shop and arrange.
+Clients show "Paused" and the clock stands still. From Rust:
+`session.pause(now)` and `session.unpause(now)`. `--spectator-delay-secs 30` delays spectators.
+
+From Rust, `server.with_host(|session, now| ...)` runs code on the hosted
+session or hub, on the server's thread, and returns the result. That is how
+the terminal commands work, and how a game could add a web dashboard or a
+bot that posts to a chat service. A host that wants a connection closed
+returns it from `Host::take_closed`.
+
+### Many games on one server
+
+A `Hub` hosts any number of games, each a `Session` of its own:
+
+```
+autoengine-server --rooms 16 --bind 0.0.0.0       # up to 16 games at once
+```
+
+```rust
+use autoengine::hub::{Hub, HubConfig};
+
+let mut hub = Hub::new(content, HubConfig { max_rooms: 16, ..HubConfig::default() });
+hub.on_new_room(|_id, session| session.set_bot_difficulty(autoengine::bot::Difficulty::Hard));
+let server = Server::bind("0.0.0.0:7777")?.spawn(hub);
+```
+
+Clients send `ListRooms` to see the games (`ServerMsg::Rooms`),
+`CreateRoom { name, seats }` to open one, `EnterRoom { room }` to go into one
+and `LeaveRoom` to come back out; then `Join` or `Spectate` as usual. A
+`Join` sent outside any room goes into the first game with an open seat, or
+a new one, so a client written for single games plays on a hub unchanged.
+`GameClient::join(addr, name).in_room(3)` joins a particular game, and a
+client that reconnects goes back into the game it was in. Games that are
+finished, or that nobody is in, close after two minutes (`close_after_ms`).
+
+### A ladder
+
+`autoengine-server --rooms 8 --ladder ladder.json` rates people across the
+hub's games. Each finished game counts as one Elo match between every pair
+of people in it, won by whoever placed higher, scaled so a whole game moves
+a rating by at most 32 points. Bots are not rated. The file is saved after
+every game. Clients send `ClientMsg::Standings` to get the top 50
+(`ServerMsg::Standings`, kept in `ClientState::standings`), and the server
+terminal's `ladder` command prints the top 10. From Rust:
+`hub.keep_ladder(Ladder::load(path)?, Some(path))`, or use `ladder::Ladder`
+on its own with `record(&[(name, place)])`. Names are not accounts, so a
+ladder suits a community server rather than prize play.
+
+### Saving and resuming a match
+
+With `--record DIR` the server saves every fight as a replay and the whole
+match as `DIR/match.json` after every round. If the server stops,
+`--record DIR --resume` picks the match up where it was. Players rejoin
+under their names, and their seat tokens still work. A hub
+(`--rooms N --record DIR --resume`) does the same for every unfinished game,
+each in its old room number (`Hub::resume`), and reconnecting clients find
+their way back to their room by themselves.
+
+The match file is a `MatchLog`: the seed, the players' names and every input
+(round starts and ends, commands, and grants such as cheats). Replaying the
+inputs rebuilds exactly the same game, and a checksum confirms it.
+`autoengine match DIR/match.json --rounds` plays a saved match again and
+prints the standings after each round, and fails if the engine or the
+content now plays it differently. `autoengine lobby --save FILE` saves a bot
+game the same way. From Rust: `MatchLog::of(&game)`, `log.replay(content, setup)`
+and `log.rounds(content, setup, |game| ...)`.
 
 ## Joining
 
@@ -57,6 +136,21 @@ why. `examples/network_game.rs` is a server and two players in one program.
 
 For full control, `Connection` is the bare socket: send `ClientMsg`, receive
 `ServerMsg`, and fold them into a `ClientState` yourself.
+
+### Chat
+
+`ClientMsg::Chat { text }` (or `client.state.say("gg")`) reaches everyone in
+the game. The server attributes each line to the sender's seat, or to
+"spectator". It turns control characters into spaces and cuts lines to 200
+characters, and late joiners get the last 20 lines. Chat arrives as
+`ServerMsg::Chat`, and `ClientState` keeps it in `chat` and in the log.
+
+Each connection may send 5 lines per 10 seconds; more are refused with
+"too fast". `session.set_chat_filter(|line| ...)` sees every line first. It
+returns the line to show (changed or not) or `None` to drop it, which is
+where a word filter goes. Names in `ClientState::muted` are hidden on that
+client. In the graphical client, type `/mute NAME` or `/unmute NAME` in the
+chat line.
 
 ## The server decides everything
 
@@ -133,11 +227,12 @@ connection but never welcomes it is retried after 10.
 
 ## Limits
 
-There is no encryption and there are no accounts. A seat token stops
-someone else taking your seat by name, but anyone who can reach the port can
+There is no encryption and there are no accounts. A seat token, drawn from the operating system's randomness, stops someone
+else taking your seat by name, but anyone who can reach the port can
 join or watch. Host games for people you trust, or put the server behind a
 VPN, SSH tunnel or TLS proxy. The server is authoritative, so a modified
 client can only send commands a normal client could.
 
-The protocol version is checked on joining. This change raised it to 2, so
-clients and servers built before it cannot play together.
+The protocol version is checked on joining. It is now 3, since chat and
+rooms were added, so clients and servers built before that cannot play
+together.

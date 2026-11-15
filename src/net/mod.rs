@@ -2,7 +2,8 @@
 //!
 //! The two ends, from simplest to most control:
 //!
-//! * [`Server`] hosts a [`Session`](crate::session::Session) on a socket.
+//! * [`Server`] hosts a [`Session`](crate::session::Session), or a
+//!   [`Hub`](crate::hub::Hub) of many games, on a socket.
 //!   `Server::bind(addr)?.spawn(session)` runs it in the background and
 //!   `.run(session, &stop)` runs it on the calling thread.
 //! * [`GameClient`] is everything a player's program needs: it connects in
@@ -25,6 +26,7 @@
 //! | a flood of messages | dropped once over the allowance | `messages_per_second`, `burst` |
 //! | an enormous line | dropped | `max_line_bytes` |
 //! | too many connections | refused with a message | `max_connections` |
+//! | one address opening many connections | refused past the limit | `max_connections_per_ip` |
 //! | text that is not a message | an error reply; the connection stays | |
 //!
 //! A dropped player's seat is played by a bot until they reconnect.
@@ -36,7 +38,7 @@ mod client;
 mod server;
 
 pub use client::{Connection, GameClient, Status};
-pub use server::{NetStats, Server, ServerConfig, ServerHandle, serve};
+pub use server::{Host, NetStats, Server, ServerConfig, ServerHandle, serve};
 
 use std::io::{BufRead, Read};
 

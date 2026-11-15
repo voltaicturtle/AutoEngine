@@ -6,7 +6,7 @@ use super::*;
 pub(crate) fn draw_menu(app: &mut App) {
     let (w, h) = (screen_width(), screen_height());
     draw_rectangle(0.0, 0.0, w, h, Color::new(0.03, 0.04, 0.06, 0.82));
-    let (pw, ph) = (460.0, 530.0);
+    let (pw, ph) = (460.0, 640.0);
     let (x, y) = (w / 2.0 - pw / 2.0, h / 2.0 - ph / 2.0);
     panel(x, y, pw, ph, ui().panel);
     draw_rectangle_lines(x, y, pw, ph, 1.0, ui().muted);
@@ -28,6 +28,7 @@ pub(crate) fn draw_menu(app: &mut App) {
     toggle("Animations", &mut app.settings.animations);
     toggle("Statistics (F3)", &mut app.settings.show_stats);
     toggle("Fullscreen", &mut app.settings.fullscreen);
+    toggle("Colour-blind colours", &mut app.settings.colorblind);
 
     let stepper = |name: &str, shown: String, row: f32| -> i32 {
         let ry = y + 70.0 + row * 46.0;
@@ -38,9 +39,9 @@ pub(crate) fn draw_menu(app: &mut App) {
         plus as i32 - minus as i32
     };
     let volume = if Sounds::AVAILABLE { "Volume" } else { "Volume (sound not built in)" };
-    let step = stepper(volume, app.settings.volume.to_string(), 5.0);
+    let step = stepper(volume, app.settings.volume.to_string(), 6.0);
     app.settings.volume = (app.settings.volume as i32 + step * 10).clamp(0, 100) as u8;
-    let step = stepper("Camera turn speed", format!("{}%", app.settings.camera_turn_percent), 6.0);
+    let step = stepper("Camera turn speed", format!("{}%", app.settings.camera_turn_percent), 7.0);
     app.settings.camera_turn_percent = (app.settings.camera_turn_percent as i32 + step * 25).clamp(25, 400) as u32;
 
     if app.settings != before {
@@ -50,17 +51,34 @@ pub(crate) fn draw_menu(app: &mut App) {
         if app.settings.volume != before.volume {
             app.play(Sfx::Buy);
         }
+        if app.settings.colorblind != before.colorblind {
+            app.apply_theme();
+        }
         app.save_settings();
     }
     // Keys are rebound in the settings file.
     let keys: Vec<String> = Action::ALL.iter().map(|a| format!("{} {}", a.name().replace('_', " "), app.settings.key_name(*a))).collect();
-    draw::wrapped(&format!("Keys: {}", keys.join(", ")), x + 30.0, y + 398.0, pw - 60.0, 15.0, ui().muted);
+    draw::wrapped(&format!("Keys: {}", keys.join(", ")), x + 30.0, y + 444.0, pw - 60.0, 15.0, ui().muted);
     let by = y + ph - 58.0;
     if button("Resume", x + 30.0, by, 190.0, 40.0, true) {
         app.menu_open = false;
     }
     if button("Quit", x + pw - 220.0, by, 190.0, 40.0, true) {
         macroquad::miniquad::window::order_quit();
+    }
+    // Giving up takes two clicks.
+    let playing = app.net.state.me().is_some_and(|p| p.alive && !p.forfeited)
+        && !matches!(app.net.state.view.as_ref().map(|v| v.phase), Some(ViewPhase::Over { .. }));
+    let text = if app.confirm_forfeit { "Really forfeit?" } else { "Forfeit" };
+    if button(text, x + 30.0, by - 50.0, pw - 60.0, 36.0, playing) {
+        if app.confirm_forfeit {
+            app.send(ClientMsg::Command(Command::Forfeit));
+            app.menu_open = false;
+        }
+        app.confirm_forfeit = !app.confirm_forfeit;
+    }
+    if !app.menu_open {
+        app.confirm_forfeit = false;
     }
 }
 

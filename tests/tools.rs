@@ -145,3 +145,14 @@ mod new_tools {
         assert!(games.steps > 0);
     }
 }
+
+#[test]
+fn the_simulator_gives_the_same_report_however_it_splits_the_games() {
+    let content = std::sync::Arc::new(sample());
+    let together = simulate(content.clone(), 5, 4, 20);
+    let mut one_by_one = autoengine::tools::SimReport::default();
+    for i in 0..5 {
+        one_by_one.add(&simulate(content.clone(), 1, 4, 20 + i));
+    }
+    assert_eq!(together, one_by_one);
+}

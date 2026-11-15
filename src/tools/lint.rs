@@ -79,5 +79,27 @@ pub fn lint(content: &ContentSet, assets: Option<&Path>) -> Vec<Warning> {
             );
         }
     }
+    // Every language should name everything. Descriptions that are empty
+    // in the content itself need no translation.
+    for (language, table) in content.translations() {
+        let missing: Vec<String> = content
+            .text_keys()
+            .into_iter()
+            .filter(|key| !table.contains_key(key))
+            .filter(|key| {
+                let mut parts = key.splitn(3, '.');
+                let (kind, id, field) = (parts.next().unwrap(), parts.next().unwrap(), parts.next().unwrap());
+                content.text(None, kind, id, field).is_some_and(|own| !own.is_empty())
+            })
+            .collect();
+        if !missing.is_empty() {
+            let shown: Vec<&str> = missing.iter().take(5).map(String::as_str).collect();
+            let more = if missing.len() > 5 { format!(" and {} more", missing.len() - 5) } else { String::new() };
+            warn(
+                format!("language {language}"),
+                format!("has no text for {}{more}; the original text shows instead", shown.join(", ")),
+            );
+        }
+    }
     warnings
 }

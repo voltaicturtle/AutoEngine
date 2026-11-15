@@ -53,17 +53,57 @@ pub struct SimReport {
 /// Plays whole games between bots and tallies how units and traits did.
 /// The same arguments always give the same report.
 pub fn simulate(content: impl Into<Arc<ContentSet>>, games: u32, players: usize, seed: u64) -> SimReport {
-    const NAMES: [&str; 8] = ["A", "B", "C", "D", "E", "F", "G", "H"];
+    simulate_with(content, games, players, seed, crate::bot::Difficulty::Normal)
+}
+
+/// [`simulate`] with bots of the given difficulty.
+pub fn simulate_with(
+    content: impl Into<Arc<ContentSet>>,
+    games: u32,
+    players: usize,
+    seed: u64,
+    difficulty: crate::bot::Difficulty,
+) -> SimReport {
     let content = content.into();
+    // Games are independent and every total is a sum, so they can be
+    // spread over threads and added up in any order: the report is the
+    // same however many threads there are.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(games.max(1) as usize);
+    let parts: Vec<SimReport> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let content = content.clone();
+                scope.spawn(move || {
+                    let mut part = SimReport::default();
+                    for game_index in (t as u32..games).step_by(threads) {
+                        part.add(&play_one(&content, seed, game_index, players, difficulty));
+                    }
+                    part
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("a simulated game panicked")).collect()
+    });
     let mut report = SimReport { games, ..Default::default() };
-    for game_index in 0..games {
+    for part in &parts {
+        report.add(part);
+    }
+    report.games = games;
+    report
+}
+
+/// One simulated game's tallies.
+fn play_one(content: &Arc<ContentSet>, seed: u64, game_index: u32, players: usize, difficulty: crate::bot::Difficulty) -> SimReport {
+    const NAMES: [&str; 8] = ["A", "B", "C", "D", "E", "F", "G", "H"];
+    let mut report = SimReport { games: 1, ..Default::default() };
+    {
         let game_seed = seed.wrapping_add(game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         let mut game = Game::new(content.clone(), game_seed, &NAMES[..players.clamp(2, 8)]);
         let mut bot_rng = Rng::new(game_seed ^ 0xB07);
         // Boards as they were the last time each player fought.
         let mut last_board: BTreeMap<u8, Vec<String>> = BTreeMap::new();
         while !game.is_over() {
-            if game.round_index() >= 300 || bot::play_round(&mut game, &mut bot_rng).is_err() {
+            if game.round_index() >= 300 || bot::play_round_with(&mut game, &mut bot_rng, |_| difficulty).is_err() {
                 report.unfinished += 1;
                 break;
             }
@@ -126,6 +166,28 @@ pub fn simulate(content: impl Into<Arc<ContentSet>>, games: u32, players: usize,
 }
 
 impl SimReport {
+    /// Adds another report's tallies to this one.
+    pub fn add(&mut self, other: &SimReport) {
+        self.games += other.games;
+        self.unfinished += other.unfinished;
+        self.rounds += other.rounds;
+        self.fights += other.fights;
+        self.draws += other.draws;
+        self.fight_ms += other.fight_ms;
+        for (unit, r) in &other.units {
+            let entry = self.units.entry(unit.clone()).or_default();
+            entry.fights += r.fights;
+            entry.wins += r.wins;
+            entry.final_boards += r.final_boards;
+            entry.placement_sum += r.placement_sum;
+        }
+        for (t, (active, won)) in &other.traits {
+            let entry = self.traits.entry(t.clone()).or_default();
+            entry.0 += active;
+            entry.1 += won;
+        }
+    }
+
     /// The report as a table for the terminal.
     pub fn to_text(&self, content: &ContentSet) -> String {
         use std::fmt::Write;

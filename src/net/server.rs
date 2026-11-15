@@ -12,6 +12,43 @@ use super::read_line_limited;
 use crate::protocol::{ClientMsg, ServerMsg, decode, encode};
 use crate::session::{ConnId, Session};
 
+/// Whatever a [`Server`] hosts: one [`Session`], or a
+/// [`Hub`](crate::hub::Hub) of many. The server tells it what each
+/// connection sends and when connections close, ticks it, and delivers
+/// what it queues.
+pub trait Host: Send + 'static {
+    fn handle(&mut self, conn: ConnId, message: ClientMsg, now: u64);
+    fn disconnect(&mut self, conn: ConnId, now: u64);
+    fn tick(&mut self, now: u64);
+    fn drain_outbox(&mut self) -> Vec<(ConnId, ServerMsg)>;
+    /// Connections the host wants closed (after what it has queued for
+    /// them is sent), such as players it kicked.
+    fn take_closed(&mut self) -> Vec<ConnId> {
+        Vec::new()
+    }
+}
+
+impl Host for Session {
+    fn handle(&mut self, conn: ConnId, message: ClientMsg, now: u64) {
+        Session::handle(self, conn, message, now)
+    }
+    fn disconnect(&mut self, conn: ConnId, now: u64) {
+        Session::disconnect(self, conn, now)
+    }
+    fn tick(&mut self, now: u64) {
+        Session::tick(self, now)
+    }
+    fn drain_outbox(&mut self) -> Vec<(ConnId, ServerMsg)> {
+        Session::drain_outbox(self)
+    }
+    fn take_closed(&mut self) -> Vec<ConnId> {
+        Session::take_closed(self)
+    }
+}
+
+/// Work handed to the server thread by [`ServerHandle::with_host`].
+type HostJob<H> = Box<dyn FnOnce(&mut H, u64) + Send>;
+
 /// Limits that keep one bad connection from hurting the game. The defaults
 /// suit a game among friends; every field can be changed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,6 +56,9 @@ pub struct ServerConfig {
     /// Connections allowed at once, players and spectators together. More
     /// are refused with a message.
     pub max_connections: usize,
+    /// Connections allowed at once from one IP address, so one machine
+    /// cannot take every slot.
+    pub max_connections_per_ip: usize,
     /// A connection that has sent nothing for this long is dropped.
     pub idle_timeout: Duration,
     /// A connection that has been quiet for this long is sent a ping, which
@@ -41,6 +81,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
             max_connections: 64,
+            max_connections_per_ip: 8,
             idle_timeout: Duration::from_secs(30),
             ping_interval: Duration::from_secs(5),
             max_line_bytes: 64 * 1024,
@@ -112,34 +153,53 @@ impl Server {
         self.listener.local_addr().expect("a bound listener has an address")
     }
 
-    /// Hosts the session on the calling thread until `stop` is set, then
-    /// returns it so the final state can be inspected.
-    pub fn run(self, session: Session, stop: &AtomicBool) -> std::io::Result<Session> {
-        run(self.listener, session, stop, self.config, self.stats)
+    /// Hosts the session (or hub) on the calling thread until `stop` is
+    /// set, then returns it so the final state can be inspected.
+    pub fn run<H: Host>(self, session: H, stop: &AtomicBool) -> std::io::Result<H> {
+        let (_jobs, rx) = mpsc::channel();
+        run(self.listener, session, stop, self.config, self.stats, rx)
     }
 
-    /// Hosts the session on a background thread.
-    pub fn spawn(self, session: Session) -> ServerHandle {
+    /// Hosts the session (or hub) on a background thread.
+    pub fn spawn<H: Host>(self, session: H) -> ServerHandle<H> {
         let addr = self.addr();
         let stop = Arc::new(AtomicBool::new(false));
         let stats = self.stats.clone();
+        let (jobs, rx) = mpsc::channel();
         let thread = {
             let stop = stop.clone();
-            std::thread::spawn(move || self.run(session, &stop))
+            std::thread::spawn(move || run(self.listener, session, &stop, self.config, self.stats, rx))
         };
-        ServerHandle { addr, stop, stats, thread }
+        ServerHandle { addr, stop, stats, thread, jobs: Mutex::new(jobs) }
     }
 }
 
 /// A server running in the background (see [`Server::spawn`]).
-pub struct ServerHandle {
+pub struct ServerHandle<H = Session> {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
     stats: Arc<Mutex<NetStats>>,
-    thread: std::thread::JoinHandle<std::io::Result<Session>>,
+    thread: std::thread::JoinHandle<std::io::Result<H>>,
+    jobs: Mutex<mpsc::Sender<HostJob<H>>>,
 }
 
-impl ServerHandle {
+impl<H: Send + 'static> ServerHandle<H> {
+    /// Runs `job` on the hosted session (or hub) on the server's thread,
+    /// between messages, with the server's clock in milliseconds, and
+    /// returns what it returns. For admin tools: announcements, kicks,
+    /// reading the state. Blocks until the server gets to it; `None` if the
+    /// server has stopped.
+    pub fn with_host<R: Send + 'static>(&self, job: impl FnOnce(&mut H, u64) -> R + Send + 'static) -> Option<R> {
+        let (tx, rx) = mpsc::channel();
+        let job: HostJob<H> = Box::new(move |host, now| {
+            let _ = tx.send(job(host, now));
+        });
+        self.jobs.lock().unwrap().send(job).ok()?;
+        rx.recv().ok()
+    }
+}
+
+impl<H> ServerHandle<H> {
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
@@ -149,7 +209,7 @@ impl ServerHandle {
     }
 
     /// Stops the server, closes every connection and returns the session.
-    pub fn stop(self) -> std::io::Result<Session> {
+    pub fn stop(self) -> std::io::Result<H> {
         self.stop.store(true, Ordering::Relaxed);
         self.thread.join().unwrap_or_else(|_| Err(std::io::Error::other("the server thread panicked")))
     }
@@ -157,7 +217,7 @@ impl ServerHandle {
 
 /// Runs a session on a listener with the default [`ServerConfig`] until
 /// `stop` is set. The same as `Server::from_listener(listener).run(..)`.
-pub fn serve(listener: TcpListener, session: Session, stop: &AtomicBool) -> std::io::Result<Session> {
+pub fn serve<H: Host>(listener: TcpListener, session: H, stop: &AtomicBool) -> std::io::Result<H> {
     Server::from_listener(listener).run(session, stop)
 }
 
@@ -170,6 +230,8 @@ enum Incoming {
 
 /// One connected client as the server loop sees it.
 struct Peer {
+    /// Where the connection comes from.
+    ip: std::net::IpAddr,
     /// Lines waiting for the writer thread. Dropping this ends that thread
     /// once it has written what is queued, and closes the socket.
     queue: SyncSender<Arc<str>>,
@@ -215,7 +277,7 @@ impl Peers {
     }
 
     /// Drops a client, telling it why if it is still listening.
-    fn drop(&mut self, conn: ConnId, why: Drop, session: &mut Session, now: u64) {
+    fn drop(&mut self, conn: ConnId, why: Drop, session: &mut impl Host, now: u64) {
         let reason = match why {
             Drop::Slow => "disconnected: this connection is not keeping up",
             Drop::Idle => "disconnected: nothing was heard from this connection for too long",
@@ -277,13 +339,14 @@ fn writer_thread(mut stream: TcpStream, lines: mpsc::Receiver<Arc<str>>) {
     stream.shutdown(std::net::Shutdown::Both).ok();
 }
 
-fn run(
+fn run<H: Host>(
     listener: TcpListener,
-    mut session: Session,
+    mut session: H,
     stop: &AtomicBool,
     config: ServerConfig,
     stats: Arc<Mutex<NetStats>>,
-) -> std::io::Result<Session> {
+    jobs: mpsc::Receiver<HostJob<H>>,
+) -> std::io::Result<H> {
     listener.set_nonblocking(true)?;
     let (tx, rx) = mpsc::sync_channel::<Incoming>(1024);
     let started = Instant::now();
@@ -293,8 +356,8 @@ fn run(
     while !stop.load(Ordering::Relaxed) {
         // Accept anyone waiting.
         loop {
-            let stream = match listener.accept() {
-                Ok((stream, _)) => stream,
+            let (stream, from) = match listener.accept() {
+                Ok(accepted) => accepted,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 // One failed accept (a client that gave up, or too many open
                 // files) must not take the server down. Try again next turn.
@@ -303,10 +366,18 @@ fn run(
             stream.set_nonblocking(false).ok();
             stream.set_nodelay(true).ok();
             stream.set_write_timeout(Some(config.write_timeout)).ok();
-            if peers.peers.len() >= config.max_connections {
+            let from_here = peers.peers.values().filter(|p| p.ip == from.ip()).count();
+            let refusal = if peers.peers.len() >= config.max_connections {
+                Some("the server is full")
+            } else if from_here >= config.max_connections_per_ip {
+                Some("too many connections from your address")
+            } else {
+                None
+            };
+            if let Some(refusal) = refusal {
                 let mut stream = stream;
                 stream.set_write_timeout(Some(Duration::from_millis(200))).ok();
-                let refusal = ServerMsg::Error { message: "the server is full".into() };
+                let refusal = ServerMsg::Error { message: refusal.into() };
                 let _ = stream.write_all(format!("{}\n", encode(&refusal)).as_bytes());
                 peers.stats.lock().unwrap().refused += 1;
                 continue;
@@ -318,7 +389,7 @@ fn run(
             let now = Instant::now();
             peers.peers.insert(
                 conn,
-                Peer { queue, last_heard: now, last_ping: now, allowance: config.burst as f64, allowance_at: now },
+                Peer { ip: from.ip(), queue, last_heard: now, last_ping: now, allowance: config.burst as f64, allowance_at: now },
             );
             {
                 let mut stats = peers.stats.lock().unwrap();
@@ -332,7 +403,7 @@ fn run(
         }
 
         let now = started.elapsed().as_millis() as u64;
-        let handle = |incoming: Incoming, session: &mut Session, peers: &mut Peers| {
+        let handle = |incoming: Incoming, session: &mut H, peers: &mut Peers| {
             let (conn, bytes) = match &incoming {
                 Incoming::Message(conn, _, bytes) | Incoming::Malformed(conn, _, bytes) => (*conn, *bytes),
                 Incoming::TooLong(conn) => return peers.drop(*conn, Drop::Flood, session, now),
@@ -382,6 +453,9 @@ fn run(
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
+        for job in jobs.try_iter() {
+            job(&mut session, now);
+        }
         session.tick(now);
 
         // Ping the quiet, drop the silent.
@@ -423,6 +497,14 @@ fn run(
             for conn in slow {
                 peers.drop(conn, Drop::Slow, &mut session, now);
             }
+        }
+        // Connections the host asked to close: their writer finishes what
+        // is queued, then closes the socket.
+        for conn in session.take_closed() {
+            if peers.peers.remove(&conn).is_some() {
+                peers.stats.lock().unwrap().connections = peers.peers.len();
+            }
+            session.disconnect(conn, now);
         }
     }
     // Tell the session everyone has gone, so the returned session can be

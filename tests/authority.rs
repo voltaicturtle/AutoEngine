@@ -51,6 +51,12 @@ fn no_client_message_carries_a_result() {
         ClientMsg::ResendCombat { id: 0 },
         ClientMsg::Ping,
         ClientMsg::Pong,
+        ClientMsg::Chat { text: "hi".into() },
+        ClientMsg::ListRooms,
+        ClientMsg::CreateRoom { name: "x".into(), seats: None },
+        ClientMsg::EnterRoom { room: 1 },
+        ClientMsg::LeaveRoom,
+        ClientMsg::Standings,
     ];
     for message in every {
         let why = match message {
@@ -69,6 +75,14 @@ fn no_client_message_carries_a_result() {
             ClientMsg::Options { .. } => "how to send, not what happened",
             ClientMsg::ResendCombat { .. } => "a request for the server's own record",
             ClientMsg::Ping | ClientMsg::Pong => "keep-alive",
+            // Text only. The server names the sender from the seat the
+            // connection holds, never from the message.
+            ClientMsg::Chat { .. } => "text, attributed by the server",
+            // Which game to be in; seats in it are still the game's to give.
+            ClientMsg::ListRooms | ClientMsg::CreateRoom { .. } | ClientMsg::EnterRoom { .. } | ClientMsg::LeaveRoom => {
+                "a choice of game, not a result"
+            }
+            ClientMsg::Standings => "a request to read the ladder",
         };
         assert!(!why.is_empty());
     }
