@@ -602,11 +602,11 @@ fn print_log(combat: &Combat) {
             EventKind::Shielded { target, amount, .. } => {
                 format!("{} gains a {} shield", label(*target), amount)
             }
-            EventKind::CastStarted { unit } => {
-                let name = combat.unit(*unit).template().ability.as_ref().map(|a| a.name.as_str());
+            EventKind::CastStarted { unit, ability } => {
+                let name = combat.unit(*unit).template().abilities.get(*ability).map(|a| a.name.as_str());
                 format!("{} begins casting {}", label(*unit), name.unwrap_or("?"))
             }
-            EventKind::CastFinished { unit } => format!("{} finishes casting", label(*unit)),
+            EventKind::CastFinished { unit, .. } => format!("{} finishes casting", label(*unit)),
             EventKind::PassiveTriggered { unit, passive } => format!(
                 "{} triggers {}",
                 label(*unit),

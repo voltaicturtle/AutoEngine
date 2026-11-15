@@ -45,10 +45,9 @@ pub fn lint(content: &ContentSet, assets: Option<&Path>) -> Vec<Warning> {
             }
         }
         // An ability the unit can never pay for is dead weight.
-        let cost = unit.ability.as_ref().and_then(|a| Some((a, content.resource(a.cost.resource()?)?)));
-        if let Some((ability, resource)) = cost
-            && let Ok(template) = content.base_template(&unit.id, 1)
-        {
+        for ability in &unit.abilities {
+            let Some(resource) = ability.cost.resource().and_then(|id| content.resource(id)) else { continue };
+            let Ok(template) = content.base_template(&unit.id, 1) else { continue };
             let capacity = template.stats.get(resource.max);
             let short = match ability.cost {
                 crate::effect::Cost::Amount { amount, .. } => capacity < amount,
@@ -60,6 +59,31 @@ pub fn lint(content: &ContentSet, assets: Option<&Path>) -> Vec<Warning> {
                     format!(
                         "can never cast {}: it has {capacity} {} (the {} stat) at one star",
                         ability.name, resource.id, resource.max
+                    ),
+                );
+            }
+        }
+        // With several abilities the first affordable one is cast, so an
+        // earlier ability that is always affordable first hides a later one.
+        let price = |a: &crate::effect::Ability| {
+            let resource = content.resource(a.cost.resource()?)?;
+            let capacity = content.base_template(&unit.id, 1).ok()?.stats.get(resource.max);
+            Some((resource.id.clone(), match a.cost {
+                crate::effect::Cost::Amount { amount, .. } => amount,
+                _ => capacity,
+            }))
+        };
+        for (later_at, later) in unit.abilities.iter().enumerate() {
+            let hidden_by = unit.abilities[..later_at].iter().find(|earlier| {
+                earlier.cooldown_ms == 0
+                    && matches!((price(earlier), price(later)), (Some((a, cost)), Some((b, at_least))) if a == b && cost <= at_least)
+            });
+            if let Some(earlier) = hidden_by {
+                warn(
+                    subject.clone(),
+                    format!(
+                        "can never cast {}: {} is listed first, costs no more of the same resource and has no cooldown",
+                        later.name, earlier.name
                     ),
                 );
             }

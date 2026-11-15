@@ -152,8 +152,10 @@ pub struct CombatUnit {
     attack_progress: i64,
     move_progress: i64,
     cast_remaining_ms: Option<u32>,
-    /// Time until the ability can be cast again.
-    cooldown_ms: u32,
+    /// Which ability is being cast, by position in the template.
+    casting: usize,
+    /// Time until each ability can be cast again.
+    cooldowns: Vec<u32>,
     /// Time since the last once-a-second resource change.
     second_ms: u32,
     shields: Vec<ShieldInstance>,
@@ -205,9 +207,14 @@ impl CombatUnit {
             .map(|(def, amount)| Pool { def, amount: *amount, max: self.stats.get(def.max) })
             .filter(|p| p.max > 0)
     }
-    /// Time until the unit's ability can be cast again.
-    pub fn cooldown_ms(&self) -> u32 {
-        self.cooldown_ms
+    /// Time until one of the unit's abilities (by position) can be cast
+    /// again.
+    pub fn cooldown_ms(&self, ability: usize) -> u32 {
+        self.cooldowns.get(ability).copied().unwrap_or(0)
+    }
+    /// The ability being cast, by position, if the unit is casting.
+    pub fn casting(&self) -> Option<usize> {
+        self.cast_remaining_ms.map(|_| self.casting)
     }
     /// Total remaining shield.
     pub fn shield(&self) -> i64 {
@@ -274,8 +281,17 @@ pub enum EventKind {
     /// `source` is whoever did the healing (the unit itself for lifesteal).
     Healed { source: UnitId, target: UnitId, amount: i64 },
     Shielded { source: UnitId, target: UnitId, amount: i64 },
-    CastStarted { unit: UnitId },
-    CastFinished { unit: UnitId },
+    /// `ability` is the position of the ability among the unit's own.
+    CastStarted {
+        unit: UnitId,
+        #[serde(default)]
+        ability: usize,
+    },
+    CastFinished {
+        unit: UnitId,
+        #[serde(default)]
+        ability: usize,
+    },
     PassiveTriggered { unit: UnitId, passive: usize },
     StatusApplied { source: UnitId, target: UnitId, status: StatusKind, duration_ms: u32 },
     StatusExpired { target: UnitId, status: StatusKind },
@@ -472,6 +488,7 @@ impl Combat {
         let stats = Stats::new(template.stats.clone());
         let health = stats.get(Stat::MaxHealth).max(1);
         let passive_state = vec![PassiveState::default(); template.passives.len()];
+        let cooldowns = vec![0; template.abilities.len()];
         self.units.push(CombatUnit {
             id,
             team,
@@ -486,7 +503,8 @@ impl Combat {
             attack_progress: 0,
             move_progress: 0,
             cast_remaining_ms: None,
-            cooldown_ms: 0,
+            casting: 0,
+            cooldowns,
             second_ms: 0,
             shields: Vec::new(),
             statuses: Vec::new(),
@@ -578,17 +596,21 @@ impl Combat {
             return;
         }
 
-        // Start a cast as soon as the unit can pay for its ability.
+        // Start a cast as soon as the unit can pay for an ability: the
+        // first one it can afford, in the order they are listed.
         let silenced = self.u(id).has_status(|s| matches!(s, StatusKind::Silence));
-        if !silenced && let Some(payment) = self.payment(id) {
-            let ability = self.u(id).template.ability.as_ref().unwrap();
+        let castable = (0..self.u(id).template.abilities.len()).find_map(|i| Some((i, self.payment(id, i)?)));
+        if !silenced && let Some((which, payment)) = castable {
+            let ability = &self.u(id).template.abilities[which];
             let (cast_time, cooldown) = (ability.cast_time_ms, ability.cooldown_ms);
             if let Some((index, amount)) = payment {
                 let left = self.u(id).resources[index] - amount;
                 self.set_resource(id, index, left, false);
             }
-            self.u_mut(id).cooldown_ms = cooldown;
-            self.emit(EventKind::CastStarted { unit: id });
+            let unit = self.u_mut(id);
+            unit.cooldowns[which] = cooldown;
+            unit.casting = which;
+            self.emit(EventKind::CastStarted { unit: id, ability: which });
             if cast_time == 0 {
                 self.finish_cast(id);
             } else {
@@ -646,15 +668,15 @@ impl Combat {
         }
     }
 
-    /// What casting its ability would cost a unit right now: `None` if it
-    /// cannot cast, `Some(None)` if the cast is free, or the resource (by
-    /// position) and amount to take.
-    fn payment(&self, id: UnitId) -> Option<Option<(usize, i64)>> {
+    /// What casting one of its abilities would cost a unit right now:
+    /// `None` if it cannot cast it, `Some(None)` if the cast is free, or the
+    /// resource (by position) and amount to take.
+    fn payment(&self, id: UnitId, ability: usize) -> Option<Option<(usize, i64)>> {
         let unit = self.u(id);
-        let ability = unit.template.ability.as_ref()?;
-        if unit.cooldown_ms > 0 {
+        if unit.cooldowns[ability] > 0 {
             return None;
         }
+        let ability = &unit.template.abilities[ability];
         let (resource, amount) = match &ability.cost {
             Cost::Free => return Some(None),
             Cost::Full(resource) => (resource, None),
@@ -704,7 +726,9 @@ impl Combat {
 
         // Cooldown, and what resources gain or lose every second.
         let unit = self.u_mut(id);
-        unit.cooldown_ms = unit.cooldown_ms.saturating_sub(tick_ms);
+        for cooldown in &mut unit.cooldowns {
+            *cooldown = cooldown.saturating_sub(tick_ms);
+        }
         unit.second_ms += tick_ms;
         if unit.second_ms >= 1000 {
             unit.second_ms -= 1000;
@@ -854,9 +878,10 @@ impl Combat {
 
     fn finish_cast(&mut self, id: UnitId) {
         self.u_mut(id).cast_remaining_ms = None;
-        self.emit(EventKind::CastFinished { unit: id });
+        let which = self.u(id).casting;
+        self.emit(EventKind::CastFinished { unit: id, ability: which });
         let template = self.u(id).template.clone();
-        if let Some(ability) = &template.ability {
+        if let Some(ability) = template.abilities.get(which) {
             self.resolve(id, None, &ability.effects, true);
         }
         self.fire(id, None, |t| matches!(t, Trigger::OnCast));

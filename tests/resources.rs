@@ -105,7 +105,7 @@ fn energy_refills_over_time_and_cooldowns_space_out_casts() {
     assert_eq!(c.unit(a).resource("energy"), 100, "starts full");
     c.step();
     assert_eq!((c.unit(a).resource("energy"), casts(&c)), (60, 1));
-    assert_eq!(c.unit(a).cooldown_ms(), 3000);
+    assert_eq!(c.unit(a).cooldown_ms(0), 3000);
     // Enough energy for another cast, but the cooldown holds it back.
     steps(&mut c, 59);
     assert_eq!((c.unit(a).resource("energy"), casts(&c)), (90, 1));
@@ -290,4 +290,62 @@ fn the_sample_game_plays_the_same_with_mana_as_a_resource() {
     assert_eq!(mana.per_attack, Amount::stat(Stat::ManaPerAttack));
     assert_eq!((mana.from_damage_taken.permille, mana.from_damage_taken.cap), (30, Some(40)));
     assert_eq!(CombatConfig::default().resources, vec![mana]);
+}
+
+#[test]
+fn a_unit_can_have_several_abilities() {
+    // A big spell on mana and a quick one on a timer. The first one the
+    // unit can pay for is cast, in the order they are listed.
+    let nova = Ability::new("Nova").effect(Effect::true_damage(1000).to(Selector::CurrentTarget));
+    let jab = Ability::new("Jab").cost(Cost::Free).cooldown(1000).effect(Effect::true_damage(10).to(Selector::CurrentTarget));
+    let mage = dummy("Mage").with_stat(Stat::MaxMana, 30).with_stat(Stat::StartingMana, 30).with_ability(nova).with_ability(jab);
+    let (mut c, a, b) = duel(vec![ResourceDef::mana()], mage, dummy("Dummy"));
+
+    steps(&mut c, 22);
+    let cast: Vec<(u32, usize)> = c
+        .events()
+        .iter()
+        .filter_map(|e| match e.kind {
+            EventKind::CastStarted { ability, .. } => Some((e.tick, ability)),
+            _ => None,
+        })
+        .collect();
+    // Both can be paid for at the start: Nova is listed first, so it goes
+    // first and the jab follows on the next tick, then every second.
+    assert_eq!(cast, [(1, 0), (2, 1), (22, 1)]);
+    assert_eq!((c.unit(a).mana(), c.unit(a).cooldown_ms(0), c.unit(a).cooldown_ms(1)), (0, 0, 1000));
+    assert_eq!(c.unit(a).casting(), None, "neither has a cast time");
+    assert_eq!(c.unit(b).health(), 100_000 - 1000 - 20);
+}
+
+#[test]
+fn every_ability_has_its_own_texts_and_checks() {
+    let strike = |name: &str, cost: Cost| Ability::new(name).description(format!("{name} hits.")).cost(cost).effect(Effect::physical(10).to(Selector::CurrentTarget));
+    let unit = UnitDef::new("twin", "Twin")
+        .stat(Stat::MaxMana, 50)
+        .ability(strike("First", Cost::of("mana", 20)))
+        .ability(strike("Second", Cost::default()))
+        .ability(strike("Third", Cost::Free).cooldown(2000));
+    let game = ContentSet::builder().unit(unit).translate("fr", "unit.twin.ability_2", "Deuxième").build().unwrap();
+
+    assert_eq!(game.text(None, "unit", "twin", "ability").as_deref(), Some("First"));
+    assert_eq!(game.text(None, "unit", "twin", "ability_2_description").as_deref(), Some("Second hits."));
+    assert_eq!(game.text(Some("fr"), "unit", "twin", "ability_2").as_deref(), Some("Deuxième"));
+    assert_eq!(game.text(None, "unit", "twin", "ability_3").as_deref(), Some("Third"));
+    assert_eq!(game.text(None, "unit", "twin", "ability_4"), None);
+    assert_eq!(game.text(None, "unit", "twin", "ability_1"), None, "the first is plain `ability`");
+    assert!(game.text_keys().contains(&"unit.twin.ability_3_description".to_string()));
+    assert_eq!(autoengine::content::ability_fields(1), ("ability_2".to_string(), "ability_2_description".to_string()));
+    let bad = ContentSet::builder().unit(UnitDef::new("solo", "Solo")).translate("fr", "unit.solo.ability", "Rien").build();
+    assert!(error(bad).contains("names nothing"));
+
+    assert_eq!(game.ability_cost("twin", 1, 0).map(|(r, n)| (r.id.as_str(), n)), Some(("mana", 20)));
+    assert_eq!(game.ability_cost("twin", 1, 1).map(|(r, n)| (r.id.as_str(), n)), Some(("mana", 50)));
+    assert!(game.ability_cost("twin", 1, 2).is_none() && game.ability_cost("twin", 1, 3).is_none());
+
+    // The first ability is always affordable before the second, which
+    // therefore never gets its turn.
+    let warnings: Vec<String> = lint(&game, None).iter().map(|w| w.to_string()).filter(|w| w.contains("never cast")).collect();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("can never cast Second: First is listed first"), "{warnings:?}");
 }

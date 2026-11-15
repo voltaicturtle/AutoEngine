@@ -160,6 +160,8 @@ assert_eq!(content.name_in(Some("fr"), "ashen_hound").as_deref(), Some("Chien de
 | `unit.ID.name` | a unit's name |
 | `unit.ID.ability` | its ability's name |
 | `unit.ID.ability_description` | its ability's description |
+| `unit.ID.ability_2`, `unit.ID.ability_2_description` | the same for a second ability, and so on |
+| `resource.ID.name` | a [resource](resources.md)'s name |
 | `item.ID.name`, `item.ID.description` | an item's name and description |
 | `trait.ID.name`, `trait.ID.description` | a trait's name and description |
 | `augment.ID.name`, `augment.ID.description` | an augment's name and description |

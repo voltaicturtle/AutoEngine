@@ -754,7 +754,7 @@ pub enum Trigger {
     OnAttack,
     /// The owner takes damage from an attack or ability.
     OnDamaged,
-    /// The owner finishes casting its ability.
+    /// The owner finishes casting an ability.
     OnCast,
     OnKill,
     OnDeath,
@@ -828,7 +828,9 @@ pub struct UnitTemplate {
     pub id: String,
     pub name: String,
     pub stats: StatBlock,
-    pub ability: Option<Ability>,
+    /// The abilities it casts. Each tick it casts the first one it can pay
+    /// for, so put the ones that should win first.
+    pub abilities: Vec<Ability>,
     pub passives: Vec<Passive>,
     /// Free-form labels (traits, roles) that selectors can match on.
     pub tags: Vec<String>,
@@ -864,7 +866,7 @@ impl UnitTemplate {
             id: String::new(),
             name: name.into(),
             stats,
-            ability: None,
+            abilities: Vec::new(),
             passives: Vec::new(),
             tags: Vec::new(),
             targeting: Targeting::Nearest,
@@ -883,8 +885,10 @@ impl UnitTemplate {
         self
     }
 
+    /// Adds an ability. A unit can have several; see
+    /// [`UnitTemplate::abilities`].
     pub fn with_ability(mut self, ability: Ability) -> Self {
-        self.ability = Some(ability);
+        self.abilities.push(ability);
         self
     }
 

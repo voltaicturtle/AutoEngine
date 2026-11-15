@@ -69,8 +69,10 @@ pub struct UnitDef {
     /// Stats that differ from [`StatBlock::base`].
     #[serde(default)]
     pub stats: BTreeMap<Stat, i64>,
+    /// The abilities it casts. Each tick it casts the first one it can
+    /// pay for, so the ones that should win go first.
     #[serde(default)]
-    pub ability: Option<Ability>,
+    pub abilities: Vec<Ability>,
     #[serde(default)]
     pub passives: Vec<Passive>,
     /// Whether the unit can appear in shops. Summoned-only units set this
@@ -122,7 +124,7 @@ impl UnitDef {
             cost: 0,
             traits: Vec::new(),
             stats: BTreeMap::new(),
-            ability: None,
+            abilities: Vec::new(),
             passives: Vec::new(),
             in_shop: true,
             model: None,
@@ -167,8 +169,12 @@ impl UnitDef {
         self
     }
 
+    /// Adds an ability. Most units have one; call this again to give a
+    /// unit several, which works best when they have different
+    /// [costs](crate::effect::Cost) or cooldowns. Each tick the unit casts
+    /// the first one it can pay for, in the order they were added.
     pub fn ability(mut self, ability: Ability) -> Self {
-        self.ability = Some(ability);
+        self.abilities.push(ability);
         self
     }
 
@@ -989,9 +995,33 @@ pub type Translations = BTreeMap<String, BTreeMap<String, String>>;
 /// The kinds of definition that have translatable text.
 pub const TEXT_KINDS: [&str; 5] = ["unit", "trait", "item", "augment", "resource"];
 
+/// The text fields of a unit's ability, by position: `"ability"` and
+/// `"ability_description"` for the first, `"ability_2"` and
+/// `"ability_2_description"` for the second, and so on.
+pub fn ability_fields(index: usize) -> (String, String) {
+    match index {
+        0 => ("ability".into(), "ability_description".into()),
+        i => (format!("ability_{}", i + 1), format!("ability_{}_description", i + 1)),
+    }
+}
+
+/// The ability a text field of a unit belongs to, and whether the field is
+/// its description.
+fn ability_of_field(field: &str) -> Option<(usize, bool)> {
+    let (rest, description) = match field.strip_suffix("_description") {
+        Some(rest) => (rest, true),
+        None => (field, false),
+    };
+    let index = match rest.strip_prefix("ability")? {
+        "" => 0,
+        number => number.strip_prefix('_')?.parse::<usize>().ok().filter(|n| *n >= 2)? - 1,
+    };
+    Some((index, description))
+}
+
 /// The translation key for one text of a definition: `kind` is one of
 /// [`TEXT_KINDS`] and `field` is `"name"` or `"description"` (resources only
-/// have a name), or for units
+/// have a name), or for units also the fields [`ability_fields`] gives:
 /// `"ability"` (the ability's name) or `"ability_description"`.
 pub fn text_key(kind: &str, id: &str, field: &str) -> String {
     format!("{kind}.{id}.{field}")
@@ -1303,9 +1333,10 @@ impl ContentSet {
     pub fn text(&self, language: Option<&str>, kind: &str, id: &str, field: &str) -> Option<String> {
         let own = match (kind, field) {
             ("unit", "name") => self.unit(id).map(|d| d.name.clone()),
-            ("unit", "ability") => self.unit(id).and_then(|d| d.ability.as_ref()).map(|a| a.name.clone()),
-            ("unit", "ability_description") => {
-                self.unit(id).and_then(|d| d.ability.as_ref()).map(|a| a.description.clone())
+            ("unit", field) => {
+                let (index, description) = ability_of_field(field)?;
+                let ability = self.unit(id)?.abilities.get(index)?;
+                Some(if description { ability.description.clone() } else { ability.name.clone() })
             }
             ("item", "description") => self.item(id).map(|d| d.description.clone()),
             ("trait", "name") => self.trait_def(id).map(|d| d.name.clone()),
@@ -1327,9 +1358,10 @@ impl ContentSet {
         let mut keys = Vec::new();
         for (id, unit) in &self.units {
             keys.push(text_key("unit", id, "name"));
-            if unit.ability.is_some() {
-                keys.push(text_key("unit", id, "ability"));
-                keys.push(text_key("unit", id, "ability_description"));
+            for index in 0..unit.abilities.len() {
+                let (name, description) = ability_fields(index);
+                keys.push(text_key("unit", id, &name));
+                keys.push(text_key("unit", id, &description));
             }
         }
         for id in self.items.keys() {
@@ -1473,7 +1505,7 @@ impl ContentSet {
                 let known = match parts.as_slice() {
                     [kind, id, field] => match *kind {
                         "unit" => self.units.get(*id).is_some_and(|u| {
-                            *field == "name" || (u.ability.is_some() && matches!(*field, "ability" | "ability_description"))
+                            *field == "name" || ability_of_field(field).is_some_and(|(i, _)| i < u.abilities.len())
                         }),
                         "item" => self.items.contains_key(*id) && matches!(*field, "name" | "description"),
                         "trait" => self.traits.contains_key(*id) && matches!(*field, "name" | "description"),
@@ -1624,7 +1656,7 @@ impl ContentSet {
                 check_trait(&owner, t)?;
             }
             check_damage_kind(&owner, u.attack_kind)?;
-            if let Some(a) = &u.ability {
+            for a in &u.abilities {
                 let owner = format!("{owner}'s ability `{}`", a.name);
                 check_effects(&owner, &a.effects)?;
                 match &a.cost {
@@ -1794,7 +1826,7 @@ impl ContentSet {
     pub fn effects(&self) -> Vec<(String, &EffectSpec)> {
         let mut out = Vec::new();
         for u in self.units.values() {
-            if let Some(a) = &u.ability {
+            for a in &u.abilities {
                 out.extend(a.effects.iter().map(|e| (format!("unit {}", u.id), e)));
             }
         }
@@ -1863,7 +1895,7 @@ impl ContentSet {
             id: def.id.clone(),
             name: def.name.clone(),
             stats: stats.with_mods(star_mods),
-            ability: def.ability.clone(),
+            abilities: def.abilities.clone(),
             passives: def.passives.clone(),
             tags: def.traits.clone(),
             targeting: def.targeting,
@@ -1871,12 +1903,13 @@ impl ContentSet {
         })
     }
 
-    /// What casting its ability costs a unit at a star level, before items
-    /// and traits: the resource and how much of it. `None` for a unit with
-    /// no ability or a free one.
-    pub fn ability_cost(&self, unit_id: &str, star: u8) -> Option<(&ResourceDef, i64)> {
+    /// What casting one of its abilities (by position, the first is 0)
+    /// costs a unit at a star level, before items and traits: the resource
+    /// and how much of it. `None` for an ability that is free or is not
+    /// there.
+    pub fn ability_cost(&self, unit_id: &str, star: u8, ability: usize) -> Option<(&ResourceDef, i64)> {
         let template = self.base_template(unit_id, star).ok()?;
-        let ability = template.ability.as_ref()?;
+        let ability = template.abilities.get(ability)?;
         let resource = self.resource(ability.cost.resource()?)?;
         let amount = match ability.cost {
             Cost::Amount { amount, .. } => amount,

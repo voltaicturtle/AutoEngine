@@ -54,7 +54,7 @@ fn silence_stops_casting_but_not_attacking() {
     let me = c.spawn(caster, Team(0), at(3, 3)).unwrap();
     c.spawn(dummy("Silencer").with_passive(opener(Effect::silence(2_000))), Team(1), at(3, 4)).unwrap();
     run_ms(&mut c, 4_000);
-    let cast = first_ms(&c, |e| matches!(e, EventKind::CastStarted { unit } if *unit == me)).unwrap();
+    let cast = first_ms(&c, |e| matches!(e, EventKind::CastStarted { unit, .. } if *unit == me)).unwrap();
     let attack = first_ms(&c, |e| matches!(e, EventKind::Attacked { source, .. } if *source == me)).unwrap();
     assert!(cast >= 2_000, "cast at {cast} ms");
     assert!(attack < 2_000, "attacked at {attack} ms");

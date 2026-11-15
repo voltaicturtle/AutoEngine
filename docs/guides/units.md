@@ -41,7 +41,7 @@ assert_eq!(duelist.cost, 3);
 | `.traits(["a", "b"])` | the traits it belongs to, by id |
 | `.stat(stat, value)` | sets one base stat |
 | `.stats([(stat, value), ...])` | sets several base stats |
-| `.ability(Ability)` | the ability it casts when it can pay for it: by default, when its mana is full |
+| `.ability(Ability)` | an ability it casts when it can pay for it: by default, when its mana is full. Call it again to give the unit [several](#several-abilities) |
 | `.passive(Passive)` | an effect that fires on a trigger. Can be called more than once |
 | `.targeting(Targeting)` | which enemy it goes after (see below) |
 | `.attack_kind(DamageKind)` | the [type of damage](damage.md) its basic attacks deal, instead of physical |
@@ -122,6 +122,32 @@ assert_eq!(ability.effects.len(), 2);
 | `.effect(spec)` | one effect and who it hits, made with `Effect::...().to(Selector::...)`. Effects happen in the order they are added |
 
 Everything an ability can do is in [Effects](effects.md).
+
+### Several abilities
+
+A unit can have more than one ability. Each tick it casts the first one
+it can pay for, in the order they were added, so put the one that should
+win first. This works best when the abilities have different
+[costs or cooldowns](resources.md#costs-and-cooldowns):
+
+```rust
+use autoengine::content::UnitDef;
+use autoengine::effect::{Ability, Cost, Effect, Selector};
+use autoengine::stats::Stat::*;
+
+let mage = UnitDef::new("stormcaller", "Stormcaller")
+    .cost(4)
+    .stat(MaxMana, 100)
+    // The big one, whenever the mana bar fills.
+    .ability(Ability::new("Tempest").cast_time(600).effect(Effect::magic(300).to(Selector::AllEnemies)))
+    // A quick one every three seconds in between.
+    .ability(Ability::new("Spark").cost(Cost::Free).cooldown(3000).effect(Effect::magic(60).to(Selector::CurrentTarget)));
+assert_eq!(mage.abilities.len(), 2);
+```
+
+`CastStarted` and `CastFinished` fight events say which ability it was, by
+position, and `OnCast` passives fire for all of them. `cargo run -- check`
+warns when an earlier ability always hides a later one.
 
 ## Passives
 
@@ -259,7 +285,7 @@ let healer = UnitDef::new("dawn_cleric", "Dawn Cleric")
             )
             .effect(Effect::cleanse().to(Selector::LowestHealthAllies(2)).when(Condition::HasDebuff(Who::Target))),
     );
-assert!(healer.ability.is_some());
+assert_eq!(healer.abilities.len(), 1);
 ```
 
 **A neutral monster for PvE rounds:**

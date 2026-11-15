@@ -368,7 +368,8 @@ let skewer = Effect::physical(90).to(Selector::Custom("my_column".into()));
 ```
 
 On a unit in the fight (`ctx.combat().unit(id)`) you can read `health()`,
-`mana()`, `resource(id)`, `pools()`, `cooldown_ms()`, `shield()`,
+`mana()`, `resource(id)`, `pools()`, `cooldown_ms(ability)`, `casting()`,
+`shield()`,
 `stat(stat)`, `pos()`, `team()`, `target()`,
 `is_alive()`, `is_casting()`, `is_stunned()`, `has_status(|s| ...)`,
 `statuses()`, `stacks(name)`, `has_tag(tag)`, `name()` and `template()`.

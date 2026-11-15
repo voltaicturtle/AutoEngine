@@ -110,8 +110,8 @@ they appeared. `Spawned` says which unit each one is.
 | `Damaged` | `source`, `target`, `amount`, `absorbed`, `kind`, `crit` | damage landed. `amount` is health lost and `absorbed` is what shields took |
 | `Healed` | `source`, `target`, `amount` | health restored. `source` is the healer, or the unit itself for lifesteal |
 | `Shielded` | `source`, `target`, `amount` | a shield was given |
-| `CastStarted` | `unit` | a unit started casting its ability |
-| `CastFinished` | `unit` | the cast finished and its effects happened |
+| `CastStarted` | `unit`, `ability` | a unit started casting an ability. `ability` is its position among the unit's abilities, starting at 0 |
+| `CastFinished` | `unit`, `ability` | the cast finished and its effects happened |
 | `PassiveTriggered` | `unit`, `passive` | a passive fired. `passive` is its index in the unit's template |
 | `StatusApplied` | `source`, `target`, `status`, `duration_ms` | a status took hold, for this long after tenacity |
 | `StatusExpired` | `target`, `status` | a status ran out |

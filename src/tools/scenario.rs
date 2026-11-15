@@ -203,7 +203,7 @@ pub fn run_scenario(content: &ContentSet, scenario: &Scenario) -> ScenarioResult
                         }
                         Expect::Casts(..) => {
                             let cast = run.combat.events().iter().any(|e| {
-                                matches!(&e.kind, EventKind::CastStarted { unit }
+                                matches!(&e.kind, EventKind::CastStarted { unit, .. }
                                     if run.units(*team, &name).any(|u| u.id() == *unit))
                             });
                             if !cast {

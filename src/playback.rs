@@ -208,12 +208,12 @@ impl Playback {
                     u.shield += amount;
                 }
             }
-            EventKind::CastStarted { unit } => {
+            EventKind::CastStarted { unit, .. } => {
                 if let Some(u) = self.units.get_mut(&unit) {
                     u.casting = true;
                 }
             }
-            EventKind::CastFinished { unit } => {
+            EventKind::CastFinished { unit, .. } => {
                 if let Some(u) = self.units.get_mut(&unit) {
                     u.casting = false;
                 }
@@ -376,7 +376,7 @@ pub fn fight_stats(events: &[Event]) -> Vec<UnitFightStats> {
                     s.shielding_done += amount;
                 }
             }
-            EventKind::CastFinished { unit } => {
+            EventKind::CastFinished { unit, .. } => {
                 if let Some(s) = stats.get_mut(unit) {
                     s.casts += 1;
                 }
