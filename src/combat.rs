@@ -22,10 +22,11 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::effect::{
-    Amount, Anchor, Condition, DamageKind, Effect, EffectSpec, ScaleBy, Selector, StatusKind, Targeting, Trigger,
-    UnitTemplate, Who,
+    Amount, Anchor, Condition, Cost, DamageKind, Effect, EffectSpec, ScaleBy, Selector, StatusKind, Targeting,
+    Trigger, UnitTemplate, Who,
 };
 use crate::hex::{Hex, HexBoard};
+use crate::resource::{MANA, Pool, ResourceDef};
 use crate::rng::Rng;
 use crate::stats::{Stat, StatMod, Stats};
 
@@ -67,10 +68,9 @@ pub struct CombatConfig {
     pub tick_ms: u32,
     /// The fight ends in a draw after this long.
     pub max_duration_ms: u32,
-    /// Mana gained per point of damage taken, in permille.
-    pub mana_per_damage_permille: i64,
-    /// Most mana one instance of damage can grant.
-    pub mana_from_damage_cap: i64,
+    /// The resources units build up and spend to cast: mana, unless the
+    /// game says otherwise. See the [`resource`](crate::resource) module.
+    pub resources: Vec<ResourceDef>,
     /// Damage multiplier from resistance is `k / (k + resist)`.
     pub resist_constant: i64,
     /// Cap on the `DamageReduction` stat, in permille.
@@ -89,8 +89,7 @@ impl Default for CombatConfig {
         CombatConfig {
             tick_ms: 50,
             max_duration_ms: 60_000,
-            mana_per_damage_permille: 30,
-            mana_from_damage_cap: 40,
+            resources: vec![ResourceDef::mana()],
             resist_constant: 100,
             max_damage_reduction: 900,
             overtime_after_ms: 30_000,
@@ -134,12 +133,18 @@ pub struct CombatUnit {
     pos: Hex,
     stats: Stats,
     health: i64,
-    mana: i64,
+    /// The fight's resource rules, and how much of each the unit has.
+    resource_defs: Arc<[ResourceDef]>,
+    resources: Vec<i64>,
     alive: bool,
     target: Option<UnitId>,
     attack_progress: i64,
     move_progress: i64,
     cast_remaining_ms: Option<u32>,
+    /// Time until the ability can be cast again.
+    cooldown_ms: u32,
+    /// Time since the last once-a-second resource change.
+    second_ms: u32,
     shields: Vec<ShieldInstance>,
     statuses: Vec<StatusInstance>,
     passive_state: Vec<PassiveState>,
@@ -168,8 +173,30 @@ impl CombatUnit {
     pub fn health(&self) -> i64 {
         self.health
     }
+    /// How much mana the unit has; short for `resource("mana")`.
     pub fn mana(&self) -> i64 {
-        self.mana
+        self.resource(MANA)
+    }
+    /// How much of a resource the unit has, by resource id. Zero for a
+    /// resource the unit or the fight does not have.
+    pub fn resource(&self, id: &str) -> i64 {
+        self.pool(id).map_or(0, |p| p.amount)
+    }
+    /// One of the unit's resources, by id. `None` if it does not have it.
+    pub fn pool(&self, id: &str) -> Option<Pool<'_>> {
+        self.pools().find(|p| p.def.id == id)
+    }
+    /// Every resource the unit has, in the order the fight lists them.
+    pub fn pools(&self) -> impl Iterator<Item = Pool<'_>> {
+        self.resource_defs
+            .iter()
+            .zip(&self.resources)
+            .map(|(def, amount)| Pool { def, amount: *amount, max: self.stats.get(def.max) })
+            .filter(|p| p.max > 0)
+    }
+    /// Time until the unit's ability can be cast again.
+    pub fn cooldown_ms(&self) -> u32 {
+        self.cooldown_ms
     }
     /// Total remaining shield.
     pub fn shield(&self) -> i64 {
@@ -242,6 +269,10 @@ pub enum EventKind {
     StatusApplied { source: UnitId, target: UnitId, status: StatusKind, duration_ms: u32 },
     StatusExpired { target: UnitId, status: StatusKind },
     StacksChanged { unit: UnitId, stack: String, count: u32 },
+    /// A unit now has `amount` of the resource with this id, out of `max`.
+    /// Sent when either number changes, and for each resource a unit has
+    /// when it enters the fight.
+    ResourceChanged { unit: UnitId, resource: String, amount: i64, max: i64 },
     Died { unit: UnitId, killer: UnitId },
     Ended { winner: Option<Team>, timed_out: bool },
 }
@@ -292,6 +323,7 @@ pub struct Combat {
     board: HexBoard,
     config: CombatConfig,
     rng: Rng,
+    resources: Arc<[ResourceDef]>,
     units: Vec<CombatUnit>,
     library: HashMap<String, Arc<UnitTemplate>>,
     occupancy: Vec<Option<UnitId>>,
@@ -315,6 +347,7 @@ impl Combat {
         let cells = board.len();
         Combat {
             board,
+            resources: config.resources.clone().into(),
             config,
             rng: Rng::new(seed),
             units: Vec::new(),
@@ -415,7 +448,6 @@ impl Combat {
         let id = UnitId(self.units.len() as u32);
         let stats = Stats::new(template.stats.clone());
         let health = stats.get(Stat::MaxHealth).max(1);
-        let mana = stats.get(Stat::StartingMana).min(stats.get(Stat::MaxMana));
         let passive_state = vec![PassiveState::default(); template.passives.len()];
         self.units.push(CombatUnit {
             id,
@@ -424,12 +456,15 @@ impl Combat {
             pos,
             stats,
             health,
-            mana,
+            resource_defs: self.resources.clone(),
+            resources: vec![0; self.resources.len()],
             alive: true,
             target: None,
             attack_progress: 0,
             move_progress: 0,
             cast_remaining_ms: None,
+            cooldown_ms: 0,
+            second_ms: 0,
             shields: Vec::new(),
             statuses: Vec::new(),
             passive_state,
@@ -438,6 +473,14 @@ impl Combat {
         self.occupancy[idx] = Some(id);
         let name = self.u(id).template.name.clone();
         self.emit(EventKind::Spawned { unit: id, team, pos, name, max_health: health });
+        let defs = self.resources.clone();
+        for (index, def) in defs.iter().enumerate() {
+            let max = self.u(id).stat(def.max);
+            if max > 0 {
+                let start = self.eval(&def.start, id, id).clamp(0, max);
+                self.set_resource(id, index, start, true);
+            }
+        }
         if self.started {
             self.fire(id, None, |t| matches!(t, Trigger::CombatStart));
         }
@@ -512,12 +555,16 @@ impl Combat {
             return;
         }
 
-        // Start a cast when mana is full.
-        let max_mana = self.u(id).stat(Stat::MaxMana);
+        // Start a cast as soon as the unit can pay for its ability.
         let silenced = self.u(id).has_status(|s| matches!(s, StatusKind::Silence));
-        if max_mana > 0 && self.u(id).mana >= max_mana && self.u(id).template.ability.is_some() && !silenced {
-            let cast_time = self.u(id).template.ability.as_ref().unwrap().cast_time_ms;
-            self.u_mut(id).mana = 0;
+        if !silenced && let Some(payment) = self.payment(id) {
+            let ability = self.u(id).template.ability.as_ref().unwrap();
+            let (cast_time, cooldown) = (ability.cast_time_ms, ability.cooldown_ms);
+            if let Some((index, amount)) = payment {
+                let left = self.u(id).resources[index] - amount;
+                self.set_resource(id, index, left, false);
+            }
+            self.u_mut(id).cooldown_ms = cooldown;
             self.emit(EventKind::CastStarted { unit: id });
             if cast_time == 0 {
                 self.finish_cast(id);
@@ -576,9 +623,70 @@ impl Combat {
         }
     }
 
-    /// Advances shields, statuses and periodic passives by one tick.
+    /// What casting its ability would cost a unit right now: `None` if it
+    /// cannot cast, `Some(None)` if the cast is free, or the resource (by
+    /// position) and amount to take.
+    fn payment(&self, id: UnitId) -> Option<Option<(usize, i64)>> {
+        let unit = self.u(id);
+        let ability = unit.template.ability.as_ref()?;
+        if unit.cooldown_ms > 0 {
+            return None;
+        }
+        let (resource, amount) = match &ability.cost {
+            Cost::Free => return Some(None),
+            Cost::Full(resource) => (resource, None),
+            Cost::Amount { resource, amount } => (resource, Some((*amount).max(0))),
+        };
+        let index = self.resources.iter().position(|d| d.id == *resource)?;
+        let max = unit.stat(self.resources[index].max);
+        let amount = amount.unwrap_or(max);
+        (max > 0 && unit.resources[index] >= amount).then_some(Some((index, amount)))
+    }
+
+    /// Sets how much of a resource a unit has, and reports it if that is
+    /// news (or `always`).
+    fn set_resource(&mut self, id: UnitId, index: usize, amount: i64, always: bool) {
+        let max = self.u(id).stat(self.resources[index].max).max(0);
+        let amount = amount.clamp(0, max);
+        if std::mem::replace(&mut self.u_mut(id).resources[index], amount) != amount || always {
+            let resource = self.resources[index].id.clone();
+            self.emit(EventKind::ResourceChanged { unit: id, resource, amount, max });
+        }
+    }
+
+    /// Gives a unit some of a resource (or takes it, when negative), within
+    /// the resource's rules.
+    fn add_resource(&mut self, id: UnitId, index: usize, amount: i64) {
+        let def = &self.resources[index];
+        let unit = self.u(id);
+        let locked = unit.cast_remaining_ms.is_some() && !def.changes_while_casting;
+        if amount == 0 || !unit.alive || locked || unit.stat(def.max) <= 0 {
+            return;
+        }
+        self.set_resource(id, index, unit.resources[index] + amount, false);
+    }
+
+    /// Gives a unit what each resource's rules say an occasion is worth.
+    fn gain_resources(&mut self, id: UnitId, worth: impl Fn(&Combat, &ResourceDef) -> i64) {
+        for index in 0..self.resources.len() {
+            let amount = worth(self, &self.resources[index]);
+            self.add_resource(id, index, amount);
+        }
+    }
+
+    /// Advances shields, statuses, resources and periodic passives by one
+    /// tick.
     fn tick_timers(&mut self, id: UnitId) {
         let tick_ms = self.config.tick_ms;
+
+        // Cooldown, and what resources gain or lose every second.
+        let unit = self.u_mut(id);
+        unit.cooldown_ms = unit.cooldown_ms.saturating_sub(tick_ms);
+        unit.second_ms += tick_ms;
+        if unit.second_ms >= 1000 {
+            unit.second_ms -= 1000;
+            self.gain_resources(id, |c, def| if def.per_second.is_zero() { 0 } else { c.eval(&def.per_second, id, id) });
+        }
 
         // Shields.
         self.u_mut(id).shields.retain_mut(|s| match &mut s.remaining_ms {
@@ -707,8 +815,7 @@ impl Combat {
     fn basic_attack(&mut self, id: UnitId, target: UnitId) {
         self.emit(EventKind::Attacked { source: id, target });
         let damage = self.u(id).stat(Stat::AttackDamage);
-        let mana = self.u(id).stat(Stat::ManaPerAttack);
-        self.add_mana(id, mana);
+        self.gain_resources(id, |c, def| if def.per_attack.is_zero() { 0 } else { c.eval(&def.per_attack, id, id) });
         let dodge = self.u(target).stat(Stat::Dodge);
         if dodge > 0 && self.rng.chance(dodge.min(1000) as u64, 1000) {
             self.emit(EventKind::Dodged { source: id, target });
@@ -813,6 +920,9 @@ impl Combat {
                 who(w).is_some_and(|id| self.u(id).stacks(stack) >= *count)
             }
             Condition::AlliesWithTagAtLeast { tag, count } => self.allies_with_tag(source, tag) >= *count,
+            Condition::ResourceAtLeast { who: w, resource, permille } => who(w)
+                .and_then(|id| self.u(id).pool(resource))
+                .is_some_and(|p| p.amount * 1000 >= p.max * *permille as i64),
             Condition::Chance { permille } => self.rng.chance(*permille as u64, 1000),
             Condition::Not(c) => !self.check(c, source, target),
             Condition::All(cs) => cs.iter().all(|c| self.check(c, source, target)),
@@ -903,6 +1013,7 @@ impl Combat {
                 ScaleBy::MissingHealth => (unit.stat(Stat::MaxHealth) - unit.health).max(0),
                 ScaleBy::Stacks(stack) => unit.stacks(stack) as i64,
                 ScaleBy::AlliesWithTag(tag) => self.allies_with_tag(unit.id, tag) as i64,
+                ScaleBy::Resource(resource) => unit.resource(resource),
             };
             total += value * s.permille / 1000;
         }
@@ -936,7 +1047,12 @@ impl Combat {
                     self.emit(EventKind::Shielded { source, target, amount: value });
                 }
             }
-            Effect::GainMana { amount } => self.add_mana(target, *amount),
+            Effect::GainResource { resource, amount } => {
+                if let Some(index) = self.resources.iter().position(|d| d.id == *resource) {
+                    let amount = self.eval(amount, source, target);
+                    self.add_resource(target, index, amount);
+                }
+            }
             Effect::ApplyStatus { status, duration_ms } => {
                 let t = self.u(target);
                 if status.is_debuff() && t.has_status(|s| matches!(s, StatusKind::Unstoppable)) {
@@ -1123,16 +1239,13 @@ impl Combat {
             unit.health += after - before;
         }
         unit.health = unit.health.min(after);
-        unit.mana = unit.mana.min(unit.stats.get(Stat::MaxMana).max(0));
-    }
-
-    fn add_mana(&mut self, id: UnitId, amount: i64) {
-        let unit = self.u_mut(id);
-        let max = unit.stats.get(Stat::MaxMana);
-        if !unit.alive || max <= 0 || unit.cast_remaining_ms.is_some() {
-            return;
+        // A change of capacity is news for whoever draws the bar.
+        for index in 0..self.resources.len() {
+            if mods.iter().any(|m| m.stat == self.resources[index].max) {
+                let amount = self.u(id).resources[index];
+                self.set_resource(id, index, amount, true);
+            }
         }
-        unit.mana = (unit.mana + amount).clamp(0, max);
     }
 
     fn heal(&mut self, source: UnitId, id: UnitId, amount: i64) {
@@ -1242,15 +1355,16 @@ impl Combat {
         if lifesteal > 0 && source != target {
             self.heal(source, source, amount * lifesteal / 1000);
         }
+        if source != target {
+            self.gain_resources(source, |_, def| def.from_damage_dealt.of(amount));
+        }
 
         if health <= 0 {
             self.kill(target, source);
             return;
         }
 
-        let mana = (amount * self.config.mana_per_damage_permille / 1000)
-            .min(self.config.mana_from_damage_cap);
-        self.add_mana(target, mana);
+        self.gain_resources(target, |_, def| def.from_damage_taken.of(amount));
         if direct {
             self.fire(target, Some(source), |t| matches!(t, Trigger::OnDamaged));
         }
@@ -1273,6 +1387,7 @@ impl Combat {
         self.emit(EventKind::Died { unit: id, killer });
         self.fire(id, Some(killer), |t| matches!(t, Trigger::OnDeath));
         if killer != id {
+            self.gain_resources(killer, |c, def| if def.per_kill.is_zero() { 0 } else { c.eval(&def.per_kill, killer, id) });
             self.fire(killer, Some(id), |t| matches!(t, Trigger::OnKill));
         }
         for i in 0..self.units.len() {

@@ -1,7 +1,7 @@
 //! The sample game, written in Rust with the content builders.
 //!
 //! It is small and original: eight shop units, a summon and a neutral
-//! monster, five traits, six items (three components and what they combine
+//! monster, a second resource next to mana, five traits, six items (three components and what they combine
 //! into), seven augments, a round schedule with every built-in round kind and
 //! a scripted one, a sample fight and a few content tests. A game built on
 //! the engine defines the same things the same way, in its own crate.
@@ -13,8 +13,9 @@ use crate::content::{
     AugmentDef, BoardUnit, Bonus, ChoiceOffer, Consumable, ContentSet, ItemDef, MatchSetup, RoundDef, RoundKindDef, Schedule,
     TeamSetup, TraitDef, UnitDef,
 };
-use crate::effect::{Ability, Amount, Anchor, DamageKind, Effect, Passive, ScaleBy, Selector, Trigger, Who};
-use crate::stats::Stat::*;
+use crate::effect::{Ability, Amount, Anchor, Cost, DamageKind, Effect, Passive, ScaleBy, Selector, Trigger, Who};
+use crate::resource::ResourceDef;
+use crate::stats::Stat::{self, *};
 use crate::tools::cli::GameSpec;
 use crate::tools::scenario::{Expect, Scenario};
 
@@ -29,6 +30,7 @@ pub fn spec() -> GameSpec {
 /// The whole sample game.
 pub fn content() -> ContentSet {
     ContentSet::builder()
+        .resource(fury())
         .units(units())
         .trait_defs(traits())
         .items(items())
@@ -38,6 +40,16 @@ pub fn content() -> ContentSet {
         .script("second_wind", include_str!("../content/scripts/second_wind.rhai"))
         .build()
         .expect("the sample content is valid")
+}
+
+/// How much fury a unit can hold. Units without any don't have fury.
+pub const MAX_FURY: Stat = Stat::custom("max_fury");
+
+/// A second resource next to mana, to show how one is made: fury comes from
+/// attacking and killing and fades when the fighting stops. The Ashen Hound
+/// runs on it.
+pub fn fury() -> ResourceDef {
+    ResourceDef::new("fury", "Fury", MAX_FURY).per_attack(12).per_kill(25).per_second(-3).color([235, 120, 50])
 }
 
 /// Two boards to fight each other. Positions are `(column, row)` from each
@@ -303,12 +315,13 @@ pub fn units() -> Vec<UnitDef> {
                 (Armor, 20),
                 (MagicResist, 20),
                 (AttackSpeed, 800),
-                (MaxMana, 50),
+                (MAX_FURY, 60),
                 (MoveSpeed, 2400),
             ])
             .ability(
                 Ability::new("Cinder Bite")
                     .description("Bites its target for 200% attack damage and melts 40% of its armor for 4 seconds.")
+                    .cost(Cost::of("fury", 45))
                     .effect(
                         Effect::physical(Amount::flat(0).plus(Who::Source, ScaleBy::Stat(AttackDamage), 2000))
                             .with_crit()

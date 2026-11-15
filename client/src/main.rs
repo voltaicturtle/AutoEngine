@@ -65,7 +65,7 @@ use autoengine::protocol::DevCommand;
 use autoengine::protocol::{ClientMsg, ViewPhase};
 use macroquad::prelude::*;
 
-use draw::{Layout, button, draw_health_bar, draw_pips, draw_unit_token, label, panel, text_centered, unit_color};
+use draw::{Layout, button, draw_health_bar, draw_resource_bar, draw_pips, draw_unit_token, label, panel, text_centered, unit_color};
 use model::{Model, Pose, RawModel};
 use scene::Ground;
 use settings::{Action, Settings};

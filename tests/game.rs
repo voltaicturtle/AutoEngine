@@ -444,10 +444,10 @@ fn games_are_deterministic() {
 fn shops_only_offer_copies_that_exist() {
     // Two copies of each unit and eight shops of five: most slots must stay
     // empty, and no unit may be shown more often than it has copies.
-    let mut rules = autoengine::content::GameRules::default();
+    let base = autoengine::sample::content();
+    let mut rules = base.rules().clone();
     rules.pool_sizes.clear();
     rules.default_pool_size = 2;
-    let base = autoengine::sample::content();
     let content = ContentSet::new(base.units().cloned().collect(), base.traits().cloned().collect(), base.items().cloned().collect(), rules)
         .unwrap()
         .with_schedule(Schedule::new([RoundDef::new("fight", 1, RoundKindDef::pvp())]))
@@ -742,14 +742,8 @@ fn single_use_items_do_their_thing_and_are_gone() {
 fn single_use_items_cannot_be_recipe_parts() {
     use autoengine::content::{Consumable, ItemDef};
     let base = autoengine::sample::content();
-    let mut builder = autoengine::content::ContentSet::builder();
-    for u in base.units() {
-        builder = builder.unit(u.clone());
-    }
-    for t in base.traits() {
-        builder = builder.trait_def(t.clone());
-    }
-    let err = builder
+    let err = base
+        .into_builder()
         .item(ItemDef::new("magnet", "Magnet").consumable(Consumable::RemoveItems))
         .item(ItemDef::new("rod", "Rod"))
         .item(ItemDef::new("odd", "Odd").recipe("magnet", "rod"))

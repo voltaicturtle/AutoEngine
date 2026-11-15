@@ -35,8 +35,9 @@ the condition for each unit it would hit.
 | `Effect::shield(amount)` | a shield that absorbs damage before health, for the whole fight |
 | `Effect::shield_for(amount, ms)` | a shield that disappears after `ms` |
 | `Effect::mana(n)` | gives mana. A negative `n` drains it |
+| `Effect::resource(id, n)` | the same for any [resource](resources.md) |
 | `Effect::stun(ms)` | can't move, attack or cast. A cast already started is paused |
-| `Effect::silence(ms)` | can't start casting. Mana still builds up |
+| `Effect::silence(ms)` | can't start casting. Mana and other resources still build up |
 | `Effect::disarm(ms)` | can't attack, but can move and cast |
 | `Effect::root(ms)` | can't move, but can attack what's in range and cast |
 | `Effect::taunt(ms)` | must attack the source while the source lives |
@@ -108,6 +109,7 @@ multiplied by the source's `AbilityPower` / 100. Each term is
 | `MissingHealth` | maximum health minus health now |
 | `Stacks(name)` | its count of a named stack |
 | `AlliesWithTag(tag)` | living units on its team, itself included, that carry a tag (traits are tags) |
+| `Resource(id)` | how much of a [resource](resources.md) it has now |
 
 `Who::Source` is the unit producing the effect and `Who::Target` is the unit
 receiving it.
@@ -184,6 +186,7 @@ the target. A condition about a target that doesn't exist is false.
 | `HasTag { who, tag }` | the unit carries a tag: its traits, including traits its items grant |
 | `StacksAtLeast { who, stack, count }` | the unit has at least `count` of a stack |
 | `AlliesWithTagAtLeast { tag, count }` | at least `count` living units on the source's team carry a tag |
+| `ResourceAtLeast { who, resource, permille }` | the unit's bar of a [resource](resources.md) is at least `permille` full |
 | `Condition::chance(permille)` | a random roll from the fight's seed |
 | `Condition::custom(name)` | a Rust predicate says so (see [Rust hooks](#rust-hooks)) |
 | `c.not()`, `a.and(b)`, `a.or(b)` | combine conditions (`Not`, `All(vec)`, `Any(vec)` as values) |
@@ -291,7 +294,8 @@ A custom condition gets a `ConditionContext` with `source()`, `target()`
 (an `Option`) and `combat()`.
 
 On a unit in the fight (`ctx.combat().unit(id)`) you can read `health()`,
-`mana()`, `shield()`, `stat(stat)`, `pos()`, `team()`, `target()`,
+`mana()`, `resource(id)`, `pools()`, `cooldown_ms()`, `shield()`,
+`stat(stat)`, `pos()`, `team()`, `target()`,
 `is_alive()`, `is_casting()`, `is_stunned()`, `has_status(|s| ...)`,
 `statuses()`, `stacks(name)`, `has_tag(tag)`, `name()` and `template()`.
 

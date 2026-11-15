@@ -210,8 +210,14 @@ pub(crate) fn draw_unit_tooltip(app: &App, unit: &OwnedUnit, at: Vec2) {
     }
     if def.ability.is_some() {
         let name = content.text(language, "unit", &def.id, "ability").unwrap_or_default();
-        let mana = def.stats.get(&autoengine::stats::Stat::MaxMana).copied().unwrap_or(0);
-        lines.push((if mana > 0 { format!("{name} ({mana} mana)") } else { name }, ui().gold));
+        let cost = content.ability_cost(&def.id, unit.star).filter(|(_, amount)| *amount > 0).map(|(resource, amount)| {
+            let what = content.text(language, "resource", &resource.id, "name").unwrap_or_default();
+            format!("{amount} {}", what.to_lowercase())
+        });
+        let cooldown = def.ability.as_ref().map_or(0, |a| a.cooldown_ms);
+        let wait = (cooldown > 0).then(|| format!("every {:.1}s", cooldown as f32 / 1000.0));
+        let terms: Vec<String> = cost.into_iter().chain(wait).collect();
+        lines.push((if terms.is_empty() { name } else { format!("{name} ({})", terms.join(", ")) }, ui().gold));
         let description = content.text(language, "unit", &def.id, "ability_description").unwrap_or_default();
         if !description.is_empty() {
             lines.push((description, ui().muted));

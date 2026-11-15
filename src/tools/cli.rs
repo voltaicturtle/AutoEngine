@@ -616,7 +616,8 @@ fn print_log(combat: &Combat) {
                 let what = status.name();
                 format!("{} is {} for {}ms", label(*target), what, duration_ms)
             }
-            EventKind::StatusExpired { .. } => continue,
+            // Too frequent to read; the casts they lead to are logged.
+            EventKind::StatusExpired { .. } | EventKind::ResourceChanged { .. } => continue,
             EventKind::Died { unit, killer } => {
                 format!("{} dies (killed by {})", label(*unit), label(*killer))
             }

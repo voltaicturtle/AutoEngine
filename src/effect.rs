@@ -62,6 +62,8 @@ pub enum ScaleBy {
     Stacks(String),
     /// Living units on the unit's team (itself included) carrying a tag.
     AlliesWithTag(String),
+    /// How much of a resource the unit has right now, by resource id.
+    Resource(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,10 +95,20 @@ impl Amount {
         Amount { flat: value, power_scaled: true, ..Default::default() }
     }
 
+    /// The value of one of the source's stats.
+    pub fn stat(stat: Stat) -> Self {
+        Amount::default().plus(Who::Source, ScaleBy::Stat(stat), 1000)
+    }
+
     /// Adds a scaling term, e.g. 150% of the source's attack damage.
     pub fn plus(mut self, who: Who, by: ScaleBy, permille: i64) -> Self {
         self.scalings.push(Scaling { who, by, permille });
         self
+    }
+
+    /// Whether it is always nothing.
+    pub fn is_zero(&self) -> bool {
+        self.flat == 0 && self.scalings.is_empty()
     }
 }
 
@@ -115,7 +127,7 @@ pub enum StatusKind {
     StatMods(Vec<StatMod>),
     /// Damage every tick, expressed per second.
     DamageOverTime { per_second: Amount, kind: DamageKind },
-    /// Cannot start casting. Mana still builds up.
+    /// Cannot start casting. Resources still build up.
     Silence,
     /// Cannot make basic attacks, but can move and cast.
     Disarm,
@@ -183,8 +195,10 @@ pub enum Effect {
         #[serde(default)]
         duration_ms: Option<u32>,
     },
-    /// Positive or negative.
-    GainMana { amount: i64 },
+    /// Gives the unit some of a resource (see the
+    /// [`resource`](crate::resource) module), or takes it away when the
+    /// amount is negative. Does nothing to a unit without that resource.
+    GainResource { resource: String, amount: Amount },
     ApplyStatus { status: StatusKind, duration_ms: u32 },
     /// Stat changes that last for the rest of the combat.
     ModifyStats { mods: Vec<StatMod> },
@@ -259,8 +273,26 @@ impl Effect {
         Effect::Shield { amount: amount.into(), duration_ms: Some(duration_ms) }
     }
 
-    pub fn mana(amount: i64) -> Self {
-        Effect::GainMana { amount }
+    /// Gives mana, or drains it when negative.
+    pub fn mana(amount: impl Into<Amount>) -> Self {
+        Effect::resource(crate::resource::MANA, amount)
+    }
+
+    /// Gives some of a resource, or drains it when negative.
+    pub fn resource(resource: impl Into<String>, amount: impl Into<Amount>) -> Self {
+        Effect::GainResource { resource: resource.into(), amount: amount.into() }
+    }
+
+    /// The amounts the effect works out when it resolves.
+    pub fn amounts(&self) -> Vec<&Amount> {
+        match self {
+            Effect::Damage { amount, .. }
+            | Effect::Heal { amount }
+            | Effect::Shield { amount, .. }
+            | Effect::GainResource { amount, .. } => vec![amount],
+            Effect::ApplyStatus { status: StatusKind::DamageOverTime { per_second, .. }, .. } => vec![per_second],
+            _ => Vec::new(),
+        }
     }
 
     pub fn stun(duration_ms: u32) -> Self {
@@ -448,6 +480,9 @@ pub enum Condition {
     /// At least `count` living units on the source's team (itself included)
     /// carry a tag.
     AlliesWithTagAtLeast { tag: String, count: u32 },
+    /// The unit has a resource filled to at least this share of its
+    /// capacity, in permille. False for a unit without the resource.
+    ResourceAtLeast { who: Who, resource: String, permille: u32 },
     /// A seeded random roll, in permille.
     Chance { permille: u32 },
     Not(Box<Condition>),
@@ -531,7 +566,48 @@ impl EffectSpec {
     }
 }
 
-/// An active ability, cast automatically when the unit's mana is full.
+/// What a unit pays to cast an ability. The unit casts as soon as it can
+/// pay (and the ability is off cooldown).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Cost {
+    /// A full bar of a resource, which the cast empties. A unit with none
+    /// of the resource never casts.
+    Full(String),
+    /// A fixed amount of a resource.
+    Amount { resource: String, amount: i64 },
+    /// Nothing. Give the ability a cooldown, or the unit does little else.
+    Free,
+}
+
+impl Cost {
+    /// A full bar of a resource.
+    pub fn full(resource: impl Into<String>) -> Self {
+        Cost::Full(resource.into())
+    }
+
+    /// A fixed amount of a resource.
+    pub fn of(resource: impl Into<String>, amount: i64) -> Self {
+        Cost::Amount { resource: resource.into(), amount }
+    }
+
+    /// The resource it is paid in, if any.
+    pub fn resource(&self) -> Option<&str> {
+        match self {
+            Cost::Full(resource) | Cost::Amount { resource, .. } => Some(resource),
+            Cost::Free => None,
+        }
+    }
+}
+
+/// A full bar of mana.
+impl Default for Cost {
+    fn default() -> Self {
+        Cost::full(crate::resource::MANA)
+    }
+}
+
+/// An active ability, cast automatically as soon as the unit can pay its
+/// [`Cost`]: by default, when its mana is full.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ability {
     pub name: String,
@@ -541,12 +617,37 @@ pub struct Ability {
     /// Time the unit spends casting before the effects resolve.
     #[serde(default)]
     pub cast_time_ms: u32,
+    /// What the unit pays to cast it.
+    #[serde(default)]
+    pub cost: Cost,
+    /// The least time between two casts, counted from when a cast starts.
+    #[serde(default)]
+    pub cooldown_ms: u32,
     pub effects: Vec<EffectSpec>,
 }
 
 impl Ability {
     pub fn new(name: impl Into<String>) -> Self {
-        Ability { name: name.into(), description: String::new(), cast_time_ms: 0, effects: Vec::new() }
+        Ability {
+            name: name.into(),
+            description: String::new(),
+            cast_time_ms: 0,
+            cost: Cost::default(),
+            cooldown_ms: 0,
+            effects: Vec::new(),
+        }
+    }
+
+    /// What the unit pays to cast it: `.cost(Cost::of("energy", 40))`.
+    pub fn cost(mut self, cost: Cost) -> Self {
+        self.cost = cost;
+        self
+    }
+
+    /// The least time between two casts.
+    pub fn cooldown(mut self, ms: u32) -> Self {
+        self.cooldown_ms = ms;
+        self
     }
 
     /// What it does, for players to read.

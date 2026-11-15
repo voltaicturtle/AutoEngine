@@ -41,7 +41,7 @@ assert_eq!(duelist.cost, 3);
 | `.traits(["a", "b"])` | the traits it belongs to, by id |
 | `.stat(stat, value)` | sets one base stat |
 | `.stats([(stat, value), ...])` | sets several base stats |
-| `.ability(Ability)` | the ability it casts when its mana is full |
+| `.ability(Ability)` | the ability it casts when it can pay for it: by default, when its mana is full |
 | `.passive(Passive)` | an effect that fires on a trigger. Can be called more than once |
 | `.targeting(Targeting)` | which enemy it goes after (see below) |
 | `.summon_only()` | keeps it out of shops and the pool, for summons and neutral monsters |
@@ -61,7 +61,7 @@ values. Stats that aren't set keep the base values.
 | `MagicResist` | 0 | points | cuts magic damage in the same way |
 | `AttackSpeed` | 700 | thousandths per second | 700 is 0.7 attacks a second |
 | `Range` | 1 | hexes | how far away it can attack. 1 is melee |
-| `MaxMana` | 0 | points | mana needed to cast. 0 means the unit never casts |
+| `MaxMana` | 0 | points | how much mana it can hold, which is what an ability costs by default. 0 means the unit has no mana |
 | `StartingMana` | 0 | points | mana at the start of a fight |
 | `ManaPerAttack` | 10 | points | mana gained per basic attack |
 | `CritChance` | 250 | permille | chance for an attack (or crit-enabled damage) to crit |
@@ -95,6 +95,10 @@ mana is full. Its mana then goes back to zero. Mana comes from
 `StartingMana`, from attacks (`ManaPerAttack`), from taking damage (3% of the
 damage, at most 40 per hit) and from effects (`Effect::mana`).
 
+Mana is only the default. An ability can cost a fixed amount of any
+resource, or nothing, and can have a cooldown, and a game can define its
+own resources and change how mana works. See [Resources](resources.md).
+
 ```rust
 use autoengine::effect::{Ability, Amount, Anchor, DamageKind, Effect, Selector};
 
@@ -112,6 +116,8 @@ assert_eq!(ability.effects.len(), 2);
 | `Ability::new(name)` | an ability with no effects |
 | `.description(text)` | the tooltip text. The engine doesn't check it against the effects |
 | `.cast_time(ms)` | how long the unit stands still casting before the effects happen. A stun pauses the cast rather than cancelling it |
+| `.cost(Cost)` | what it costs to cast: `Cost::full("mana")` (the default), `Cost::of("energy", 40)` or `Cost::Free`. See [Resources](resources.md) |
+| `.cooldown(ms)` | the least time between two casts |
 | `.effect(spec)` | one effect and who it hits, made with `Effect::...().to(Selector::...)`. Effects happen in the order they are added |
 
 Everything an ability can do is in [Effects](effects.md).

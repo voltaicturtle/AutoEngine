@@ -41,7 +41,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::combat::{Combat, ConditionContext, CustomConditionFn, CustomEffectFn, EffectContext, Team};
-use crate::effect::{Ability, Condition, Effect, EffectSpec, Passive, StatusKind, UnitTemplate};
+use crate::effect::{Ability, Amount, Condition, Cost, Effect, EffectSpec, Passive, ScaleBy, StatusKind, UnitTemplate};
+use crate::resource::ResourceDef;
 use crate::hex::{Hex, HexBoard};
 use crate::stats::{Stat, StatBlock, StatMod};
 
@@ -963,10 +964,11 @@ pub struct GameBuilder {
 pub type Translations = BTreeMap<String, BTreeMap<String, String>>;
 
 /// The kinds of definition that have translatable text.
-pub const TEXT_KINDS: [&str; 4] = ["unit", "trait", "item", "augment"];
+pub const TEXT_KINDS: [&str; 5] = ["unit", "trait", "item", "augment", "resource"];
 
 /// The translation key for one text of a definition: `kind` is one of
-/// [`TEXT_KINDS`] and `field` is `"name"` or `"description"`, or for units
+/// [`TEXT_KINDS`] and `field` is `"name"` or `"description"` (resources only
+/// have a name), or for units
 /// `"ability"` (the ability's name) or `"ability_description"`.
 pub fn text_key(kind: &str, id: &str, field: &str) -> String {
     format!("{kind}.{id}.{field}")
@@ -996,6 +998,45 @@ impl GameBuilder {
     /// Stat modifiers for each star level, starting at one star.
     pub fn star_levels<L: IntoIterator<Item = StatMod>>(mut self, levels: impl IntoIterator<Item = L>) -> Self {
         self.rules = self.rules.star_levels(levels);
+        self
+    }
+
+    /// Adds a resource units can build up and spend (see the
+    /// [`resource`](crate::resource) module), or replaces the one with the
+    /// same id: pass a changed [`ResourceDef::mana`] to retune mana.
+    ///
+    /// ```
+    /// use autoengine::content::{ContentSet, UnitDef};
+    /// use autoengine::effect::{Ability, Cost, Effect, Selector};
+    /// use autoengine::resource::ResourceDef;
+    /// use autoengine::stats::Stat;
+    ///
+    /// const MAX_ENERGY: Stat = Stat::custom("max_energy");
+    ///
+    /// let game = ContentSet::builder()
+    ///     .resource(ResourceDef::new("energy", "Energy", MAX_ENERGY).starts_full().per_second(10))
+    ///     .unit(UnitDef::new("duelist", "Duelist").stat(MAX_ENERGY, 100).ability(
+    ///         Ability::new("Lunge")
+    ///             .cost(Cost::of("energy", 40))
+    ///             .effect(Effect::physical(120).to(Selector::CurrentTarget)),
+    ///     ))
+    ///     .build()
+    ///     .unwrap();
+    /// assert_eq!(game.resources().len(), 2); // mana is still there
+    /// ```
+    pub fn resource(mut self, def: ResourceDef) -> Self {
+        let resources = &mut self.rules.combat.resources;
+        match resources.iter_mut().find(|r| r.id == def.id) {
+            Some(existing) => *existing = def,
+            None => resources.push(def),
+        }
+        self
+    }
+
+    /// Takes a resource out of the game: `.without_resource("mana")` for a
+    /// game that has no use for it.
+    pub fn without_resource(mut self, id: &str) -> Self {
+        self.rules.combat.resources.retain(|r| r.id != id);
         self
     }
 
@@ -1186,6 +1227,7 @@ impl ContentSet {
             ("item", "name") => self.item(id).map(|d| d.name.clone()),
             ("augment", "name") => self.augment(id).map(|d| d.name.clone()),
             ("augment", "description") => self.augment(id).map(|d| d.description.clone()),
+            ("resource", "name") => self.resource(id).map(|d| d.name.clone()),
             _ => None,
         }?;
         let translated = language
@@ -1216,6 +1258,9 @@ impl ContentSet {
             keys.push(text_key("augment", id, "name"));
             keys.push(text_key("augment", id, "description"));
         }
+        for def in self.resources() {
+            keys.push(text_key("resource", &def.id, "name"));
+        }
         keys
     }
 
@@ -1227,6 +1272,32 @@ impl ContentSet {
     /// Starts defining a game in Rust.
     pub fn builder() -> GameBuilder {
         GameBuilder::new()
+    }
+
+    /// A builder that already holds everything in this content set, for
+    /// making a variant of a game: the same game with one more unit, other
+    /// rules, an extra resource. Adding a definition with an id that is
+    /// already taken is an error when the variant is built.
+    ///
+    /// ```
+    /// use autoengine::content::UnitDef;
+    ///
+    /// let base = autoengine::sample::content();
+    /// let modded = base.clone().into_builder().unit(UnitDef::new("newcomer", "Newcomer").cost(1)).build().unwrap();
+    /// assert_eq!(modded.units().count(), base.units().count() + 1);
+    /// ```
+    pub fn into_builder(self) -> GameBuilder {
+        GameBuilder {
+            units: self.units.into_values().collect(),
+            traits: self.traits.into_values().collect(),
+            items: self.items.into_values().collect(),
+            augments: self.augments.into_values().collect(),
+            schedule: Some(self.schedule),
+            rules: self.rules,
+            scripts: self.scripts,
+            hooks: self.hooks,
+            translations: self.translations,
+        }
     }
 
     /// Adds scripts, given as name and source, after checking that they
@@ -1321,6 +1392,7 @@ impl ContentSet {
                         "item" => self.items.contains_key(*id) && matches!(*field, "name" | "description"),
                         "trait" => self.traits.contains_key(*id) && matches!(*field, "name" | "description"),
                         "augment" => self.augments.contains_key(*id) && matches!(*field, "name" | "description"),
+                        "resource" => self.resource(id).is_some() && *field == "name",
                         _ => false,
                     },
                     _ => false,
@@ -1345,6 +1417,33 @@ impl ContentSet {
         if r.economy.interest_per <= 0 {
             return invalid("interest_per must be positive".into());
         }
+        let resources = &r.combat.resources;
+        let check_resource = |owner: &str, id: &str| {
+            if resources.iter().any(|d| d.id == id) {
+                Ok(())
+            } else {
+                let known: Vec<String> = resources.iter().map(|d| d.id.clone()).collect();
+                invalid(format!("{owner} refers to unknown resource `{id}`{}", suggestion(id, known.iter())))
+            }
+        };
+        let check_amount = |owner: &str, amount: &Amount| {
+            amount.scalings.iter().try_for_each(|s| match &s.by {
+                ScaleBy::Resource(id) => check_resource(owner, id),
+                _ => Ok(()),
+            })
+        };
+        for (i, def) in resources.iter().enumerate() {
+            if def.id.is_empty() {
+                return invalid("a resource has an empty id".into());
+            }
+            if resources[..i].iter().any(|d| d.id == def.id) {
+                return invalid(format!("duplicate resource id `{}`", def.id));
+            }
+            let owner = format!("resource `{}`", def.id);
+            for amount in [&def.start, &def.per_attack, &def.per_kill, &def.per_second] {
+                check_amount(&owner, amount)?;
+            }
+        }
         let check_trait = |owner: &str, id: &str| {
             if self.traits.contains_key(id) {
                 Ok(())
@@ -1356,11 +1455,15 @@ impl ContentSet {
             let mut result = Ok(());
             if let Some(c) = condition {
                 c.walk(&mut |c| {
-                    if let Condition::Custom(name) = c
-                        && !self.hooks.conditions.contains_key(name)
-                        && result.is_ok()
-                    {
-                        result = invalid(format!("{owner} uses unregistered custom condition `{name}`"));
+                    if result.is_err() {
+                        return;
+                    }
+                    match c {
+                        Condition::Custom(name) if !self.hooks.conditions.contains_key(name) => {
+                            result = invalid(format!("{owner} uses unregistered custom condition `{name}`"));
+                        }
+                        Condition::ResourceAtLeast { resource, .. } => result = check_resource(owner, resource),
+                        _ => {}
                     }
                 });
             }
@@ -1369,7 +1472,11 @@ impl ContentSet {
         let check_effects = |owner: &str, effects: &[EffectSpec]| {
             for spec in effects {
                 check_condition(owner, spec.condition.as_ref())?;
+                for amount in spec.effect.amounts() {
+                    check_amount(owner, amount)?;
+                }
                 match &spec.effect {
+                    Effect::GainResource { resource, .. } => check_resource(owner, resource)?,
                     Effect::Summon { unit, .. } if !self.units.contains_key(unit) => {
                         return invalid(format!(
                             "{owner} summons unknown unit `{unit}`{}",
@@ -1403,7 +1510,21 @@ impl ContentSet {
                 check_trait(&owner, t)?;
             }
             if let Some(a) = &u.ability {
+                let owner = format!("{owner}'s ability `{}`", a.name);
                 check_effects(&owner, &a.effects)?;
+                match &a.cost {
+                    Cost::Full(resource) => check_resource(&owner, resource)?,
+                    Cost::Amount { resource, amount } => {
+                        check_resource(&owner, resource)?;
+                        if *amount <= 0 {
+                            return invalid(format!("{owner} costs {amount} {resource}; use `Cost::Free` for an ability that costs nothing"));
+                        }
+                    }
+                    Cost::Free if a.cooldown_ms == 0 => {
+                        return invalid(format!("{owner} is free and has no cooldown, so the unit would do nothing but cast"));
+                    }
+                    Cost::Free => {}
+                }
             }
             check_passives(&owner, &u.passives)?;
         }
@@ -1470,6 +1591,13 @@ impl ContentSet {
 
     pub fn rules(&self) -> &GameRules {
         &self.rules
+    }
+    /// The resources units can have, in the order fights list them.
+    pub fn resources(&self) -> &[ResourceDef] {
+        &self.rules.combat.resources
+    }
+    pub fn resource(&self, id: &str) -> Option<&ResourceDef> {
+        self.resources().iter().find(|r| r.id == id)
     }
     pub fn unit(&self, id: &str) -> Option<&UnitDef> {
         self.units.get(id)
@@ -1576,6 +1704,20 @@ impl ContentSet {
             tags: def.traits.clone(),
             targeting: def.targeting,
         })
+    }
+
+    /// What casting its ability costs a unit at a star level, before items
+    /// and traits: the resource and how much of it. `None` for a unit with
+    /// no ability or a free one.
+    pub fn ability_cost(&self, unit_id: &str, star: u8) -> Option<(&ResourceDef, i64)> {
+        let template = self.base_template(unit_id, star).ok()?;
+        let ability = template.ability.as_ref()?;
+        let resource = self.resource(ability.cost.resource()?)?;
+        let amount = match ability.cost {
+            Cost::Amount { amount, .. } => amount,
+            _ => template.stats.get(resource.max),
+        };
+        Some((resource, amount))
     }
 
     /// Turns one player's board into combat-ready units, folding in star

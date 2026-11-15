@@ -38,13 +38,17 @@ do.
 ## What happens each tick
 
 Units act one at a time, in the order they entered the fight. Each living
-unit first counts down its statuses, shields and `Every` passives. Then,
+unit first counts down its statuses, shields, cooldown and `Every`
+passives, and once a second its resources gain or lose what their rules
+say. Then,
 unless it is stunned, it:
 
 1. **Continues a cast**, if it is casting. When the cast time is up, the
    ability's effects happen and `OnCast` passives fire.
-2. **Starts a cast** if its mana is full (`MaxMana` above 0), it has an
-   ability and it isn't silenced. Mana goes back to zero.
+2. **Starts a cast** if it has an ability, can pay its
+   [cost](resources.md#costs-and-cooldowns) (by default a full bar of
+   mana), the ability is off cooldown and the unit isn't silenced. The
+   cost is taken at once.
 3. Otherwise **picks a target** if it has none: whoever taunted it, or else
    the enemy its [targeting](units.md#targeting) prefers.
 4. **Attacks** if the target is within `Range` and it isn't disarmed.
@@ -59,7 +63,8 @@ by something happening are resolved straight away, in order.
 
 A basic attack:
 
-1. gives the attacker `ManaPerAttack` mana,
+1. gives the attacker what each of its resources gains per attack
+   (`ManaPerAttack` mana),
 2. misses if the target dodges (chance `Dodge` / 1000), which gives a
    `Dodged` event and nothing else,
 3. otherwise deals `AttackDamage` physical damage, which can crit, and fires
@@ -87,7 +92,9 @@ through the same steps:
 An invulnerable target takes nothing. After the hit:
 
 - the source heals for `Lifesteal` / 1000 of the damage,
-- the target gains 3% of the damage as mana, at most 40 per hit,
+- the source and the target gain what their resources give for damage
+  dealt and taken (for mana: the target gains 3% of the damage, at most 40
+  per hit),
 - `OnCrit` fires for the source on a crit, and `OnShieldBroken` for the target
   for each shield used up,
 - `OnDamaged` fires for the target if the damage came from an attack or an

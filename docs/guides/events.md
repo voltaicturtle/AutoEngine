@@ -116,6 +116,7 @@ they appeared. `Spawned` says which unit each one is.
 | `StatusApplied` | `source`, `target`, `status`, `duration_ms` | a status took hold, for this long after tenacity |
 | `StatusExpired` | `target`, `status` | a status ran out |
 | `StacksChanged` | `unit`, `stack`, `count` | a stack changed. `count` is the new count |
+| `ResourceChanged` | `unit`, `resource`, `amount`, `max` | a unit now has `amount` of a [resource](resources.md) out of `max`. Sent when either changes, and for each resource a unit has when it enters the fight |
 | `Overtime` | | overtime began, and damage grows from now on (see [Fights](fights.md#overtime)) |
 | `Died` | `unit`, `killer` | a unit died |
 | `Ended` | `winner`, `timed_out` | the fight ended. `winner` is the team left standing, or `None` for a draw |

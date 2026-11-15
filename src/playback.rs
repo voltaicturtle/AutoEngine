@@ -37,6 +37,18 @@ pub struct UnitView {
     pub statuses: Vec<(&'static str, u32)>,
     /// Named stack counters (see `Effect::AddStacks`), without the empty ones.
     pub stacks: BTreeMap<String, u32>,
+    /// The unit's resource bars (mana and whatever else the game defines),
+    /// in the order they first appeared.
+    pub resources: Vec<ResourceView>,
+}
+
+/// One resource bar of a unit in a replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceView {
+    /// The resource's id, as in [`ResourceDef::id`](crate::resource::ResourceDef).
+    pub id: String,
+    pub amount: i64,
+    pub max: i64,
 }
 
 impl UnitView {
@@ -50,6 +62,11 @@ impl UnitView {
             }
         }
         names
+    }
+
+    /// How much of a resource the unit has, by resource id.
+    pub fn resource(&self, id: &str) -> Option<&ResourceView> {
+        self.resources.iter().find(|r| r.id == id)
     }
 
     /// Position in fractional axial coordinates `(q, r)`, easing between
@@ -91,15 +108,32 @@ pub struct Playback {
 
 impl Playback {
     pub fn new(record: &CombatRecord) -> Self {
+        let mut playback = Playback::from_events(record.events.clone(), record.tick_ms);
+        playback.duration_ms = record.duration_ms;
+        playback.winner = record.winner;
+        playback
+    }
+
+    /// Replays any fight from its events, such as
+    /// [`Combat::events`](crate::combat::Combat::events) of one run outside
+    /// a game. `tick_ms` is the fight's
+    /// [`CombatConfig::tick_ms`](crate::combat::CombatConfig).
+    pub fn from_events(events: Vec<Event>, tick_ms: u32) -> Self {
+        let tick_ms = tick_ms.max(1);
+        let end = events.iter().rev().find_map(|e| match e.kind {
+            EventKind::Ended { winner, .. } => Some((e.tick * tick_ms, winner)),
+            _ => None,
+        });
+        let last = events.last().map_or(0, |e| e.tick * tick_ms);
         let mut playback = Playback {
-            events: record.events.clone(),
-            tick_ms: record.tick_ms.max(1),
-            duration_ms: record.duration_ms,
+            events,
+            tick_ms,
+            duration_ms: end.map_or(last, |(at, _)| at),
             cursor: 0,
             time_ms: 0,
             units: BTreeMap::new(),
             flashes: Vec::new(),
-            winner: record.winner,
+            winner: end.and_then(|(_, winner)| winner),
             ended: false,
             overtime_at_ms: None,
         };
@@ -141,6 +175,7 @@ impl Playback {
                         stunned_until_ms: 0,
                         statuses: Vec::new(),
                         stacks: BTreeMap::new(),
+                        resources: Vec::new(),
                     },
                 );
             }
@@ -222,6 +257,15 @@ impl Playback {
                     } else {
                         u.stacks.insert(stack, count);
                     }
+                }
+            }
+            EventKind::ResourceChanged { unit, resource, amount, max } => {
+                if let Some(u) = self.units.get_mut(&unit) {
+                    match u.resources.iter_mut().find(|r| r.id == resource) {
+                        Some(bar) => (bar.amount, bar.max) = (amount, max),
+                        None => u.resources.push(ResourceView { id: resource, amount, max }),
+                    }
+                    u.resources.retain(|r| r.max > 0);
                 }
             }
             EventKind::Ended { .. } => self.ended = true,

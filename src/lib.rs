@@ -77,6 +77,7 @@ pub mod net;
 pub mod playback;
 pub mod protocol;
 pub mod replay;
+pub mod resource;
 pub mod rng;
 pub mod round;
 pub mod sample;
@@ -111,6 +112,8 @@ mod guides {
     struct Units;
     #[doc = include_str!("../docs/guides/effects.md")]
     struct Effects;
+    #[doc = include_str!("../docs/guides/resources.md")]
+    struct Resources;
     #[doc = include_str!("../docs/guides/traits.md")]
     struct Traits;
     #[doc = include_str!("../docs/guides/items.md")]

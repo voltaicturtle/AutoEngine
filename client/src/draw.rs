@@ -268,6 +268,13 @@ pub fn draw_pips(c: Vec2, star: u8, items: usize) {
 /// A health bar centred on `c`; `health` and `shield` are fractions of
 /// maximum health. The shield is drawn after the health, or over its end
 /// when there is no room left.
+/// A thin bar for one of a unit's resources, `row` bars under its health.
+pub fn draw_resource_bar(c: Vec2, w: f32, row: usize, share: f32, color: Color) {
+    let (x, y) = (c.x - w / 2.0, c.y + 5.0 + row as f32 * 5.0);
+    draw_rectangle(x - 1.0, y, w + 2.0, 5.0, ui().background);
+    draw_rectangle(x, y, w * share.clamp(0.0, 1.0), 4.0, color);
+}
+
 pub fn draw_health_bar(c: Vec2, w: f32, health: f32, shield: f32, friendly: bool) {
     let (x, y) = (c.x - w / 2.0, c.y - 3.0);
     draw_rectangle(x - 1.0, y - 1.0, w + 2.0, 8.0, ui().background);

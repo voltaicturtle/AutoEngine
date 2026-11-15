@@ -41,6 +41,26 @@ pub fn lint(content: &ContentSet, assets: Option<&Path>) -> Vec<Warning> {
                 warn(subject.clone(), "is sold in the shop but has no traits".into());
             }
         }
+        // An ability the unit can never pay for is dead weight.
+        let cost = unit.ability.as_ref().and_then(|a| Some((a, content.resource(a.cost.resource()?)?)));
+        if let Some((ability, resource)) = cost
+            && let Ok(template) = content.base_template(&unit.id, 1)
+        {
+            let capacity = template.stats.get(resource.max);
+            let short = match ability.cost {
+                crate::effect::Cost::Amount { amount, .. } => capacity < amount,
+                _ => capacity <= 0,
+            };
+            if short {
+                warn(
+                    subject.clone(),
+                    format!(
+                        "can never cast {}: it has {capacity} {} (the {} stat) at one star",
+                        ability.name, resource.id, resource.max
+                    ),
+                );
+            }
+        }
         match (&unit.model, assets) {
             (Some(model), Some(dir)) if !dir.join(&model.file).is_file() => {
                 warn(subject.clone(), format!("model file {} is missing; clients will draw a stand-in", model.file));

@@ -303,7 +303,14 @@ pub(crate) fn draw_replay(app: &mut App, layout: &Layout) {
     for u in show.playback.units().filter(|u| u.alive) {
         let Some((head, _, size)) = head_of(&show.playback, u.id) else { continue };
         let full = u.max_health.max(1) as f32;
-        draw_health_bar(head, (size * 1.1).clamp(28.0, 70.0), u.health as f32 / full, u.shield as f32 / full, u.team.0 == my_team);
+        let width = (size * 1.1).clamp(28.0, 70.0);
+        draw_health_bar(head, width, u.health as f32 / full, u.shield as f32 / full, u.team.0 == my_team);
+        for (row, bar) in u.resources.iter().enumerate() {
+            // The game's color for the resource, or one of a few stand-ins.
+            let chosen = app.net.state.content.as_ref().and_then(|c| c.resource(&bar.id)?.color);
+            let [r, g, b] = chosen.unwrap_or([[70, 130, 230], [230, 120, 60], [240, 210, 80], [150, 220, 140]][row % 4]);
+            draw_resource_bar(head, width, row, bar.amount as f32 / bar.max.max(1) as f32, Color::from_rgba(r, g, b, 255));
+        }
         let statuses = u.statuses_at(now);
         if !statuses.is_empty() {
             text_centered(&statuses.join(" "), head.x, head.y - 8.0, 14.0, ui().gold);
