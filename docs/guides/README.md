@@ -10,6 +10,7 @@ changes.
 | [Units](units.md) | `UnitDef`: cost, traits, stats, abilities, passives, targeting, summons, models, star levels |
 | [Effects](effects.md) | what abilities, passives, traits and items can do: effects, amounts, selectors, triggers, conditions, statuses, stacks, Rust hooks |
 | [Resources](resources.md) | mana and resources of your own (rage, energy and so on), ability costs and cooldowns, custom stats |
+| [Damage types](damage.md) | physical, magic and true damage, and damage types of your own with their own resistances |
 | [Traits](traits.md) | `TraitDef`: breakpoints and bonuses |
 | [Items](items.md) | `ItemDef`: stats, passives, recipes, granted traits, single-use items |
 | [Augments](augments.md) | `AugmentDef`: lasting bonuses, gold up front, rewards every round, lobby modifiers |

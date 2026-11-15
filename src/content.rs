@@ -40,8 +40,13 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::combat::{Combat, ConditionContext, CustomConditionFn, CustomEffectFn, EffectContext, Team};
-use crate::effect::{Ability, Amount, Condition, Cost, Effect, EffectSpec, Passive, ScaleBy, StatusKind, UnitTemplate};
+use crate::combat::{
+    Combat, ConditionContext, CustomConditionFn, CustomEffectFn, CustomSelectorFn, EffectContext, SelectContext, Team, UnitId,
+};
+use crate::damage::DamageType;
+use crate::effect::{
+    Ability, Amount, Condition, Cost, DamageKind, Effect, EffectSpec, Passive, ScaleBy, Selector, StatusKind, UnitTemplate,
+};
 use crate::resource::ResourceDef;
 use crate::hex::{Hex, HexBoard};
 use crate::stats::{Stat, StatBlock, StatMod};
@@ -79,6 +84,13 @@ pub struct UnitDef {
     /// Which enemy the unit goes after.
     #[serde(default)]
     pub targeting: crate::effect::Targeting,
+    /// The type of damage its basic attacks deal.
+    #[serde(default = "physical")]
+    pub attack_kind: DamageKind,
+}
+
+fn physical() -> DamageKind {
+    DamageKind::Physical
 }
 
 /// A 3D model for a unit: display-only data that travels with the content
@@ -115,7 +127,14 @@ impl UnitDef {
             in_shop: true,
             model: None,
             targeting: crate::effect::Targeting::Nearest,
+            attack_kind: DamageKind::Physical,
         }
+    }
+
+    /// The type of damage its basic attacks deal, instead of physical.
+    pub fn attack_kind(mut self, kind: DamageKind) -> Self {
+        self.attack_kind = kind;
+        self
     }
 
     /// Which enemy the unit goes after, such as
@@ -922,6 +941,7 @@ fn index<T>(
 struct Hooks {
     effects: BTreeMap<String, Arc<CustomEffectFn>>,
     conditions: BTreeMap<String, Arc<CustomConditionFn>>,
+    selectors: BTreeMap<String, Arc<CustomSelectorFn>>,
 }
 
 impl std::fmt::Debug for Hooks {
@@ -929,6 +949,7 @@ impl std::fmt::Debug for Hooks {
         f.debug_struct("Hooks")
             .field("effects", &self.effects.keys().collect::<Vec<_>>())
             .field("conditions", &self.conditions.keys().collect::<Vec<_>>())
+            .field("selectors", &self.selectors.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -936,7 +957,9 @@ impl std::fmt::Debug for Hooks {
 /// Hooks are closures, so two sets are equal when they register the same names.
 impl PartialEq for Hooks {
     fn eq(&self, other: &Self) -> bool {
-        self.effects.keys().eq(other.effects.keys()) && self.conditions.keys().eq(other.conditions.keys())
+        self.effects.keys().eq(other.effects.keys())
+            && self.conditions.keys().eq(other.conditions.keys())
+            && self.selectors.keys().eq(other.selectors.keys())
     }
 }
 
@@ -1029,6 +1052,36 @@ impl GameBuilder {
         match resources.iter_mut().find(|r| r.id == def.id) {
             Some(existing) => *existing = def,
             None => resources.push(def),
+        }
+        self
+    }
+
+    /// Describes a kind of damage (see the [`damage`](crate::damage)
+    /// module): one of the game's own, or a built-in kind with other rules.
+    ///
+    /// ```
+    /// use autoengine::content::{ContentSet, UnitDef};
+    /// use autoengine::damage::DamageType;
+    /// use autoengine::effect::{Ability, DamageKind, Effect, Selector};
+    /// use autoengine::stats::Stat;
+    ///
+    /// const FIRE: DamageKind = DamageKind::custom("fire");
+    /// const FIRE_RESIST: Stat = Stat::custom("fire_resist");
+    ///
+    /// let game = ContentSet::builder()
+    ///     .damage_type(DamageType::new(FIRE, "Fire").resisted_by(FIRE_RESIST))
+    ///     .unit(UnitDef::new("pyre", "Pyre").attack_kind(FIRE).stat(Stat::MaxMana, 60).ability(
+    ///         Ability::new("Flare").effect(Effect::damage(150, FIRE).to(Selector::CurrentTarget)),
+    ///     ))
+    ///     .build()
+    ///     .unwrap();
+    /// assert_eq!(game.damage_types().len(), 4);
+    /// ```
+    pub fn damage_type(mut self, def: DamageType) -> Self {
+        let types = &mut self.rules.combat.damage_types;
+        match types.iter_mut().find(|t| t.kind == def.kind) {
+            Some(existing) => *existing = def,
+            None => types.push(def),
         }
         self
     }
@@ -1129,6 +1182,39 @@ impl GameBuilder {
         hook: impl Fn(&mut EffectContext<'_>) + Send + Sync + 'static,
     ) -> Self {
         self.hooks.effects.insert(name.into(), Arc::new(hook));
+        self
+    }
+
+    /// Registers a Rust hook that picks the units for
+    /// `Selector::Custom(name)`, for targets the built-in selectors cannot
+    /// describe. It must give the same units in the same order every time
+    /// for the same fight.
+    ///
+    /// ```
+    /// use autoengine::content::{ContentSet, UnitDef};
+    /// use autoengine::effect::{Ability, Effect, Selector};
+    ///
+    /// // Every enemy standing in the same column as the caster.
+    /// let game = ContentSet::builder()
+    ///     .custom_selector("my_column", |ctx| {
+    ///         let me = ctx.combat().unit(ctx.source());
+    ///         let column = me.pos().to_offset().0;
+    ///         let enemies = ctx.combat().units().iter().filter(|u| u.is_alive() && u.team() != me.team());
+    ///         enemies.filter(|u| u.pos().to_offset().0 == column).map(|u| u.id()).collect()
+    ///     })
+    ///     .unit(UnitDef::new("lancer", "Lancer").ability(
+    ///         Ability::new("Skewer").effect(Effect::physical(90).to(Selector::Custom("my_column".into()))),
+    ///     ))
+    ///     .build()
+    ///     .unwrap();
+    /// # let _ = game;
+    /// ```
+    pub fn custom_selector(
+        mut self,
+        name: impl Into<String>,
+        hook: impl Fn(&SelectContext<'_>) -> Vec<UnitId> + Send + Sync + 'static,
+    ) -> Self {
+        self.hooks.selectors.insert(name.into(), Arc::new(hook));
         self
     }
 
@@ -1426,6 +1512,24 @@ impl ContentSet {
                 invalid(format!("{owner} refers to unknown resource `{id}`{}", suggestion(id, known.iter())))
             }
         };
+        let damage_types = &r.combat.damage_types;
+        let check_damage_kind = |owner: &str, kind: DamageKind| {
+            if damage_types.iter().any(|t| t.kind == kind) {
+                Ok(())
+            } else {
+                let known: Vec<String> = damage_types.iter().map(|t| t.kind.id().to_string()).collect();
+                invalid(format!(
+                    "{owner} deals `{}` damage, which the game does not describe (see `damage_type`){}",
+                    kind.id(),
+                    suggestion(kind.id(), known.iter())
+                ))
+            }
+        };
+        for (i, def) in damage_types.iter().enumerate() {
+            if damage_types[..i].iter().any(|t| t.kind == def.kind) {
+                return invalid(format!("damage type `{}` is described twice", def.kind.id()));
+            }
+        }
         let check_amount = |owner: &str, amount: &Amount| {
             amount.scalings.iter().try_for_each(|s| match &s.by {
                 ScaleBy::Resource(id) => check_resource(owner, id),
@@ -1475,6 +1579,16 @@ impl ContentSet {
                 for amount in spec.effect.amounts() {
                     check_amount(owner, amount)?;
                 }
+                if let Selector::Custom(name) = &spec.target
+                    && !self.hooks.selectors.contains_key(name)
+                {
+                    return invalid(format!("{owner} uses unregistered custom selector `{name}`"));
+                }
+                if let Effect::Damage { kind, .. }
+                | Effect::ApplyStatus { status: StatusKind::DamageOverTime { kind, .. }, .. } = &spec.effect
+                {
+                    check_damage_kind(owner, *kind)?;
+                }
                 match &spec.effect {
                     Effect::GainResource { resource, .. } => check_resource(owner, resource)?,
                     Effect::Summon { unit, .. } if !self.units.contains_key(unit) => {
@@ -1509,6 +1623,7 @@ impl ContentSet {
             for t in &u.traits {
                 check_trait(&owner, t)?;
             }
+            check_damage_kind(&owner, u.attack_kind)?;
             if let Some(a) = &u.ability {
                 let owner = format!("{owner}'s ability `{}`", a.name);
                 check_effects(&owner, &a.effects)?;
@@ -1599,6 +1714,13 @@ impl ContentSet {
     pub fn resource(&self, id: &str) -> Option<&ResourceDef> {
         self.resources().iter().find(|r| r.id == id)
     }
+    /// The rules for every kind of damage in the game.
+    pub fn damage_types(&self) -> &[DamageType] {
+        &self.rules.combat.damage_types
+    }
+    pub fn damage_type(&self, kind: DamageKind) -> Option<&DamageType> {
+        self.damage_types().iter().find(|t| t.kind == kind)
+    }
     pub fn unit(&self, id: &str) -> Option<&UnitDef> {
         self.units.get(id)
     }
@@ -1638,6 +1760,48 @@ impl ContentSet {
         self.items.values().find(|i| {
             i.recipe.as_ref().is_some_and(|(x, y)| (x == a && y == b) || (x == b && y == a))
         })
+    }
+
+    /// Every passive in the content, each with what carries it (such as
+    /// `unit ashen_hound` or `trait grove`), for tools that look across
+    /// everything.
+    pub fn passives(&self) -> Vec<(String, &Passive)> {
+        fn add<'a>(out: &mut Vec<(String, &'a Passive)>, owner: String, passives: &'a [Passive]) {
+            out.extend(passives.iter().map(|p| (owner.clone(), p)));
+        }
+        let mut out = Vec::new();
+        for u in self.units.values() {
+            add(&mut out, format!("unit {}", u.id), &u.passives);
+        }
+        for t in self.traits.values() {
+            for bonus in t.breakpoints.iter().flat_map(|b| &b.bonuses) {
+                add(&mut out, format!("trait {}", t.id), &bonus.passives);
+            }
+        }
+        for i in self.items.values() {
+            add(&mut out, format!("item {}", i.id), &i.passives);
+        }
+        for a in self.augments.values() {
+            for bonus in &a.bonuses {
+                add(&mut out, format!("augment {}", a.id), &bonus.passives);
+            }
+        }
+        out
+    }
+
+    /// Every effect in the content, from abilities and passives alike, each
+    /// with what carries it.
+    pub fn effects(&self) -> Vec<(String, &EffectSpec)> {
+        let mut out = Vec::new();
+        for u in self.units.values() {
+            if let Some(a) = &u.ability {
+                out.extend(a.effects.iter().map(|e| (format!("unit {}", u.id), e)));
+            }
+        }
+        for (owner, passive) in self.passives() {
+            out.extend(passive.effects.iter().map(|e| (owner.clone(), e)));
+        }
+        out
     }
 
     // ----- building teams -------------------------------------------------
@@ -1703,6 +1867,7 @@ impl ContentSet {
             passives: def.passives.clone(),
             tags: def.traits.clone(),
             targeting: def.targeting,
+            attack_kind: def.attack_kind,
         })
     }
 
@@ -1798,6 +1963,10 @@ impl ContentSet {
         for (name, predicate) in &self.hooks.conditions {
             let predicate = predicate.clone();
             combat.register_custom_condition(name.clone(), move |ctx| predicate(ctx));
+        }
+        for (name, hook) in &self.hooks.selectors {
+            let hook = hook.clone();
+            combat.register_custom_selector(name.clone(), move |ctx| hook(ctx));
         }
         for id in self.units.keys() {
             combat.register_template(id.clone(), self.base_template(id, 1)?);

@@ -57,6 +57,8 @@ the condition for each unit it would hit.
 | `.capped_at(max)` | added to `add_stacks`, caps the counter |
 | `.per_stack(mods)` | added to `add_stacks`, gives stats for each stack gained |
 | `Effect::clear_stacks(name)` | sets the counter to zero and removes the stats its stacks gave |
+| `Effect::mark(name, ms)`, `Effect::harmful_mark(name, ms)` | puts a named mark on the unit for conditions to find (see [Statuses](#statuses)) |
+| `Effect::signal(name)` | fires the unit's passives that wait for this [signal](#signals) |
 | `Effect::custom(name)` | runs a Rust hook (see [Rust hooks](#rust-hooks)) |
 | `Effect::custom_with(name, [args])` | runs a Rust hook with numbers passed to it |
 
@@ -131,12 +133,17 @@ so fights stay repeatable.
 | `LowestHealthAllies(n)` | the `n` allies with the least health |
 | `HighestStatEnemies { stat, n }` | the `n` enemies with the most of a stat |
 | `HighestStatAllies { stat, n }` | the `n` allies with the most of a stat |
+| `LowestStatEnemies { stat, n }` | the `n` enemies with the least of a stat |
+| `LowestStatAllies { stat, n }` | the `n` allies with the least of a stat |
 | `RandomEnemies(n)` | up to `n` enemies picked at random (from the fight's seed) |
+| `RandomAllies(n)` | up to `n` allies picked at random, the source included |
 | `AllEnemies` | every living enemy |
 | `AllAllies` | every living ally |
+| `OtherAllies` | every living ally except the source |
 | `EnemiesWithin { anchor, radius }` | enemies within `radius` hexes of the anchor |
 | `AlliesWithin { anchor, radius }` | allies within `radius` hexes of the anchor |
 | `AlliesWithTag(tag)` | allies carrying a tag, such as a trait id |
+| `Custom(name)` | whatever a Rust hook returns (see [Rust hooks](#rust-hooks)) |
 
 `anchor` is `Anchor::Source` or `Anchor::CurrentTarget`. Radius 1 means the
 anchor and the six hexes next to it.
@@ -160,6 +167,11 @@ condition sees as `Who::Target`.
 | `OnKill` | the owner kills a unit | the victim |
 | `OnDeath` | the owner dies | the killer |
 | `OnAllyDeath` | another unit on the owner's team dies | the fallen ally |
+| `OnEnemyDeath` | an enemy dies, whoever killed it | the one that died |
+| `OnDodge` | the owner dodges a basic attack | the attacker |
+| `OnHealed` | the owner is healed by an ability, but not by lifesteal or a passive | the healer |
+| `OnAllyCast` | another unit on the owner's team finishes casting | the caster |
+| `Trigger::signal(name)` | an `Effect::signal(name)` reaches the owner (see [Signals](#signals)) | the unit that sent it |
 | `OnShieldBroken` | one of the owner's shields is used up by damage | the unit that broke it |
 | `Every { interval_ms }` | every `interval_ms` while the owner lives, first after one interval | none |
 | `HealthBelow { permille }` | the owner's health drops to or below `permille` of its maximum. Fires once per fight unless `max_procs` says otherwise | the attacker |
@@ -167,6 +179,22 @@ condition sees as `Who::Target`.
 Dead units only resolve their `OnDeath` passives. A chain of passives
 triggering each other stops after 10,000 in one go, so content that triggers
 itself forever can't hang a fight.
+
+### Signals
+
+A signal is an occasion the content makes up. `Effect::signal(name)` sends
+it to the selected units, and each of them fires its passives that wait for
+`Trigger::signal(name)`. This lets one piece of content set off another
+without either knowing what the other does:
+
+```rust
+use autoengine::effect::{Ability, Effect, Passive, Selector, Trigger};
+
+// The ability calls "rally". Any unit, item or trait can answer it.
+let rally = Ability::new("Rally").effect(Effect::signal("rally").to(Selector::OtherAllies));
+let answer = Passive::new("Answer the Call", Trigger::signal("rally")).effect(Effect::shield(80).to(Selector::Source));
+assert_eq!(rally.effects.len() + answer.effects.len(), 2);
+```
 
 ## Conditions
 
@@ -186,6 +214,7 @@ the target. A condition about a target that doesn't exist is false.
 | `HasTag { who, tag }` | the unit carries a tag: its traits, including traits its items grant |
 | `StacksAtLeast { who, stack, count }` | the unit has at least `count` of a stack |
 | `AlliesWithTagAtLeast { tag, count }` | at least `count` living units on the source's team carry a tag |
+| `HasStatus { who, status }` | the unit has a status with this name: `"stunned"`, `"rooted"` and so on, or the name of a [mark](#statuses) |
 | `ResourceAtLeast { who, resource, permille }` | the unit's bar of a [resource](resources.md) is at least `permille` full |
 | `Condition::chance(permille)` | a random roll from the fight's seed |
 | `Condition::custom(name)` | a Rust predicate says so (see [Rust hooks](#rust-hooks)) |
@@ -211,6 +240,26 @@ stun, silence, disarm, root, taunt, wound, damage over time, and stat
 changes that lower any stat. A lower `MaxMana` helps the unit, so it
 doesn't count. `cleanse` removes debuffs, `HasDebuff` checks for them and
 `unstoppable` blocks new ones. Invulnerable and unstoppable are not debuffs.
+
+A **mark** is a status that does nothing by itself. It is there for
+conditions to find with `Condition::HasStatus`, and clients show its name
+over the unit like any other status. `Effect::mark(name, ms)` puts one on,
+and `Effect::harmful_mark(name, ms)` puts on one that counts as a debuff.
+
+```rust
+use autoengine::effect::{Condition, Effect, Passive, Selector, Trigger, Who};
+
+// Attacks deal 40 bonus damage to targets something has marked as hunted.
+let finish = Passive::new("Finish", Trigger::OnAttack)
+    .when(Condition::HasStatus { who: Who::Target, status: "hunted".into() })
+    .effect(Effect::true_damage(40).to(Selector::EventOther));
+let mark = Effect::harmful_mark("hunted", 4000).to(Selector::CurrentTarget);
+assert!(finish.condition.is_some() && mark.condition.is_none());
+```
+
+The built-in statuses are named `stunned`, `silenced`, `disarmed`, `rooted`,
+`taunted`, `wounded`, `afflicted` (damage over time), `stat-modified`,
+`invulnerable` and `unstoppable`.
 
 ## Stacks
 
@@ -292,6 +341,31 @@ A custom effect runs once per selected unit and gets an `EffectContext`:
 
 A custom condition gets a `ConditionContext` with `source()`, `target()`
 (an `Option`) and `combat()`.
+
+A custom selector is registered with `.custom_selector(name, |ctx| ...)` and
+used as `Selector::Custom(name.into())`. It gets a `SelectContext` with
+`source()`, `other()`, `combat()` and `rng()` (dice that don't move the
+fight's own), and returns the ids of the units it picks. It must return
+the same units in the same order every time, so sort by something stable
+such as distance and then id. Dead units it returns are skipped.
+
+```rust
+use autoengine::content::ContentSet;
+use autoengine::effect::{Effect, Selector};
+
+let content = ContentSet::builder()
+    // Every living enemy in the same column as the source.
+    .custom_selector("my_column", |ctx| {
+        let me = ctx.combat().unit(ctx.source());
+        let column = me.pos().to_offset().0;
+        let enemies = ctx.combat().units().iter().filter(|u| u.is_alive() && u.team() != me.team());
+        enemies.filter(|u| u.pos().to_offset().0 == column).map(|u| u.id()).collect()
+    })
+    .build()
+    .unwrap();
+let skewer = Effect::physical(90).to(Selector::Custom("my_column".into()));
+# let _ = (content, skewer);
+```
 
 On a unit in the fight (`ctx.combat().unit(id)`) you can read `health()`,
 `mana()`, `resource(id)`, `pools()`, `cooldown_ms()`, `shield()`,

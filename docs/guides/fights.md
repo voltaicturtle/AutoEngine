@@ -67,8 +67,9 @@ A basic attack:
    (`ManaPerAttack` mana),
 2. misses if the target dodges (chance `Dodge` / 1000), which gives a
    `Dodged` event and nothing else,
-3. otherwise deals `AttackDamage` physical damage, which can crit, and fires
-   the attacker's `OnAttack` passives.
+3. otherwise deals `AttackDamage` damage, which can crit, and fires the
+   attacker's `OnAttack` passives. The damage is physical unless the unit
+   has another `attack_kind`.
 
 ## Damage
 
@@ -78,7 +79,8 @@ through the same steps:
 1. **Crit:** if the damage can crit (attacks, and damage effects with
    `.with_crit()`), it crits with chance `CritChance` / 1000 and is then
    multiplied by `CritDamage` / 1000.
-2. **Amplification:** × (1000 + the source's `DamageAmp`) / 1000.
+2. **Amplification:** × (1000 + the source's `DamageAmp`) / 1000. A
+   [damage type](damage.md) can name a second stat that adds to this.
 3. **Overtime:** × (1000 + `overtime_damage_per_second` × seconds into
    overtime) / 1000.
 4. **Resistance:** × 100 / (100 + armor) for physical damage, or magic
@@ -88,6 +90,10 @@ through the same steps:
    `DamageReduction` capped at 900. True damage skips this step.
 6. **Shields** soak what's left, oldest shield first. Then health takes
    the rest.
+
+Which stat resists a kind of damage, and whether reduction and shields
+apply to it, are that kind's rules. A game can change them and add kinds
+of its own: see [Damage types](damage.md).
 
 An invulnerable target takes nothing. After the hit:
 

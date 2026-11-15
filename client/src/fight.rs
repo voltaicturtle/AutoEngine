@@ -199,6 +199,15 @@ pub(crate) fn draw_replay(app: &mut App, layout: &Layout) {
                         DamageKind::Physical => effects.hit_physical,
                         DamageKind::Magic => effects.hit_magic,
                         DamageKind::True => effects.hit_true,
+                        // A game's own damage type: the true-damage burst in its color.
+                        DamageKind::Custom(_) => {
+                            let color = app.net.state.content.as_ref().and_then(|c| c.damage_type(*kind)?.color);
+                            let mut burst = effects.hit_true;
+                            if let Some([r, g, b]) = color {
+                                burst.color = Color::from_rgba(r, g, b, 255);
+                            }
+                            burst
+                        }
                     };
                     if *crit {
                         burst.count = burst.count * effects.crit_percent as usize / 100;
@@ -329,11 +338,10 @@ pub(crate) fn draw_replay(app: &mut App, layout: &Layout) {
             Flash::Damage { target, amount, absorbed, kind, crit } => {
                 if let Some((p, _, _)) = head_of(&show.playback, *target) {
                     let alpha = (1.0 - age / 900.0).max(0.0);
-                    let mut color = match kind {
-                        autoengine::effect::DamageKind::Physical => Color::new(1.0, 0.55, 0.30, alpha),
-                        autoengine::effect::DamageKind::Magic => Color::new(0.55, 0.65, 1.0, alpha),
-                        autoengine::effect::DamageKind::True => Color::new(1.0, 1.0, 1.0, alpha),
-                    };
+                    // The game's color for this kind of damage, or white.
+                    let rgb = app.net.state.content.as_ref().and_then(|c| c.damage_type(*kind)?.color);
+                    let [r, g, b] = rgb.unwrap_or([255, 255, 255]);
+                    let mut color = Color::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, alpha);
                     let shown = amount + absorbed;
                     if *amount == 0 {
                         color = Color::new(0.8, 0.8, 0.8, alpha);

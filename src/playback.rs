@@ -34,7 +34,7 @@ pub struct UnitView {
     pub stunned_until_ms: u32,
     /// Statuses on the unit by [`StatusKind::name`](crate::effect::StatusKind::name),
     /// each with when it ends; see [`UnitView::statuses_at`].
-    pub statuses: Vec<(&'static str, u32)>,
+    pub statuses: Vec<(String, u32)>,
     /// Named stack counters (see `Effect::AddStacks`), without the empty ones.
     pub stacks: BTreeMap<String, u32>,
     /// The unit's resource bars (mana and whatever else the game defines),
@@ -54,11 +54,11 @@ pub struct ResourceView {
 impl UnitView {
     /// Names of the statuses the unit has at `time_ms`, each once, in the
     /// order they were applied.
-    pub fn statuses_at(&self, time_ms: u32) -> Vec<&'static str> {
-        let mut names = Vec::new();
+    pub fn statuses_at(&self, time_ms: u32) -> Vec<&str> {
+        let mut names: Vec<&str> = Vec::new();
         for (name, until) in &self.statuses {
-            if *until > time_ms && !names.contains(name) {
-                names.push(*name);
+            if *until > time_ms && !names.contains(&name.as_str()) {
+                names.push(name);
             }
         }
         names
@@ -224,7 +224,7 @@ impl Playback {
                     if status == crate::effect::StatusKind::Stun {
                         u.stunned_until_ms = u.stunned_until_ms.max(at + duration_ms);
                     }
-                    u.statuses.push((status.name(), at + duration_ms));
+                    u.statuses.push((status.name().to_string(), at + duration_ms));
                 }
             }
             EventKind::StatusExpired { target, status } => {
@@ -232,12 +232,12 @@ impl Playback {
                 // end it early).
                 if let Some(u) = self.units.get_mut(&target) {
                     let name = status.name();
-                    let soonest = u.statuses.iter().enumerate().filter(|(_, (n, _))| *n == name).min_by_key(|(_, (_, until))| *until);
+                    let soonest = u.statuses.iter().enumerate().filter(|(_, (n, _))| n == name).min_by_key(|(_, (_, until))| *until);
                     if let Some((i, _)) = soonest {
                         u.statuses.remove(i);
                     }
                     if status == crate::effect::StatusKind::Stun {
-                        u.stunned_until_ms = u.statuses.iter().filter(|(n, _)| *n == name).map(|(_, until)| *until).max().unwrap_or(at).min(u.stunned_until_ms);
+                        u.stunned_until_ms = u.statuses.iter().filter(|(n, _)| n == name).map(|(_, until)| *until).max().unwrap_or(at).min(u.stunned_until_ms);
                     }
                 }
             }

@@ -128,6 +128,7 @@ and clients show how many copies are left on each card.
 | `tick_ms` | 50 | length of one simulation step |
 | `max_duration_ms` | 60000 | a fight still going after this long is a draw |
 | `resources` | mana | what units build up and spend to cast. Set with the builder's `.resource(...)`; see [Resources](resources.md) |
+| `damage_types` | physical, magic, true | how each kind of damage is mitigated. Set with the builder's `.damage_type(...)`; see [Damage types](damage.md) |
 | `resist_constant` | 100 | damage after armor or magic resist is `damage × k / (k + resist)` |
 | `max_damage_reduction` | 900 | cap on the `DamageReduction` stat |
 | `overtime_after_ms` | 30000 | from this point, all damage grows every second. 0 turns overtime off |

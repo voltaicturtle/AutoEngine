@@ -67,12 +67,14 @@ pub mod bot;
 pub mod client;
 pub mod combat;
 pub mod content;
+pub mod damage;
 pub mod effect;
 pub mod game;
 pub mod hex;
 pub mod hub;
 pub mod ladder;
 pub mod matchlog;
+pub mod name;
 pub mod net;
 pub mod playback;
 pub mod protocol;
@@ -114,6 +116,8 @@ mod guides {
     struct Effects;
     #[doc = include_str!("../docs/guides/resources.md")]
     struct Resources;
+    #[doc = include_str!("../docs/guides/damage.md")]
+    struct Damage;
     #[doc = include_str!("../docs/guides/traits.md")]
     struct Traits;
     #[doc = include_str!("../docs/guides/items.md")]

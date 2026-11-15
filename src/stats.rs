@@ -11,10 +11,9 @@
 //! * `AbilityPower`: percent multiplier on power-scaled amounts (`100` = 1x).
 //! * Everything else is a plain amount.
 
-use std::collections::BTreeSet;
-use std::sync::Mutex;
-
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::name::{intern, same};
 
 /// A numeric property of a unit.
 ///
@@ -90,26 +89,7 @@ const NAMES: [&str; STAT_COUNT] = [
 ];
 
 /// Longest name a custom stat may have, in bytes.
-pub const MAX_STAT_NAME: usize = 48;
-
-/// Most custom stat names one process will learn from data it reads (saved
-/// games, messages). Names written in code do not count.
-const MAX_LEARNED_NAMES: usize = 1024;
-
-const fn same(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i < a.len() {
-        if a[i] != b[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
+pub const MAX_STAT_NAME: usize = crate::name::MAX_NAME;
 
 const fn built_in(name: &str) -> Option<usize> {
     let mut i = 0;
@@ -165,23 +145,7 @@ impl Stat {
         if let Some(i) = built_in(name) {
             return Some(Stat::ALL[i]);
         }
-        if name.is_empty() || name.len() > MAX_STAT_NAME {
-            return None;
-        }
-        // Custom stats hold a `&'static str` so that `Stat` stays `Copy`.
-        // Names that arrive as data are kept for the life of the process,
-        // up to a limit so that hostile input cannot grow it forever.
-        static LEARNED: Mutex<BTreeSet<&'static str>> = Mutex::new(BTreeSet::new());
-        let mut learned = LEARNED.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(known) = learned.get(name) {
-            return Some(Stat::Custom(known));
-        }
-        if learned.len() >= MAX_LEARNED_NAMES {
-            return None;
-        }
-        let kept: &'static str = Box::leak(name.to_string().into_boxed_str());
-        learned.insert(kept);
-        Some(Stat::Custom(kept))
+        intern(name).map(Stat::Custom)
     }
 
     /// The stat's name: `"Armor"`, or the name a custom stat was given.

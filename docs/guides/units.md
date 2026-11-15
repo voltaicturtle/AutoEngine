@@ -44,6 +44,7 @@ assert_eq!(duelist.cost, 3);
 | `.ability(Ability)` | the ability it casts when it can pay for it: by default, when its mana is full |
 | `.passive(Passive)` | an effect that fires on a trigger. Can be called more than once |
 | `.targeting(Targeting)` | which enemy it goes after (see below) |
+| `.attack_kind(DamageKind)` | the [type of damage](damage.md) its basic attacks deal, instead of physical |
 | `.summon_only()` | keeps it out of shops and the pool, for summons and neutral monsters |
 | `.model(file, scale_percent)` | the 3D model clients draw, relative to the assets folder, and its height as a percentage of a standard unit. The engine itself never reads it |
 
@@ -160,6 +161,8 @@ When a unit has no target, or its target dies, it picks a new one:
 | `LowestHealth` | the enemy with the least health left |
 | `HighestDamage` | the enemy with the most attack damage |
 | `LowestArmor` | the enemy with the least armor |
+| `HighestStat(stat)` | the enemy with the most of any stat, your own stats included |
+| `LowestStat(stat)` | the enemy with the least of any stat |
 
 Ties go to the closest enemy. A taunted unit attacks whoever taunted it,
 whatever its targeting says.

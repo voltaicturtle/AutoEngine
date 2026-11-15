@@ -1,8 +1,11 @@
 //! The content checker behind `autoengine check`.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::content::{ContentSet, RoundKindDef};
+use crate::effect::{Condition, Effect, StatusKind, Trigger};
+use crate::name::Name;
 
 /// Something in the content that loads but is probably a mistake.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,6 +89,63 @@ pub fn lint(content: &ContentSet, assets: Option<&Path>) -> Vec<Warning> {
                 );
             }
         }
+    }
+
+    // A signal only does something when one thing sends it and another
+    // waits for it, and the two are easy to spell differently.
+    let passives = content.passives();
+    let effects = content.effects();
+    let sent: BTreeSet<Name> = effects
+        .iter()
+        .filter_map(|(_, spec)| match &spec.effect {
+            Effect::Signal { name } => Some(*name),
+            _ => None,
+        })
+        .collect();
+    let heard: BTreeSet<Name> = passives
+        .iter()
+        .filter_map(|(_, p)| match p.trigger {
+            Trigger::Signal(name) => Some(name),
+            _ => None,
+        })
+        .collect();
+    for (owner, passive) in &passives {
+        if let Trigger::Signal(name) = passive.trigger
+            && !sent.contains(&name)
+        {
+            warn(owner.clone(), format!("waits for the signal \"{name}\", which nothing in the content sends (a Rust hook still can)"));
+        }
+    }
+    for (owner, spec) in &effects {
+        if let Effect::Signal { name } = &spec.effect
+            && !heard.contains(name)
+        {
+            warn(owner.clone(), format!("sends the signal \"{name}\", which nothing waits for"));
+        }
+    }
+    // A condition that asks for a status nothing can apply is never true.
+    const BUILT_IN: [&str; 10] = [
+        "stunned", "stat-modified", "afflicted", "silenced", "disarmed", "rooted", "taunted", "wounded", "invulnerable", "unstoppable",
+    ];
+    let marks: BTreeSet<&str> = effects
+        .iter()
+        .filter_map(|(_, spec)| match &spec.effect {
+            Effect::ApplyStatus { status: StatusKind::Marker { name, .. }, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut asked: Vec<(&String, &Condition)> = Vec::new();
+    asked.extend(passives.iter().filter_map(|(owner, p)| Some((owner, p.condition.as_ref()?))));
+    asked.extend(effects.iter().filter_map(|(owner, spec)| Some((owner, spec.condition.as_ref()?))));
+    for (owner, condition) in asked {
+        condition.walk(&mut |c| {
+            if let Condition::HasStatus { status, .. } = c
+                && !BUILT_IN.contains(&status.as_str())
+                && !marks.contains(status.as_str())
+            {
+                warn(owner.clone(), format!("asks for the status \"{status}\", which nothing in the content applies"));
+            }
+        });
     }
 
     let scripted: Vec<&String> = content.scripts().keys().collect();

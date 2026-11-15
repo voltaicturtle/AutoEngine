@@ -29,9 +29,12 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::name::Name;
 use crate::stats::{Stat, StatBlock, StatMod};
 
-/// How damage is mitigated.
+/// The type of some damage, which decides how it is mitigated. The rules
+/// for each kind are a [`DamageType`](crate::damage::DamageType) in the
+/// fight's settings, and a game can add kinds of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DamageKind {
     /// Reduced by armor.
@@ -40,6 +43,28 @@ pub enum DamageKind {
     Magic,
     /// Ignores resistances.
     True,
+    /// A kind the game defines; see [`DamageKind::custom`].
+    Custom(Name),
+}
+
+impl DamageKind {
+    /// A damage type of the game's own, such as `DamageKind::custom("fire")`.
+    /// Declare it once as a constant, and describe it to the game with
+    /// [`GameBuilder::damage_type`](crate::content::GameBuilder::damage_type).
+    pub const fn custom(id: &'static str) -> Self {
+        DamageKind::Custom(Name::new(id))
+    }
+
+    /// A short lower-case id: `"physical"`, `"magic"`, `"true"`, or the
+    /// name a custom kind was given.
+    pub const fn id(self) -> &'static str {
+        match self {
+            DamageKind::Physical => "physical",
+            DamageKind::Magic => "magic",
+            DamageKind::True => "true",
+            DamageKind::Custom(name) => name.as_str(),
+        }
+    }
 }
 
 /// Which unit a scaling value or condition is read from.
@@ -142,6 +167,10 @@ pub enum StatusKind {
     Invulnerable,
     /// New debuffs do not take hold (see [`StatusKind::is_debuff`]).
     Unstoppable,
+    /// Does nothing by itself: a named mark for conditions to look for
+    /// ([`Condition::HasStatus`]), such as "burning" or "marked". A
+    /// `harmful` mark counts as a debuff.
+    Marker { name: String, harmful: bool },
 }
 
 impl StatusKind {
@@ -159,12 +188,15 @@ impl StatusKind {
             | StatusKind::DamageOverTime { .. } => true,
             StatusKind::StatMods(mods) => mods.iter().any(StatMod::lowers),
             StatusKind::Invulnerable | StatusKind::Unstoppable => false,
+            StatusKind::Marker { harmful, .. } => *harmful,
         }
     }
 
-    /// A short name for logs and tooltips.
-    pub fn name(&self) -> &'static str {
+    /// A short name for logs, tooltips and [`Condition::HasStatus`]. A
+    /// marker's name is the one it was given.
+    pub fn name(&self) -> &str {
         match self {
+            StatusKind::Marker { name, .. } => name,
             StatusKind::Stun => "stunned",
             StatusKind::StatMods(_) => "stat-modified",
             StatusKind::DamageOverTime { .. } => "afflicted",
@@ -231,6 +263,10 @@ pub enum Effect {
     /// The source jumps to the free hex closest to the selected unit, and
     /// targets it if it is an enemy.
     Leap,
+    /// Fires the selected unit's [`Trigger::Signal`] passives of this name,
+    /// with the source as the other unit. This is how content makes
+    /// occasions of its own for passives to react to.
+    Signal { name: Name },
     /// Runs a Rust hook registered under `name` (see
     /// [`GameBuilder::custom_effect`](crate::content::GameBuilder::custom_effect)),
     /// once per selected unit. `args` are passed through to the hook so one
@@ -331,6 +367,23 @@ impl Effect {
 
     pub fn unstoppable(duration_ms: u32) -> Self {
         Effect::ApplyStatus { status: StatusKind::Unstoppable, duration_ms }
+    }
+
+    /// Puts a named mark on the unit for conditions to look for. It does
+    /// nothing by itself and is not a debuff.
+    pub fn mark(name: impl Into<String>, duration_ms: u32) -> Self {
+        Effect::ApplyStatus { status: StatusKind::Marker { name: name.into(), harmful: false }, duration_ms }
+    }
+
+    /// A mark that counts as a debuff: cleansing removes it and an
+    /// unstoppable unit shrugs it off.
+    pub fn harmful_mark(name: impl Into<String>, duration_ms: u32) -> Self {
+        Effect::ApplyStatus { status: StatusKind::Marker { name: name.into(), harmful: true }, duration_ms }
+    }
+
+    /// Fires the selected units' passives that wait for this signal.
+    pub fn signal(name: &'static str) -> Self {
+        Effect::Signal { name: Name::new(name) }
     }
 
     pub fn execute(permille: u32) -> Self {
@@ -455,6 +508,17 @@ pub enum Selector {
     HighestStatEnemies { stat: Stat, n: u32 },
     /// The `n` allies (the source included) with the most of a stat.
     HighestStatAllies { stat: Stat, n: u32 },
+    /// The `n` enemies with the least of a stat.
+    LowestStatEnemies { stat: Stat, n: u32 },
+    /// The `n` allies (the source included) with the least of a stat.
+    LowestStatAllies { stat: Stat, n: u32 },
+    /// Up to `n` allies picked at random, the source included.
+    RandomAllies(u32),
+    /// Every ally except the source.
+    OtherAllies,
+    /// Units chosen by a Rust hook registered under this name (see
+    /// [`GameBuilder::custom_selector`](crate::content::GameBuilder::custom_selector)).
+    Custom(String),
 }
 
 /// A yes/no question asked when a passive fires or an effect resolves.
@@ -483,6 +547,9 @@ pub enum Condition {
     /// The unit has a resource filled to at least this share of its
     /// capacity, in permille. False for a unit without the resource.
     ResourceAtLeast { who: Who, resource: String, permille: u32 },
+    /// The unit has a status with this [name](StatusKind::name), such as
+    /// `"stunned"` or the name of a [marker](StatusKind::Marker).
+    HasStatus { who: Who, status: String },
     /// A seeded random roll, in permille.
     Chance { permille: u32 },
     Not(Box<Condition>),
@@ -670,6 +737,18 @@ impl Ability {
 /// When a passive fires.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Trigger {
+    /// The owner dodged a basic attack; the other unit is the attacker.
+    OnDodge,
+    /// The owner was healed by an ability or an effect of one (not by
+    /// lifesteal or a passive); the other unit is the healer.
+    OnHealed,
+    /// An ally finished casting; the other unit is the caster.
+    OnAllyCast,
+    /// An enemy died; the other unit is the one that died.
+    OnEnemyDeath,
+    /// An [`Effect::Signal`] of this name reached the owner; the other unit
+    /// is the one that sent it.
+    Signal(Name),
     CombatStart,
     /// The owner lands a basic attack.
     OnAttack,
@@ -689,6 +768,13 @@ pub enum Trigger {
     Every { interval_ms: u32 },
     /// The owner's health drops to or below this share of its maximum.
     HealthBelow { permille: u32 },
+}
+
+impl Trigger {
+    /// Fires when an [`Effect::signal`] of this name reaches the owner.
+    pub const fn signal(name: &'static str) -> Self {
+        Trigger::Signal(Name::new(name))
+    }
 }
 
 /// A triggered set of effects. Traits, items and augments attach these to
@@ -748,6 +834,8 @@ pub struct UnitTemplate {
     pub tags: Vec<String>,
     /// Which enemy the unit goes after when it needs a new target.
     pub targeting: Targeting,
+    /// The type of damage its basic attacks deal.
+    pub attack_kind: DamageKind,
 }
 
 /// How a unit picks its target when it has none (or its target died).
@@ -764,6 +852,10 @@ pub enum Targeting {
     HighestDamage,
     /// The enemy with the least armor.
     LowestArmor,
+    /// The enemy with the most of any stat.
+    HighestStat(Stat),
+    /// The enemy with the least of any stat.
+    LowestStat(Stat),
 }
 
 impl UnitTemplate {
@@ -776,7 +868,14 @@ impl UnitTemplate {
             passives: Vec::new(),
             tags: Vec::new(),
             targeting: Targeting::Nearest,
+            attack_kind: DamageKind::Physical,
         }
+    }
+
+    /// The type of damage its basic attacks deal, instead of physical.
+    pub fn with_attack_kind(mut self, kind: DamageKind) -> Self {
+        self.attack_kind = kind;
+        self
     }
 
     pub fn with_id(mut self, id: impl Into<String>) -> Self {

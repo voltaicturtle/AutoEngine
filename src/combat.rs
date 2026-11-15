@@ -25,6 +25,7 @@ use crate::effect::{
     Amount, Anchor, Condition, Cost, DamageKind, Effect, EffectSpec, ScaleBy, Selector, StatusKind, Targeting,
     Trigger, UnitTemplate, Who,
 };
+use crate::damage::DamageType;
 use crate::hex::{Hex, HexBoard};
 use crate::resource::{MANA, Pool, ResourceDef};
 use crate::rng::Rng;
@@ -59,6 +60,12 @@ pub type CustomEffectFn = dyn Fn(&mut EffectContext<'_>) + Send + Sync;
 /// rules as [`CustomEffectFn`] apply.
 pub type CustomConditionFn = dyn Fn(&ConditionContext<'_>) -> bool + Send + Sync;
 
+/// A Rust hook that picks the units for [`Selector::Custom`]. It must give
+/// the same units in the same order every time for the same fight, so sort
+/// by something stable such as the unit id. Dead units it returns are
+/// skipped.
+pub type CustomSelectorFn = dyn Fn(&SelectContext<'_>) -> Vec<UnitId> + Send + Sync;
+
 /// Tunable rules of the simulation. A game sets them in
 /// [`GameRules::combat`](crate::content::GameRules).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +78,9 @@ pub struct CombatConfig {
     /// The resources units build up and spend to cast: mana, unless the
     /// game says otherwise. See the [`resource`](crate::resource) module.
     pub resources: Vec<ResourceDef>,
+    /// How each kind of damage is mitigated. See the
+    /// [`damage`](crate::damage) module.
+    pub damage_types: Vec<DamageType>,
     /// Damage multiplier from resistance is `k / (k + resist)`.
     pub resist_constant: i64,
     /// Cap on the `DamageReduction` stat, in permille.
@@ -90,6 +100,7 @@ impl Default for CombatConfig {
             tick_ms: 50,
             max_duration_ms: 60_000,
             resources: vec![ResourceDef::mana()],
+            damage_types: DamageType::defaults(),
             resist_constant: 100,
             max_damage_reduction: 900,
             overtime_after_ms: 30_000,
@@ -334,6 +345,7 @@ pub struct Combat {
     outcome: Option<Outcome>,
     custom_effects: HashMap<String, Arc<CustomEffectFn>>,
     custom_conditions: HashMap<String, Arc<CustomConditionFn>>,
+    custom_selectors: HashMap<String, Arc<CustomSelectorFn>>,
     hook_depth: u32,
 }
 
@@ -360,6 +372,7 @@ impl Combat {
             outcome: None,
             custom_effects: HashMap::new(),
             custom_conditions: HashMap::new(),
+            custom_selectors: HashMap::new(),
             hook_depth: 0,
         }
     }
@@ -431,6 +444,16 @@ impl Combat {
         predicate: impl Fn(&ConditionContext<'_>) -> bool + Send + Sync + 'static,
     ) {
         self.custom_conditions.insert(name.into(), Arc::new(predicate));
+    }
+
+    /// Registers the hook behind `Selector::Custom(name)`. Unregistered
+    /// custom selectors pick nobody.
+    pub fn register_custom_selector(
+        &mut self,
+        name: impl Into<String>,
+        hook: impl Fn(&SelectContext<'_>) -> Vec<UnitId> + Send + Sync + 'static,
+    ) {
+        self.custom_selectors.insert(name.into(), Arc::new(hook));
     }
 
     /// Places a unit on the board.
@@ -772,6 +795,8 @@ impl Combat {
             Targeting::LowestHealth => enemies.min_by_key(|o| (o.health, near(o))),
             Targeting::HighestDamage => enemies.min_by_key(|o| (std::cmp::Reverse(o.stat(Stat::AttackDamage)), near(o))),
             Targeting::LowestArmor => enemies.min_by_key(|o| (o.stat(Stat::Armor), near(o))),
+            Targeting::HighestStat(stat) => enemies.min_by_key(|o| (std::cmp::Reverse(o.stat(stat)), near(o))),
+            Targeting::LowestStat(stat) => enemies.min_by_key(|o| (o.stat(stat), near(o))),
         }
         .map(|o| o.id);
         self.u_mut(id).target = target;
@@ -819,9 +844,11 @@ impl Combat {
         let dodge = self.u(target).stat(Stat::Dodge);
         if dodge > 0 && self.rng.chance(dodge.min(1000) as u64, 1000) {
             self.emit(EventKind::Dodged { source: id, target });
+            self.fire(target, Some(id), |t| matches!(t, Trigger::OnDodge));
             return;
         }
-        self.deal_damage(id, target, damage, DamageKind::Physical, true, true);
+        let kind = self.u(id).template.attack_kind;
+        self.deal_damage(id, target, damage, kind, true, true);
         self.fire(id, Some(target), |t| matches!(t, Trigger::OnAttack));
     }
 
@@ -833,6 +860,13 @@ impl Combat {
             self.resolve(id, None, &ability.effects, true);
         }
         self.fire(id, None, |t| matches!(t, Trigger::OnCast));
+        let team = self.u(id).team;
+        for i in 0..self.units.len() {
+            let ally = &self.units[i];
+            if ally.alive && ally.team == team && ally.id != id {
+                self.fire(ally.id, Some(id), |t| matches!(t, Trigger::OnAllyCast));
+            }
+        }
     }
 
     // ----- triggers -------------------------------------------------------
@@ -923,6 +957,9 @@ impl Combat {
             Condition::ResourceAtLeast { who: w, resource, permille } => who(w)
                 .and_then(|id| self.u(id).pool(resource))
                 .is_some_and(|p| p.amount * 1000 >= p.max * *permille as i64),
+            Condition::HasStatus { who: w, status } => {
+                who(w).is_some_and(|id| self.u(id).has_status(|s| s.name() == status))
+            }
             Condition::Chance { permille } => self.rng.chance(*permille as u64, 1000),
             Condition::Not(c) => !self.check(c, source, target),
             Condition::All(cs) => cs.iter().all(|c| self.check(c, source, target)),
@@ -997,6 +1034,24 @@ impl Combat {
             Selector::HighestStatAllies { stat, n } => {
                 take_sorted(allies(), *n, |o| std::cmp::Reverse(o.stat(*stat)))
             }
+            Selector::LowestStatEnemies { stat, n } => take_sorted(enemies(), *n, |o| o.stat(*stat)),
+            Selector::LowestStatAllies { stat, n } => take_sorted(allies(), *n, |o| o.stat(*stat)),
+            Selector::RandomAllies(n) => {
+                let mut dice = self.rng.clone().fork((self.tick as u64) << 16 | source.0 as u64);
+                let mut pool = ids(&mut allies());
+                dice.shuffle(&mut pool);
+                pool.truncate(*n as usize);
+                pool
+            }
+            Selector::OtherAllies => ids(&mut allies().filter(|o| o.id != source)),
+            Selector::Custom(name) => match self.custom_selectors.get(name) {
+                Some(hook) => {
+                    let mut picked = hook(&SelectContext { combat: self, source, other });
+                    picked.retain(|id| self.units.get(id.0 as usize).is_some_and(|u| u.alive));
+                    picked
+                }
+                None => Vec::new(),
+            },
         }
     }
 
@@ -1036,7 +1091,12 @@ impl Combat {
             }
             Effect::Heal { amount } => {
                 let raw = self.eval(amount, source, target);
-                self.heal(source, target, raw);
+                if self.heal(source, target, raw) > 0 && direct {
+                    self.fire(target, Some(source), |t| matches!(t, Trigger::OnHealed));
+                }
+            }
+            Effect::Signal { name } => {
+                self.fire(target, Some(source), |t| matches!(t, Trigger::Signal(n) if n == name));
             }
             Effect::Shield { amount, duration_ms } => {
                 let value = self.eval(amount, source, target);
@@ -1248,10 +1308,11 @@ impl Combat {
         }
     }
 
-    fn heal(&mut self, source: UnitId, id: UnitId, amount: i64) {
+    /// Heals a unit and returns how much health it got back.
+    fn heal(&mut self, source: UnitId, id: UnitId, amount: i64) -> i64 {
         let unit = self.u_mut(id);
         if !unit.alive || amount <= 0 {
-            return;
+            return 0;
         }
         let wound = unit
             .statuses
@@ -1269,6 +1330,7 @@ impl Combat {
         if healed > 0 {
             self.emit(EventKind::Healed { source, target: id, amount: healed });
         }
+        healed
     }
 
     /// Runs the full damage pipeline: crit, amplification, resistance,
@@ -1289,12 +1351,16 @@ impl Combat {
         if self.u(target).has_status(|s| matches!(s, StatusKind::Invulnerable)) {
             return;
         }
+        // A kind with no rules behaves like true damage that shields soak.
+        let rules = self.config.damage_types.iter().find(|t| t.kind == kind);
+        let (resist, amp, reducible, shieldable) =
+            rules.map_or((None, None, false, true), |t| (t.resist, t.amp, t.reducible, t.shieldable));
         let (crit_chance, crit_damage, amp, lifesteal) = {
             let s = self.u(source);
             (
                 s.stat(Stat::CritChance),
                 s.stat(Stat::CritDamage),
-                s.stat(Stat::DamageAmp),
+                s.stat(Stat::DamageAmp) + amp.map_or(0, |stat| s.stat(stat)),
                 s.stat(Stat::Lifesteal),
             )
         };
@@ -1312,13 +1378,9 @@ impl Combat {
 
         let k = self.config.resist_constant.max(1);
         let t = self.u(target);
-        let resist = match kind {
-            DamageKind::Physical => t.stat(Stat::Armor),
-            DamageKind::Magic => t.stat(Stat::MagicResist),
-            DamageKind::True => 0,
-        };
+        let resist = resist.map_or(0, |stat| t.stat(stat));
         amount = amount * k / (k + resist);
-        if kind != DamageKind::True {
+        if reducible {
             let reduction = t.stat(Stat::DamageReduction).min(self.config.max_damage_reduction);
             amount = amount * (1000 - reduction) / 1000;
         }
@@ -1329,7 +1391,7 @@ impl Combat {
         // Shields soak damage first, oldest first.
         let unit = self.u_mut(target);
         let mut left = amount;
-        for shield in unit.shields.iter_mut() {
+        for shield in unit.shields.iter_mut().filter(|_| shieldable) {
             let soak = shield.amount.min(left);
             shield.amount -= soak;
             left -= soak;
@@ -1391,9 +1453,11 @@ impl Combat {
             self.fire(killer, Some(id), |t| matches!(t, Trigger::OnKill));
         }
         for i in 0..self.units.len() {
-            let ally = &self.units[i];
-            if ally.alive && ally.team == team {
-                self.fire(ally.id, Some(id), |t| matches!(t, Trigger::OnAllyDeath));
+            let other = &self.units[i];
+            if other.alive && other.team == team {
+                self.fire(other.id, Some(id), |t| matches!(t, Trigger::OnAllyDeath));
+            } else if other.alive {
+                self.fire(other.id, Some(id), |t| matches!(t, Trigger::OnEnemyDeath));
             }
         }
     }
@@ -1491,6 +1555,32 @@ impl EffectContext<'_> {
         }
         self.combat.displace(unit, to);
         true
+    }
+}
+
+/// What a [`CustomSelectorFn`] can see.
+pub struct SelectContext<'a> {
+    combat: &'a Combat,
+    source: UnitId,
+    other: Option<UnitId>,
+}
+
+impl SelectContext<'_> {
+    /// The unit producing the effect.
+    pub fn source(&self) -> UnitId {
+        self.source
+    }
+    /// The other unit in the triggering event, if any.
+    pub fn other(&self) -> Option<UnitId> {
+        self.other
+    }
+    pub fn combat(&self) -> &Combat {
+        self.combat
+    }
+    /// The fight's dice as they stand, to roll without moving them: the
+    /// same call gives the same rolls until the fight rolls again.
+    pub fn rng(&self) -> Rng {
+        self.combat.rng.clone().fork((self.combat.tick as u64) << 16 | self.source.0 as u64)
     }
 }
 
