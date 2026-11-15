@@ -74,9 +74,11 @@ or `game.drain_events()` (the ones since the last call).
 | `ShopRolled` | `player`, `offers` | a player's shop got new offers: at the start of a round, or after a reroll. `offers` holds unit ids, with `None` (`()` in Rhai) for empty slots |
 | `GoldChanged` | `player`, `gold` | a player's gold changed. `gold` is the new total |
 | `CurrencyChanged` | `player`, `currency`, `amount` | a player's balance of a currency other than gold changed. `amount` is the new total |
+| `ActionUsed` | `player`, `action`, `arg` | a player used one of the game's own [actions](rules.md#actions) and has paid for it |
 | `XpChanged` | `player`, `level`, `xp` | a player gained experience. These are the new level and experience |
 | `UnitGained` | `player`, `uid`, `unit` | a player got a unit: bought, drafted, granted or duplicated. `uid` identifies this copy for the rest of the game |
 | `UnitSold` | `player`, `uid`, `unit` | a unit was sold |
+| `UnitRemoved` | `player`, `uid`, `unit` | a unit was taken away without being sold (`Game::remove_unit`) |
 | `UnitUpgraded` | `player`, `uid`, `unit`, `star` | copies merged. `uid` is the unit that was kept, and `star` its new star level |
 | `UnitMoved` | `player`, `uid`, `to` | a unit moved to a bench slot or a board place |
 | `ItemGained` | `player`, `item` | an item went into a player's inventory |
@@ -90,6 +92,7 @@ or `game.drain_events()` (the ones since the last call).
 | `PlayerReady` | `player` | a player said they are done planning |
 | `CombatFinished` | `combat`, `home`, `away`, `winner` | a fight finished. `combat` indexes `game.combats()` for the full record, and `winner` is `0` (home), `1` (away) or `None` for a draw |
 | `PlayerDamaged` | `player`, `amount`, `health` | a player lost health. `health` is what is left |
+| `PlayerHealed` | `player`, `amount`, `health` | a player got health back. `health` is the new total |
 | `PlayerForfeited` | `player` | a player gave up. They leave when the round ends |
 | `PlayerEliminated` | `player`, `placement` | a player is out, finishing in `placement` (1 is the winner) |
 | `GameOver` | `winner` | the game ended |
@@ -143,6 +146,7 @@ one place.
 | `EquipItem { item, uid }` | gives item number `item` from the player's inventory to a unit, or uses it if it is single-use |
 | `Pick { option }` | picks an option the round offers |
 | `RerollPick` | swaps the round's options for new ones, where the round allows it |
+| `Action { id, arg }` | uses one of the game's own [actions](rules.md#actions). `arg` is the unit's `uid` for an action on a unit |
 | `Ready` | done planning. A hosted game ends planning early when everyone is ready |
 | `Forfeit` | gives up. The player leaves when the round ends, placed below everyone else who goes out that round. This can't be undone |
 
@@ -156,6 +160,8 @@ one place.
 | `NotEnoughGold { need, have }` | can't afford it |
 | `NotEnough { currency, need, have }` | not enough of a currency other than gold (from `spend_currency`) |
 | `UnknownCurrency` | the game has no currency with that id |
+| `UnknownAction` | the game has no action with that id |
+| `ActionLimit { per_round }` | the action has been used as often as it can be this round |
 | `EmptyShopSlot` | nothing in that shop slot |
 | `SoldOut` | no copies of that unit are left in the pool |
 | `BenchFull` | no room on the bench |
@@ -189,6 +195,7 @@ directly, because they run again on replay.
 | `Item(id)` | an item |
 | `Augment(id)` | an augment |
 | `Damage(n)` | takes health |
+| `Heal(n)` | gives health back, up to what players start with |
 
 Every input that moves a game along (`Input::BeginRound`, `FinishRound`,
 accepted commands and grants) is recorded in `game.inputs()`.

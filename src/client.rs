@@ -181,6 +181,13 @@ impl ClientState {
         c.text(self.language.as_deref(), kind, id, "description").unwrap_or_default()
     }
 
+    /// Any text of the content (see [`ContentSet::text`]) in
+    /// [`ClientState::language`]; empty if there is none.
+    pub fn text(&self, kind: &str, id: &str, field: &str) -> String {
+        let Some(c) = &self.content else { return String::new() };
+        c.text(self.language.as_deref(), kind, id, field).unwrap_or_default()
+    }
+
     /// A line of text for events worth telling the player about.
     pub fn describe(&self, event: &GameEvent) -> Option<String> {
         let name = |id: &PlayerId| self.player_name(*id);
@@ -215,6 +222,10 @@ impl ClientState {
             GameEvent::PlayerDamaged { player, amount, health } => {
                 format!("{} took {amount} damage ({} left)", name(player), (*health).max(0))
             }
+            GameEvent::PlayerHealed { player, amount, health } => {
+                format!("{} regained {amount} health ({health} now)", name(player))
+            }
+            GameEvent::ActionUsed { player, action, .. } => format!("{} used {}", name(player), self.text("action", action, "name")),
             GameEvent::PlayerForfeited { player } => format!("{} forfeited", name(player)),
             GameEvent::LobbyModifier { augment } => {
                 let text = self.description("augment", augment);

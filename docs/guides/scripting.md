@@ -40,7 +40,7 @@ field.
 | `game.all_players()` | ids of every player, including eliminated ones |
 | `game.name(p)` | a player's name |
 | `game.gold(p)` | a player's gold |
-| `game.amount(p, "id")` | how much a player has of a currency other than gold. One the game does not define reads as 0 |
+| `game.amount(p, "id")` | how much a player has of a currency. `"gold"` is gold, and one the game does not define reads as 0 |
 | `game.health(p)` | a player's health |
 | `game.level(p)` | a player's level |
 | `game.is_alive(p)` | whether a player is still in the game |
@@ -73,6 +73,7 @@ field.
 | `game.give_unit(p, "id")` | puts a one-star unit on the bench, taking a copy from the pool if one is left |
 | `game.give_augment(p, "id")` | gives an augment |
 | `game.damage(p, n)` | takes health |
+| `game.heal(p, n)` | gives health back, up to what players start with |
 | `game.log("text")` | shows a line in every client's log |
 | `game.fight_all()` | pairs everyone up to fight, as a PvP round does |
 

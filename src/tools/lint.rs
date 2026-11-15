@@ -172,6 +172,34 @@ pub fn lint(content: &ContentSet, assets: Option<&Path>) -> Vec<Warning> {
         });
     }
 
+    // A currency should come from somewhere and go somewhere, and an action
+    // should do something. Scripts and Rust hooks can do either, so these
+    // only speak up when the content has neither.
+    let has_code = !content.scripts().is_empty();
+    let grants = |currency: &str| {
+        content.actions().iter().flat_map(|a| &a.gives).any(|g| matches!(g, crate::game::Grant::Currency { currency: c, amount } if c == currency && *amount > 0))
+    };
+    for currency in content.currencies() {
+        let subject = format!("currency {}", currency.id);
+        let paid = currency.starting > 0
+            || currency.per_round > 0
+            || content.augments().any(|a| a.per_round.currencies.get(&currency.id).is_some_and(|n| *n > 0))
+            || grants(&currency.id);
+        let handled = content.actions().iter().any(|a| content.action_handler(&a.id).is_some());
+        if !paid && !has_code && !handled {
+            warn(subject.clone(), "nothing in the content gives it to players".into());
+        }
+        let spent = content.actions().iter().flat_map(|a| &a.prices).any(|p| p.currency == currency.id);
+        if !spent && !has_code && !handled {
+            warn(subject, "nothing in the content lets players spend it".into());
+        }
+    }
+    for action in content.actions() {
+        if action.gives.is_empty() && content.action_handler(&action.id).is_none() && !has_code {
+            warn(format!("action {}", action.id), "gives nothing and has no handler, so using it does nothing".into());
+        }
+    }
+
     let scripted: Vec<&String> = content.scripts().keys().collect();
     for round in &content.schedule().rounds {
         if let RoundKindDef::Custom { kind, .. } = &round.kind

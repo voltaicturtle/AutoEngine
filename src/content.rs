@@ -44,6 +44,7 @@ use crate::combat::{
     Combat, ConditionContext, CustomConditionFn, CustomEffectFn, CustomSelectorFn, EffectContext, SelectContext, Team, UnitId,
 };
 use crate::damage::DamageType;
+use crate::game::{CommandError, Game, Grant, PlayerId};
 use crate::effect::{
     Ability, Amount, Condition, Cost, DamageKind, Effect, EffectSpec, Passive, ScaleBy, Selector, StatusKind, UnitTemplate,
 };
@@ -421,6 +422,129 @@ impl Default for EconomyRules {
     }
 }
 
+/// What something costs: an amount of gold, or of a currency the game
+/// defines.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Price {
+    /// `"gold"` or a currency's id.
+    pub currency: String,
+    pub amount: i64,
+}
+
+impl Price {
+    pub fn gold(amount: i64) -> Self {
+        Price { currency: "gold".into(), amount }
+    }
+
+    pub fn of(currency: impl Into<String>, amount: i64) -> Self {
+        Price { currency: currency.into(), amount }
+    }
+}
+
+/// What a player has to point an action at.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActionTarget {
+    /// Nothing: the action is a plain button.
+    #[default]
+    None,
+    /// One of the player's own units. The command's `arg` is its `uid`, and
+    /// the engine refuses a unit the player does not own.
+    Unit,
+}
+
+/// Something a player can do during planning that the game itself defines:
+/// trade souls for experience, pay for a blessing, sacrifice a unit.
+/// Clients show actions as buttons and send
+/// [`Command::Action`](crate::game::Command::Action).
+///
+/// The engine checks the price and the limit, and takes the price once the
+/// action goes through. What the action does is any mix of:
+///
+/// - [`gives`](Self::gives): things handed over, with no code at all;
+/// - a Rust handler added with
+///   [`GameBuilder::action_handler`], which can also refuse;
+/// - hooks and scripts reacting to
+///   [`GameEvent::ActionUsed`](crate::game::GameEvent::ActionUsed).
+///
+/// ```
+/// use autoengine::content::{ActionDef, ContentSet, CurrencyDef};
+/// use autoengine::game::Grant;
+///
+/// let game = ContentSet::builder()
+///     .currency(CurrencyDef::new("souls", "Souls").per_round(1))
+///     .action(ActionDef::new("study", "Study").description("Trade 2 souls for 6 experience.").costs("souls", 2).gives(Grant::Xp(6)).per_round(1))
+///     .build()
+///     .unwrap();
+/// assert_eq!(game.action("study").unwrap().prices[0].amount, 2);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionDef {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// What using it costs. Empty is free.
+    #[serde(default)]
+    pub prices: Vec<Price>,
+    /// What the player gets each time.
+    #[serde(default)]
+    pub gives: Vec<Grant>,
+    /// How many times a player may use it in one round. `None` is no limit.
+    #[serde(default)]
+    pub per_round: Option<u32>,
+    #[serde(default)]
+    pub target: ActionTarget,
+}
+
+impl ActionDef {
+    /// A free action that does nothing yet.
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        ActionDef {
+            id: id.into(),
+            name: name.into(),
+            description: String::new(),
+            prices: Vec::new(),
+            gives: Vec::new(),
+            per_round: None,
+            target: ActionTarget::None,
+        }
+    }
+
+    pub fn description(mut self, text: impl Into<String>) -> Self {
+        self.description = text.into();
+        self
+    }
+
+    /// Adds to the price: `.costs("gold", 2)` or `.costs("souls", 1)`.
+    pub fn costs(mut self, currency: impl Into<String>, amount: i64) -> Self {
+        self.prices.push(Price::of(currency, amount));
+        self
+    }
+
+    /// Adds something the player gets each time they use the action.
+    pub fn gives(mut self, grant: Grant) -> Self {
+        self.gives.push(grant);
+        self
+    }
+
+    /// Limits how often a player may use it in one round.
+    pub fn per_round(mut self, times: u32) -> Self {
+        self.per_round = Some(times);
+        self
+    }
+
+    /// Makes the action need one of the player's own units.
+    pub fn on_unit(mut self) -> Self {
+        self.target = ActionTarget::Unit;
+        self
+    }
+}
+
+/// A Rust handler for an [`ActionDef`]: gets the game, the player and the
+/// command's `arg`. Returning an error refuses the action, and nothing is
+/// charged; a handler must not change the game before it refuses.
+pub type ActionFn = dyn Fn(&mut Game, PlayerId, i64) -> Result<(), CommandError> + Send + Sync;
+
 /// A currency players hold besides gold: tokens, souls, favor. The engine
 /// keeps the balance, pays it out and shows it; what it buys is up to the
 /// game's round types, scripts and hooks (see
@@ -534,6 +658,8 @@ pub struct GameRules {
     /// The share of what a unit is worth that selling it gives back, in
     /// thousandths. 1000 is a full refund.
     pub sell_refund_permille: u32,
+    /// Things players can do during planning besides the built-in commands.
+    pub actions: Vec<ActionDef>,
 }
 
 impl Default for GameRules {
@@ -587,6 +713,7 @@ impl Default for GameRules {
             lobby_modifiers: Vec::new(),
             currencies: Vec::new(),
             sell_refund_permille: 1000,
+            actions: Vec::new(),
         }
     }
 }
@@ -640,6 +767,8 @@ pub struct RoundGrant {
     pub components: u32,
     /// Other currencies, by id.
     pub currencies: BTreeMap<String, i64>,
+    /// Health back, up to what players start with.
+    pub health: i64,
 }
 
 impl RoundGrant {
@@ -1016,6 +1145,7 @@ struct Hooks {
     effects: BTreeMap<String, Arc<CustomEffectFn>>,
     conditions: BTreeMap<String, Arc<CustomConditionFn>>,
     selectors: BTreeMap<String, Arc<CustomSelectorFn>>,
+    actions: BTreeMap<String, Arc<ActionFn>>,
 }
 
 impl std::fmt::Debug for Hooks {
@@ -1024,6 +1154,7 @@ impl std::fmt::Debug for Hooks {
             .field("effects", &self.effects.keys().collect::<Vec<_>>())
             .field("conditions", &self.conditions.keys().collect::<Vec<_>>())
             .field("selectors", &self.selectors.keys().collect::<Vec<_>>())
+            .field("actions", &self.actions.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -1034,6 +1165,7 @@ impl PartialEq for Hooks {
         self.effects.keys().eq(other.effects.keys())
             && self.conditions.keys().eq(other.conditions.keys())
             && self.selectors.keys().eq(other.selectors.keys())
+            && self.actions.keys().eq(other.actions.keys())
     }
 }
 
@@ -1061,7 +1193,7 @@ pub struct GameBuilder {
 pub type Translations = BTreeMap<String, BTreeMap<String, String>>;
 
 /// The kinds of definition that have translatable text.
-pub const TEXT_KINDS: [&str; 6] = ["unit", "trait", "item", "augment", "resource", "currency"];
+pub const TEXT_KINDS: [&str; 7] = ["unit", "trait", "item", "augment", "resource", "currency", "action"];
 
 /// The text fields of a unit's ability, by position: `"ability"` and
 /// `"ability_description"` for the first, `"ability_2"` and
@@ -1162,6 +1294,53 @@ impl GameBuilder {
             Some(existing) => *existing = def,
             None => currencies.push(def),
         }
+        self
+    }
+
+    /// Adds something players can do during planning (see [`ActionDef`]),
+    /// or replaces the action with the same id.
+    pub fn action(mut self, def: ActionDef) -> Self {
+        let actions = &mut self.rules.actions;
+        match actions.iter_mut().find(|a| a.id == def.id) {
+            Some(existing) => *existing = def,
+            None => actions.push(def),
+        }
+        self
+    }
+
+    /// Gives an action Rust code to run. The handler can refuse by
+    /// returning an error (usually [`CommandError::CannotUse`] with the
+    /// reason), and then the player is not charged.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use autoengine::content::{ActionDef, ContentSet};
+    /// use autoengine::game::{Command, CommandError, Game, PlayerId};
+    ///
+    /// let content = ContentSet::builder()
+    ///     .action(ActionDef::new("bloodprice", "Blood Price").description("Lose 5 health, gain 4 gold."))
+    ///     .action_handler("bloodprice", |game, player, _arg| {
+    ///         if game.player(player).health <= 5 {
+    ///             return Err(CommandError::CannotUse("not enough health".into()));
+    ///         }
+    ///         game.damage_player(player, 5);
+    ///         game.add_gold(player, 4);
+    ///         Ok(())
+    ///     })
+    ///     .build()
+    ///     .unwrap();
+    /// let mut game = Game::new(Arc::new(content), 1, &["a", "b"]);
+    /// game.begin_round().unwrap();
+    /// let gold = game.player(PlayerId(0)).gold;
+    /// game.apply(PlayerId(0), Command::Action { id: "bloodprice".into(), arg: 0 }).unwrap();
+    /// assert_eq!(game.player(PlayerId(0)).gold, gold + 4);
+    /// ```
+    pub fn action_handler(
+        mut self,
+        id: impl Into<String>,
+        handler: impl Fn(&mut Game, PlayerId, i64) -> Result<(), CommandError> + Send + Sync + 'static,
+    ) -> Self {
+        self.hooks.actions.insert(id.into(), Arc::new(handler));
         self
     }
 
@@ -1425,6 +1604,8 @@ impl ContentSet {
             ("augment", "description") => self.augment(id).map(|d| d.description.clone()),
             ("resource", "name") => self.resource(id).map(|d| d.name.clone()),
             ("currency", "name") => self.currency(id).map(|d| d.name.clone()),
+            ("action", "name") => self.action(id).map(|d| d.name.clone()),
+            ("action", "description") => self.action(id).map(|d| d.description.clone()),
             _ => None,
         }?;
         let translated = language
@@ -1461,6 +1642,10 @@ impl ContentSet {
         }
         for def in self.currencies() {
             keys.push(text_key("currency", &def.id, "name"));
+        }
+        for def in self.actions() {
+            keys.push(text_key("action", &def.id, "name"));
+            keys.push(text_key("action", &def.id, "description"));
         }
         keys
     }
@@ -1595,6 +1780,7 @@ impl ContentSet {
                         "augment" => self.augments.contains_key(*id) && matches!(*field, "name" | "description"),
                         "resource" => self.resource(id).is_some() && *field == "name",
                         "currency" => self.currency(id).is_some() && *field == "name",
+                        "action" => self.action(id).is_some() && matches!(*field, "name" | "description"),
                         _ => false,
                     },
                     _ => false,
@@ -1625,6 +1811,52 @@ impl ContentSet {
             }
             if r.currencies[..i].iter().any(|c| c.id == def.id) {
                 return invalid(format!("duplicate currency id `{}`", def.id));
+            }
+        }
+        let currency_ids = || -> Vec<String> { std::iter::once("gold".to_string()).chain(r.currencies.iter().map(|c| c.id.clone())).collect() };
+        for (i, def) in r.actions.iter().enumerate() {
+            let owner = format!("action `{}`", def.id);
+            if def.id.is_empty() {
+                return invalid("an action needs an id".into());
+            }
+            if r.actions[..i].iter().any(|a| a.id == def.id) {
+                return invalid(format!("duplicate action id `{}`", def.id));
+            }
+            for price in &def.prices {
+                if price.currency != "gold" && self.currency(&price.currency).is_none() {
+                    let known = currency_ids();
+                    return invalid(format!("{owner} costs unknown currency `{}`{}", price.currency, suggestion(&price.currency, known.iter())));
+                }
+                if price.amount <= 0 {
+                    return invalid(format!("{owner} has a price of {} {}; a price must be positive (give things with `gives`)", price.amount, price.currency));
+                }
+            }
+            if def.per_round == Some(0) {
+                return invalid(format!("{owner} can be used 0 times a round, so never"));
+            }
+            for grant in &def.gives {
+                match grant {
+                    Grant::Unit(id) if !self.units.contains_key(id) => {
+                        return invalid(format!("{owner} gives unknown unit `{id}`{}", suggestion(id, self.units.keys())));
+                    }
+                    Grant::Item(id) if !self.items.contains_key(id) => {
+                        return invalid(format!("{owner} gives unknown item `{id}`{}", suggestion(id, self.items.keys())));
+                    }
+                    Grant::Augment(id) if !self.augments.contains_key(id) => {
+                        return invalid(format!("{owner} gives unknown augment `{id}`{}", suggestion(id, self.augments.keys())));
+                    }
+                    Grant::Currency { currency, .. } if currency != "gold" && self.currency(currency).is_none() => {
+                        let known = currency_ids();
+                        return invalid(format!("{owner} gives unknown currency `{currency}`{}", suggestion(currency, known.iter())));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for id in self.hooks.actions.keys() {
+            if !r.actions.iter().any(|a| &a.id == id) {
+                let known: Vec<String> = r.actions.iter().map(|a| a.id.clone()).collect();
+                return invalid(format!("there is a handler for the action `{id}`, but no such action{}", suggestion(id, known.iter())));
             }
         }
         let resources = &r.combat.resources;
@@ -1850,6 +2082,20 @@ impl ContentSet {
     }
     pub fn currency(&self, id: &str) -> Option<&CurrencyDef> {
         self.currencies().iter().find(|c| c.id == id)
+    }
+
+    /// What players can do during planning besides the built-in commands.
+    pub fn actions(&self) -> &[ActionDef] {
+        &self.rules.actions
+    }
+
+    pub fn action(&self, id: &str) -> Option<&ActionDef> {
+        self.actions().iter().find(|a| a.id == id)
+    }
+
+    /// The Rust handler of an action, if it has one.
+    pub fn action_handler(&self, id: &str) -> Option<Arc<ActionFn>> {
+        self.hooks.actions.get(id).cloned()
     }
     /// The rules for every kind of damage in the game.
     pub fn damage_types(&self) -> &[DamageType] {

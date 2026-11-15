@@ -23,7 +23,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::combat::{Event, Team};
-use crate::content::{BoardUnit, ContentSet, RoundKindDef, TeamSetup};
+use crate::content::{ActionDef, ActionTarget, BoardUnit, ContentSet, RoundKindDef, TeamSetup};
 use crate::rng::Rng;
 use crate::round::{self, RoundFactory, RoundType};
 
@@ -71,6 +71,15 @@ pub enum Command {
     /// Swap the options the current round offers for new ones, where the
     /// round allows it (see [`Game::rerolls_left`]).
     RerollPick,
+    /// Use one of the game's own actions (see
+    /// [`ActionDef`](crate::content::ActionDef)). `arg` is whatever the
+    /// action needs: the `uid` of a unit for an action aimed at one, and
+    /// otherwise a number only the game's own code gives a meaning to.
+    Action {
+        id: String,
+        #[serde(default)]
+        arg: i64,
+    },
     /// Signal that the player is done for this round.
     Ready,
     /// Give up. The player leaves when the round ends, placed below
@@ -90,6 +99,10 @@ pub enum CommandError {
     NotEnough { currency: String, need: i64, have: i64 },
     /// The game has no currency with that id.
     UnknownCurrency,
+    /// The game has no action with that id.
+    UnknownAction,
+    /// The action has been used as often as it can be this round.
+    ActionLimit { per_round: u32 },
     EmptyShopSlot,
     SoldOut,
     BenchFull,
@@ -120,6 +133,9 @@ impl std::fmt::Display for CommandError {
             CommandError::NotEnoughGold { need, have } => write!(f, "needs {need} gold, has {have}"),
             CommandError::NotEnough { currency, need, have } => write!(f, "needs {need} {currency}, has {have}"),
             CommandError::UnknownCurrency => write!(f, "the game has no such currency"),
+            CommandError::UnknownAction => write!(f, "the game has no such action"),
+            CommandError::ActionLimit { per_round: 1 } => write!(f, "already used this round"),
+            CommandError::ActionLimit { per_round } => write!(f, "already used {per_round} times this round"),
             CommandError::EmptyShopSlot => write!(f, "that shop slot is empty"),
             CommandError::SoldOut => write!(f, "no copies of that unit are left"),
             CommandError::BenchFull => write!(f, "the bench is full"),
@@ -180,6 +196,9 @@ pub struct Player {
     /// `GameRules::currencies`).
     #[serde(default)]
     pub wallet: BTreeMap<String, i64>,
+    /// How often the player has used each of the game's actions this round.
+    #[serde(default)]
+    pub actions_used: BTreeMap<String, u32>,
 }
 
 /// Running totals for one player, for end-of-game summaries.
@@ -226,6 +245,32 @@ mod board_serde {
 }
 
 impl Player {
+    /// How much the player has of a currency. `"gold"` is their gold.
+    pub fn balance(&self, currency: &str) -> i64 {
+        if currency == "gold" { self.gold } else { self.wallet.get(currency).copied().unwrap_or(0) }
+    }
+
+    /// Whether the player could use one of the game's actions right now, as
+    /// far as its limit and price go. Clients use this to grey a button
+    /// out; the action's own handler can still refuse.
+    pub fn can_use(&self, action: &ActionDef) -> Result<(), CommandError> {
+        if let Some(per_round) = action.per_round
+            && self.actions_used.get(&action.id).copied().unwrap_or(0) >= per_round
+        {
+            return Err(CommandError::ActionLimit { per_round });
+        }
+        for price in &action.prices {
+            let have = self.balance(&price.currency);
+            if have < price.amount {
+                return Err(match price.currency.as_str() {
+                    "gold" => CommandError::NotEnoughGold { need: price.amount, have },
+                    _ => CommandError::NotEnough { currency: price.currency.clone(), need: price.amount, have },
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Every unit the player owns, board first.
     pub fn units(&self) -> impl Iterator<Item = &OwnedUnit> {
         self.board.values().chain(self.bench.iter().flatten())
@@ -312,9 +357,13 @@ pub enum GameEvent {
     GoldChanged { player: PlayerId, gold: i64 },
     /// A player now has `amount` of a currency other than gold.
     CurrencyChanged { player: PlayerId, currency: String, amount: i64 },
+    /// A player used one of the game's own actions, and has paid for it.
+    ActionUsed { player: PlayerId, action: String, arg: i64 },
     XpChanged { player: PlayerId, level: u32, xp: u32 },
     UnitGained { player: PlayerId, uid: u32, unit: String },
     UnitSold { player: PlayerId, uid: u32, unit: String },
+    /// A unit was taken away without being sold (see [`Game::remove_unit`]).
+    UnitRemoved { player: PlayerId, uid: u32, unit: String },
     UnitUpgraded { player: PlayerId, uid: u32, unit: String, star: u8 },
     UnitMoved { player: PlayerId, uid: u32, to: Slot },
     ItemGained { player: PlayerId, item: String },
@@ -333,6 +382,8 @@ pub enum GameEvent {
     /// Index into [`Game::combats`] for the full record.
     CombatFinished { combat: usize, home: PlayerId, away: Opponent, winner: Option<Team> },
     PlayerDamaged { player: PlayerId, amount: i64, health: i64 },
+    /// A player got `amount` health back and now has `health`.
+    PlayerHealed { player: PlayerId, amount: i64, health: i64 },
     PlayerForfeited { player: PlayerId },
     PlayerEliminated { player: PlayerId, placement: u32 },
     GameOver { winner: PlayerId },
@@ -418,6 +469,8 @@ pub enum Grant {
     Item(String),
     Augment(String),
     Damage(i64),
+    /// Health back, up to what players start with.
+    Heal(i64),
     /// Some of a currency other than gold; negative takes it away.
     Currency { currency: String, amount: i64 },
 }
@@ -460,6 +513,7 @@ impl Game {
                 free_rerolls: 0,
                 stats: PlayerStats::default(),
                 wallet: rules.currencies.iter().map(|c| (c.id.clone(), c.starting.max(0))).collect(),
+                actions_used: BTreeMap::new(),
             })
             .collect();
         #[cfg(feature = "scripting")]
@@ -699,6 +753,7 @@ impl Game {
             }
             let p = &mut self.players[id.0 as usize];
             p.ready = false;
+            p.actions_used.clear();
             p.stats.rounds += 1;
             if p.shop_locked {
                 p.shop_locked = false;
@@ -773,6 +828,7 @@ impl Game {
             let grant = &augment.per_round;
             self.add_gold(id, grant.gold);
             self.add_xp(id, grant.xp);
+            self.heal_player(id, grant.health);
             for (currency, amount) in &grant.currencies {
                 self.add_currency(id, currency, *amount);
             }
@@ -855,6 +911,7 @@ impl Game {
         match command {
             Command::BuyUnit { slot } => self.buy_unit(id, slot),
             Command::SellUnit { uid } => self.sell_unit(id, uid),
+            Command::Action { id: action, arg } => self.use_action(id, &action, arg),
             Command::Reroll => {
                 if self.player(id).free_rerolls > 0 {
                     self.players[id.0 as usize].free_rerolls -= 1;
@@ -930,6 +987,35 @@ impl Game {
         Ok(())
     }
 
+    /// Carries out one of the game's own actions: checks the limit, the
+    /// target and the price, lets the handler refuse, then charges, hands
+    /// over what the action gives and reports it.
+    fn use_action(&mut self, id: PlayerId, action: &str, arg: i64) -> Result<(), CommandError> {
+        let content = self.content.clone();
+        let def = content.action(action).ok_or(CommandError::UnknownAction)?;
+        self.player(id).can_use(def)?;
+        if def.target == ActionTarget::Unit && !self.player(id).units().any(|u| i64::from(u.uid) == arg) {
+            return Err(CommandError::UnknownUnit);
+        }
+        if let Some(handler) = content.action_handler(action) {
+            handler(self, id, arg)?;
+        }
+        for price in &def.prices {
+            if price.currency == "gold" {
+                self.add_gold(id, -price.amount);
+                self.players[id.0 as usize].stats.gold_spent += price.amount;
+            } else {
+                self.add_currency(id, &price.currency, -price.amount);
+            }
+        }
+        for grant in &def.gives {
+            self.give(id, grant)?;
+        }
+        *self.players[id.0 as usize].actions_used.entry(action.to_string()).or_insert(0) += 1;
+        self.emit(GameEvent::ActionUsed { player: id, action: action.to_string(), arg });
+        Ok(())
+    }
+
     fn buy_unit(&mut self, id: PlayerId, slot: usize) -> Result<(), CommandError> {
         let content = self.content.clone();
         let p = self.player(id);
@@ -959,13 +1045,12 @@ impl Game {
         let slot = p.locate(uid).ok_or(CommandError::UnknownUnit)?;
         let unit = p.take(slot).unwrap();
         p.items.extend(unit.items.iter().cloned());
-        let cost = self.content.unit(&unit.unit).map(|u| u.cost as i64).unwrap_or(0);
-        let copies = self.copies_in(&unit);
+        let value = self.unit_value(&unit);
         self.return_to_pool(&unit);
         self.emit(GameEvent::UnitSold { player: id, uid, unit: unit.unit.clone() });
         self.players[id.0 as usize].stats.units_sold += 1;
         let refund = self.content.rules().sell_refund_permille as i64;
-        self.add_gold(id, cost * copies as i64 * refund / 1000);
+        self.add_gold(id, value * refund / 1000);
         Ok(())
     }
 
@@ -1120,23 +1205,30 @@ impl Game {
         if !p.alive {
             return Err(CommandError::Eliminated);
         }
+        self.give(id, &grant)?;
+        self.inputs.push(Input::Grant { player: id, grant });
+        self.run_hooks();
+        Ok(())
+    }
+
+    /// Hands a player what a grant describes, without recording it.
+    fn give(&mut self, id: PlayerId, grant: &Grant) -> Result<(), CommandError> {
         let content = self.content.clone();
-        match &grant {
+        match grant {
             Grant::Gold(n) => self.add_gold(id, *n),
             Grant::Xp(n) => self.add_xp(id, *n),
             Grant::Unit(unit) if content.unit(unit).is_some() => self.add_unit(id, unit, Vec::new()),
             Grant::Item(item) if content.item(item).is_some() => self.give_item(id, item),
             Grant::Augment(a) if content.augment(a).is_some() => self.give_augment(id, a),
             Grant::Damage(n) => self.damage_player(id, (*n).max(0)),
-            Grant::Currency { currency, amount } if content.currency(currency).is_some() => {
+            Grant::Heal(n) => self.heal_player(id, *n),
+            Grant::Currency { currency, amount } if currency == "gold" || content.currency(currency).is_some() => {
                 self.add_currency(id, currency, *amount);
             }
             Grant::Currency { .. } => return Err(CommandError::UnknownCurrency),
             Grant::Unit(_) => return Err(CommandError::UnknownUnit),
             Grant::Item(_) | Grant::Augment(_) => return Err(CommandError::UnknownItem),
         }
-        self.inputs.push(Input::Grant { player: id, grant });
-        self.run_hooks();
         Ok(())
     }
 
@@ -1191,15 +1283,18 @@ impl Game {
         self.emit(GameEvent::GoldChanged { player: id, gold });
     }
 
-    /// How much a player has of a currency other than gold.
+    /// How much a player has of a currency. `"gold"` is their gold.
     pub fn currency(&self, id: PlayerId, currency: &str) -> i64 {
-        self.player(id).wallet.get(currency).copied().unwrap_or(0)
+        self.player(id).balance(currency)
     }
 
-    /// Gives a player some of a currency other than gold, or takes it away
-    /// when negative (never below zero). Currencies the content does not
-    /// define are ignored.
+    /// Gives a player some of a currency, or takes it away when negative
+    /// (never below zero). `"gold"` is the same as [`Game::add_gold`].
+    /// Currencies the content does not define are ignored.
     pub fn add_currency(&mut self, id: PlayerId, currency: &str, amount: i64) {
+        if currency == "gold" {
+            return self.add_gold(id, amount);
+        }
         if amount == 0 || self.content.currency(currency).is_none() {
             return;
         }
@@ -1209,10 +1304,13 @@ impl Game {
         self.emit(GameEvent::CurrencyChanged { player: id, currency: currency.to_string(), amount });
     }
 
-    /// Takes `cost` of a currency other than gold from a player, or fails
-    /// and takes nothing if they have less. This is how a round type or a
-    /// hook charges for something.
+    /// Takes `cost` of a currency from a player, or fails and takes nothing
+    /// if they have less. This is how a round type or a hook charges for
+    /// something. `"gold"` spends gold.
     pub fn spend_currency(&mut self, id: PlayerId, currency: &str, cost: i64) -> Result<(), CommandError> {
+        if currency == "gold" {
+            return self.spend(id, cost.max(0));
+        }
         let have = self.currency(id, currency);
         if self.content.currency(currency).is_none() {
             return Err(CommandError::UnknownCurrency);
@@ -1516,6 +1614,42 @@ impl Game {
         p.stats.damage_taken += amount;
         let health = p.health;
         self.emit(GameEvent::PlayerDamaged { player: id, amount, health });
+    }
+
+    /// Gives a player health back, up to what players start with
+    /// (`GameRules::starting_health`). Does nothing for a player who is
+    /// already there.
+    pub fn heal_player(&mut self, id: PlayerId, amount: i64) {
+        let most = self.content.rules().starting_health;
+        let p = &mut self.players[id.0 as usize];
+        let amount = amount.min(most - p.health);
+        if amount <= 0 {
+            return;
+        }
+        p.health += amount;
+        let health = p.health;
+        self.emit(GameEvent::PlayerHealed { player: id, amount, health });
+    }
+
+    /// Takes a unit away from a player without paying for it: a sacrifice,
+    /// a trade, a unit that leaves. Its items go back to the player's
+    /// inventory and its copies back to the pool. Returns the unit, or
+    /// `None` if the player has no unit with that `uid`.
+    pub fn remove_unit(&mut self, id: PlayerId, uid: u32) -> Option<OwnedUnit> {
+        let p = &mut self.players[id.0 as usize];
+        let slot = p.locate(uid)?;
+        let unit = p.take(slot)?;
+        p.items.extend(unit.items.iter().cloned());
+        self.return_to_pool(&unit);
+        self.emit(GameEvent::UnitRemoved { player: id, uid, unit: unit.unit.clone() });
+        Some(unit)
+    }
+
+    /// What a unit is worth: its price times the copies merged into it.
+    /// Selling it pays this times `GameRules::sell_refund_permille`.
+    pub fn unit_value(&self, unit: &OwnedUnit) -> i64 {
+        let cost = self.content.unit(&unit.unit).map(|u| u.cost as i64).unwrap_or(0);
+        cost * self.copies_in(unit) as i64
     }
 
     /// Updates a player's streak after a fight against another player and

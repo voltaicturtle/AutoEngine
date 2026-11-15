@@ -37,6 +37,7 @@ check the rules.
 | `starting_health` | 100 | each player's health at the start |
 | `economy` | see below | gold and experience |
 | `currencies` | empty | what players hold besides gold, added with `.currency(CurrencyDef)`; see [Currencies](#currencies) |
+| `actions` | empty | things players can do during planning besides the built-in commands, added with `.action(ActionDef)`; see [Actions](#actions) |
 | `sell_refund_permille` | 1000 | the share of a unit's price that selling it gives back, in thousandths. 1000 is all of it, 500 is half |
 | `levels` | see below | one entry per player level |
 | `pool_sizes` | 1: 29, 2: 22, 3: 18, 4: 12, 5: 10 | copies of each unit in the shared pool, by cost |
@@ -132,6 +133,88 @@ react. Scripts use `game.amount`, `game.give` and `game.take` (see
 the rules, and the cheat console has `give CURRENCY N`. A player's balances
 are in `Player::wallet`, and the client lists them under the gold.
 
+These three calls take `"gold"` as well, so code that charges a price does
+not need a special case for it.
+
+## Actions
+
+Buying, selling, rerolling and the rest are built in. An action is
+something else a player can do during planning, defined by the game: trade
+a currency for experience, pay for a blessing, sacrifice a unit. The client
+shows every action as a button with its price, and bots use the ones that
+only cost a currency other than gold.
+
+```rust
+use std::sync::Arc;
+use autoengine::content::{ActionDef, ContentSet, CurrencyDef};
+use autoengine::game::{Command, CommandError, Game, Grant, PlayerId};
+
+let content = ContentSet::builder()
+    .currency(CurrencyDef::new("favor", "Favor").starting(3))
+    // Data only: pay the price, get what it gives.
+    .action(ActionDef::new("petition", "Petition").description("Trade 3 favor for 4 experience.").costs("favor", 3).gives(Grant::Xp(4)))
+    // With code: the player drops a unit on the button, and the handler
+    // decides what happens.
+    .action(ActionDef::new("offering", "Offering").description("Give up a unit for favor.").on_unit().per_round(1))
+    .action_handler("offering", |game, player, uid| {
+        let unit = game.remove_unit(player, uid as u32).ok_or(CommandError::UnknownUnit)?;
+        let worth = game.unit_value(&unit);
+        game.add_currency(player, "favor", worth);
+        Ok(())
+    })
+    .build()
+    .unwrap();
+
+let mut game = Game::new(Arc::new(content), 1, &["a", "b"]);
+game.begin_round().unwrap();
+let me = PlayerId(0);
+game.apply(me, Command::Action { id: "petition".into(), arg: 0 }).unwrap();
+assert_eq!(game.currency(me, "favor"), 0);
+// Not enough favor for a second one, so nothing happens.
+assert!(game.apply(me, Command::Action { id: "petition".into(), arg: 0 }).is_err());
+```
+
+| `ActionDef` call | Meaning |
+| --- | --- |
+| `ActionDef::new(id, name)` | a free action that does nothing yet |
+| `.description(text)` | what clients show when the mouse is over it |
+| `.costs(currency, n)` | adds to the price. `"gold"` or a currency's id |
+| `.gives(Grant)` | something the player gets each time; see [Grants](events.md#grants) |
+| `.per_round(n)` | how often one player may use it in a round |
+| `.on_unit()` | the action needs one of the player's own units. `arg` is the unit's `uid`, and the engine refuses a unit the player does not own |
+
+When a player uses an action the engine checks the limit, the target and
+the price, runs the handler if there is one, takes the price, hands over
+what the action gives and sends an `ActionUsed` event. So an action can
+work in three ways, alone or together:
+
+- **Data.** `.gives(...)` needs no code.
+- **A Rust handler**, added with `.action_handler(id, |game, player, arg| ...)`.
+  It can refuse by returning an error, usually
+  `CommandError::CannotUse("why".into())`, and then the player is not
+  charged. A handler should refuse before it changes anything.
+- **Hooks and scripts** reacting to `ActionUsed` in `on_event`. They run
+  after the price is paid and cannot refuse.
+
+`arg` is a number that travels with the command. For an action on a unit
+it is the unit's `uid`. For other actions the bundled client sends 0, and a
+game with its own client can use it for anything.
+
+For a client, `Player::can_use(&action)` says whether a player can use an
+action right now as far as the limit and the price go, and
+`Player::actions_used` holds how often each was used this round.
+
+## Helpers for game code
+
+Round types, hooks and action handlers change the game through `Game`.
+Next to `add_gold`, `add_xp`, `give_item`, `add_unit` and `damage_player`:
+
+| On `Game` | Does |
+| --- | --- |
+| `heal_player(player, n)` | gives health back, up to `starting_health` |
+| `remove_unit(player, uid)` | takes a unit away without paying for it. Its items go back to the inventory and its copies to the pool. Returns the unit |
+| `unit_value(&unit)` | what a unit is worth: its price times the copies merged into it |
+
 ## Levels
 
 `levels` has one `LevelRule` per player level, starting at level 1:
@@ -215,6 +298,7 @@ assert_eq!(content.name_in(Some("fr"), "ashen_hound").as_deref(), Some("Chien de
 | `unit.ID.ability_2`, `unit.ID.ability_2_description` | the same for a second ability, and so on |
 | `resource.ID.name` | a [resource](resources.md)'s name |
 | `currency.ID.name` | a [currency](#currencies)'s name |
+| `action.ID.name`, `action.ID.description` | an [action](#actions)'s name and description |
 | `item.ID.name`, `item.ID.description` | an item's name and description |
 | `trait.ID.name`, `trait.ID.description` | a trait's name and description |
 | `augment.ID.name`, `augment.ID.description` | an augment's name and description |

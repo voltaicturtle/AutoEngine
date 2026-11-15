@@ -117,7 +117,11 @@ pub(crate) fn draw_planning(app: &mut App, layout: &Layout) {
             app.drag = Some(Drag::Item(i));
         }
         draw_shop(app, layout, &player);
+        let hovered_action = draw_actions(app, layout, &player, mouse);
         handle_drop(app, layout, &player, mouse);
+        if let Some(action) = hovered_action.filter(|_| app.drag.is_none()) {
+            draw_action_tooltip(app, &action, &player, mouse);
+        }
     }
 
     // Whatever is being dragged follows the mouse.
@@ -321,6 +325,99 @@ pub(crate) fn draw_shop(app: &mut App, layout: &Layout, player: &Player) {
     if lock || app.pressed(Action::LockShop) {
         app.command(Command::SetShopLock { locked: !player.shop_locked });
     }
+}
+
+/// A price as players read it: `3 Favor + 2g`.
+fn price_text(app: &App, prices: &[autoengine::content::Price]) -> String {
+    let parts: Vec<String> = prices
+        .iter()
+        .map(|price| match price.currency.as_str() {
+            "gold" => format!("{}g", price.amount),
+            id => format!("{} {}", price.amount, app.net.state.text("currency", id, "name")),
+        })
+        .collect();
+    parts.join(" + ")
+}
+
+/// The game's own actions, as a row of buttons on the right of the item
+/// row. An action aimed at a unit is used by dropping the unit on it.
+/// Returns the action under the mouse.
+fn draw_actions(app: &mut App, layout: &Layout, player: &Player, mouse: Vec2) -> Option<String> {
+    // Rightmost first, so the first action ends up on the left.
+    let buttons: Vec<(String, String, bool, ActionTarget)> = {
+        let content = app.net.state.content.as_ref()?;
+        let button = |def: &autoengine::content::ActionDef| {
+            let name = app.net.state.text("action", &def.id, "name");
+            let text = if def.prices.is_empty() { name } else { format!("{name} ({})", price_text(app, &def.prices)) };
+            (def.id.clone(), text, player.can_use(def).is_ok(), def.target)
+        };
+        content.actions().iter().rev().map(button).collect()
+    };
+    let dragged_unit = match app.drag {
+        Some(Drag::Unit(uid)) => Some(uid),
+        _ => None,
+    };
+    let (y, h) = (layout.item_slot(0).y, 36.0);
+    let mut right = layout.shop_area().x + layout.shop_area().w;
+    let mut hovered = None;
+    let mut used = None;
+    for (id, text, enabled, target) in buttons {
+        let w = theme::text_width(&text, 19.0) + 24.0;
+        let x = right - w;
+        right = x - 6.0;
+        let over = Rect::new(x, y, w, h).contains(mouse);
+        match target {
+            ActionTarget::None => {
+                if button(&text, x, y, w, h, enabled && app.drag.is_none()) {
+                    used = Some(Command::Action { id: id.clone(), arg: 0 });
+                }
+            }
+            ActionTarget::Unit => {
+                // Lights up while a unit is held over it.
+                let ready = enabled && dragged_unit.is_some() && over;
+                draw_rectangle(x, y, w, h, if ready { Color::new(0.30, 0.38, 0.52, 1.0) } else { ui().panel_light });
+                draw_rectangle_lines(x, y, w, h, 1.0, if enabled { ui().gold } else { ui().muted });
+                text_centered(&text, x + w / 2.0, y + h / 2.0 + 6.0, 19.0, if enabled { ui().text } else { ui().muted });
+                if let Some(uid) = dragged_unit.filter(|_| ready && is_mouse_button_released(MouseButton::Left)) {
+                    used = Some(Command::Action { id: id.clone(), arg: i64::from(uid) });
+                }
+            }
+        }
+        if over {
+            hovered = Some(id);
+        }
+    }
+    if let Some(command) = used {
+        // The unit was dropped on the button, not on whatever is behind it.
+        app.drag = None;
+        app.command(command);
+    }
+    hovered
+}
+
+/// What an action does and why it cannot be used, for the mouse over it.
+fn draw_action_tooltip(app: &App, action: &str, player: &Player, at: Vec2) {
+    let state = &app.net.state;
+    let Some(def) = state.content.as_ref().and_then(|c| c.action(action)) else { return };
+    let mut lines = Vec::new();
+    let description = state.description("action", action);
+    if !description.is_empty() {
+        lines.push((description, ui().muted));
+    }
+    if !def.prices.is_empty() {
+        lines.push((format!("Costs {}", price_text(app, &def.prices)), ui().gold));
+    }
+    if def.target == ActionTarget::Unit {
+        lines.push(("Drop one of your units here".into(), ui().text));
+    }
+    if let Some(times) = def.per_round {
+        let left = times.saturating_sub(player.actions_used.get(action).copied().unwrap_or(0));
+        lines.push((format!("{left} of {times} left this round"), ui().muted));
+    }
+    if let Err(why) = player.can_use(def) {
+        lines.push((why.to_string(), ui().bad));
+    }
+    draw_tooltip(&state.text("action", action, "name"), &lines, at);
 }
 
 /// Turns the end of a drag into a command.

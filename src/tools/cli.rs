@@ -224,14 +224,17 @@ fn check(spec: &GameSpec, args: &mut Args) -> Result<(), String> {
     // Mistakes that stop the content building are errors; warnings are not.
     let content = spec.load()?;
     println!(
-        "{}: {} units, {} traits, {} items, {} augments, {} rounds, {} scripts",
+        "{}: {} units, {} traits, {} items, {} augments, {} rounds, {} scripts, {} resources, {} currencies, {} actions",
         spec.name,
         content.units().count(),
         content.traits().count(),
         content.items().count(),
         content.augments().count(),
         content.schedule().rounds.len(),
-        content.scripts().len()
+        content.scripts().len(),
+        content.resources().len(),
+        content.currencies().len(),
+        content.actions().len()
     );
     let warnings = tools::lint(&content, spec.assets.as_deref());
     for warning in &warnings {

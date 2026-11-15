@@ -53,6 +53,7 @@ as `Bonus::team()`.
 | `xp` | experience |
 | `free_rerolls` | rerolls that cost no gold. They are used before gold, and unused ones carry over |
 | `components` | random component items |
+| `health` | health back, up to what players start with |
 
 ## How players get augments
 

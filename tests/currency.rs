@@ -94,7 +94,7 @@ fn currencies_are_validated_and_can_be_translated() {
     assert!(err(base().currency(CurrencyDef::new("", "Nothing")).build()).contains("needs an id"));
     // Adding the same id again replaces it instead of clashing.
     let twice = base().currency(CurrencyDef::new("souls", "Souls")).currency(CurrencyDef::new("souls", "Spirits").per_round(1)).build().unwrap();
-    assert_eq!(twice.currencies().len(), 1);
+    assert_eq!(twice.currencies().iter().filter(|c| c.id == "souls").count(), 1);
     assert_eq!(twice.currency("souls").unwrap().name, "Spirits");
     // An augment that pays a currency nobody defined is a typo.
     let typo = with_souls().into_builder().augment(AugmentDef::new("reaper", "Reaper").per_round(RoundGrant::default().currency("soul", 3))).build();

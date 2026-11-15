@@ -1,7 +1,7 @@
 //! The sample game, written in Rust with the content builders.
 //!
 //! It is small and original: eight shop units, a summon and a neutral
-//! monster, a second resource next to mana, five traits, six items (three components and what they combine
+//! monster, a second resource next to mana, a second currency next to gold with two actions that use it, five traits, six items (three components and what they combine
 //! into), seven augments, a round schedule with every built-in round kind and
 //! a scripted one, a sample fight and a few content tests. A game built on
 //! the engine defines the same things the same way, in its own crate.
@@ -10,10 +10,11 @@
 //! folder; the content only names them.
 
 use crate::content::{
-    AugmentDef, BoardUnit, Bonus, ChoiceOffer, Consumable, ContentSet, ItemDef, MatchSetup, RoundDef, RoundKindDef, Schedule,
+    ActionDef, AugmentDef, BoardUnit, Bonus, ChoiceOffer, Consumable, ContentSet, CurrencyDef, ItemDef, MatchSetup, RoundDef, RoundKindDef, Schedule,
     TeamSetup, TraitDef, UnitDef,
 };
 use crate::effect::{Ability, Amount, Anchor, Cost, DamageKind, Effect, Passive, ScaleBy, Selector, Trigger, Who};
+use crate::game::{CommandError, Grant};
 use crate::resource::ResourceDef;
 use crate::stats::Stat::{self, *};
 use crate::tools::cli::GameSpec;
@@ -31,6 +32,22 @@ pub fn spec() -> GameSpec {
 pub fn content() -> ContentSet {
     ContentSet::builder()
         .resource(fury())
+        .currency(favor())
+        .action(
+            ActionDef::new("petition", "Petition").description("Trade 3 favor for 4 experience.").costs("favor", 3).gives(Grant::Xp(4)),
+        )
+        .action(
+            ActionDef::new("offering", "Offering")
+                .description("Give up a unit for as much favor as it is worth. Once a round.")
+                .on_unit()
+                .per_round(1),
+        )
+        .action_handler("offering", |game, player, uid| {
+            let unit = u32::try_from(uid).ok().and_then(|uid| game.remove_unit(player, uid)).ok_or(CommandError::UnknownUnit)?;
+            let worth = game.unit_value(&unit);
+            game.add_currency(player, "favor", worth);
+            Ok(())
+        })
         .units(units())
         .trait_defs(traits())
         .items(items())
@@ -50,6 +67,12 @@ pub const MAX_FURY: Stat = Stat::custom("max_fury");
 /// runs on it.
 pub fn fury() -> ResourceDef {
     ResourceDef::new("fury", "Fury", MAX_FURY).per_attack(12).per_kill(25).per_second(-3).color([235, 120, 50])
+}
+
+/// A second currency next to gold, to show how one is made: every player
+/// gets one favor a round, and the two actions above earn and spend it.
+pub fn favor() -> CurrencyDef {
+    CurrencyDef::new("favor", "Favor").per_round(1).color([230, 200, 120])
 }
 
 /// Two boards to fight each other. Positions are `(column, row)` from each

@@ -56,7 +56,7 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 
 use autoengine::combat::UnitId;
-use autoengine::content::UnitDef;
+use autoengine::content::{ActionTarget, UnitDef};
 use autoengine::game::{Command, Opponent, OwnedUnit, Player, PlayerId, Slot};
 use autoengine::hex::Hex;
 use autoengine::net::{GameClient, Status};
@@ -787,7 +787,7 @@ fn draw_top_bar(app: &App) {
         };
         let x = w - 520.0;
         label(&format!("Health {}", me.health.max(0)), x, 29.0, 22.0, if me.health > 30 { ui().good } else { ui().bad });
-        label(&format!("Gold {}", me.gold), x + 140.0, 29.0, 22.0, ui().gold);
+        label(&format!("Gold {}", me.gold), x + 140.0, if app.net.state.content.as_ref().is_some_and(|c| !c.currencies().is_empty()) { 24.0 } else { 29.0 }, 22.0, ui().gold);
         // The game's other currencies, in a smaller line under the gold.
         if let Some(content) = &app.net.state.content {
             let language = app.net.state.language.as_deref();
@@ -796,8 +796,8 @@ fn draw_top_bar(app: &App) {
                 let name = content.text(language, "currency", &currency.id, "name").unwrap_or_default();
                 let text = format!("{name} {}", me.wallet.get(&currency.id).copied().unwrap_or(0));
                 let [r, g, b] = currency.color.unwrap_or([200, 200, 210]);
-                label(&text, at, 44.0, 14.0, Color::from_rgba(r, g, b, 255));
-                at += measure_text(&text, None, 14, 1.0).width + 14.0;
+                label(&text, at, 41.0, 13.0, Color::from_rgba(r, g, b, 255));
+                at += theme::text_width(&text, 13.0) + 12.0;
             }
         }
         label(&format!("Level {}  ({xp})", me.level), x + 250.0, 29.0, 22.0, ui().text);

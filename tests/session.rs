@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use autoengine::content::ContentSet;
-use autoengine::game::{Command, GameEvent, PlayerId, Slot};
+use autoengine::game::{Command, GameEvent, Opponent, PlayerId, Slot};
 use autoengine::net::{Connection, serve};
 use autoengine::protocol::{ClientMsg, GameView, PROTOCOL_VERSION, ServerMsg, ViewPhase, decode, encode};
 use autoengine::session::{ConnId, Session, SessionConfig};
@@ -350,7 +350,8 @@ fn a_client_can_play_over_tcp() {
             }
         }
         if let ServerMsg::CombatSeed { record, .. } = message {
-            assert_eq!(record.home, PlayerId(0));
+            // Which of the two is at home is up to the dice.
+            assert!(record.home == PlayerId(0) || record.away == Opponent::Player(PlayerId(0)));
             assert!(record.events.is_empty(), "the log is left out; the client fights it again");
             fights += 1;
         }
