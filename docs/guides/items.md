@@ -46,6 +46,7 @@ assert_eq!(content.combine_items("ember_core", "whetstone").unwrap().id, "cinder
 | `.passive(Passive)` | a passive the holder gets. Can be called more than once |
 | `.grants_trait(id)` | the holder counts as having this trait, for trait counts, `AlliesWithTag`, `HasTag` and the like |
 | `.recipe(a, b)` | the two items that combine into this one. Order doesn't matter, and `a` and `b` may be the same item |
+| `.unique()` | a unit can hold only one of it |
 | `.consumable(Consumable)` | makes the item single-use (see below) |
 
 ## Components and recipes
@@ -75,6 +76,7 @@ Giving a single-use item to a unit uses it up instead of equipping it:
 | `Duplicate` | gives the player another one-star copy of the unit, from the pool |
 | `Reforge` | swaps each of the unit's items for a random other item of the same kind: components for components, finished items for finished items |
 | `Gold(n)` | gives `n` gold. Which unit it is given to doesn't matter |
+| `Give(Grant)` | hands the player anything a [grant](events.md#grants) can: a currency, experience, health, an item, an augment. Which unit it is given to doesn't matter |
 
 If it can't do anything, the item is kept and the command fails with
 `CommandError::CannotUse`, saying why (for example "that unit holds no

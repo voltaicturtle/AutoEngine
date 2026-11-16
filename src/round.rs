@@ -62,8 +62,8 @@ pub trait RoundType: Send {
 pub(crate) fn builtin(def: &RoundKindDef) -> Box<dyn RoundType> {
     match def {
         RoundKindDef::Pvp => Box::new(PvpRound),
-        RoundKindDef::Pve { enemies, gold, items } => {
-            Box::new(PveRound { enemies: enemies.clone(), gold: *gold, items: *items })
+        RoundKindDef::Pve { enemies, gold, items, rewards } => {
+            Box::new(PveRound { enemies: enemies.clone(), gold: *gold, items: *items, rewards: rewards.clone() })
         }
         RoundKindDef::Draft { extra, max_cost } => Box::new(DraftRound {
             extra: *extra,
@@ -186,6 +186,7 @@ pub struct PveRound {
     enemies: Vec<BoardUnit>,
     gold: i64,
     items: u32,
+    rewards: Vec<crate::game::Grant>,
 }
 
 impl RoundType for PveRound {
@@ -200,6 +201,10 @@ impl RoundType for PveRound {
                 game.add_gold(player, self.gold);
                 for _ in 0..self.items {
                     game.give_random_component(player);
+                }
+                for reward in &self.rewards {
+                    // Checked when the content was built, so this cannot fail.
+                    let _ = game.give(player, reward);
                 }
             } else {
                 let damage = game.loss_damage(result.survivors);

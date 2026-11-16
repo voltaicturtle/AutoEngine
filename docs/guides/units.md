@@ -45,6 +45,7 @@ assert_eq!(duelist.cost, 3);
 | `.passive(Passive)` | an effect that fires on a trigger. Can be called more than once |
 | `.targeting(Targeting)` | which enemy it goes after (see below) |
 | `.attack_kind(DamageKind)` | the [type of damage](damage.md) its basic attacks deal, instead of physical |
+| `.pool_size(n)` | how many copies the shared pool holds, instead of the number its cost gives. `.pool_size(1)` makes a unit only one player can own |
 | `.summon_only()` | keeps it out of shops and the pool, for summons and neutral monsters |
 | `.model(file, scale_percent)` | the 3D model clients draw, relative to the assets folder, and its height as a percentage of a standard unit. The engine itself never reads it |
 

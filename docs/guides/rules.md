@@ -214,6 +214,7 @@ Next to `add_gold`, `add_xp`, `give_item`, `add_unit` and `damage_player`:
 | `heal_player(player, n)` | gives health back, up to `starting_health` |
 | `remove_unit(player, uid)` | takes a unit away without paying for it. Its items go back to the inventory and its copies to the pool. Returns the unit |
 | `unit_value(&unit)` | what a unit is worth: its price times the copies merged into it |
+| `give(player, &Grant)` | hands over what a [grant](events.md#grants) describes, without recording it as an outside input |
 
 ## Levels
 

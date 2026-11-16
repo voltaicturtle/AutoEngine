@@ -485,7 +485,8 @@ impl Game {
             .units()
             .filter(|u| u.in_shop)
             .map(|u| {
-                let size = rules.pool_sizes.get(&u.cost).copied().unwrap_or(rules.default_pool_size);
+                let by_cost = rules.pool_sizes.get(&u.cost).copied().unwrap_or(rules.default_pool_size);
+                let size = u.pool_size.unwrap_or(by_cost);
                 (u.id.clone(), size)
             })
             .collect();
@@ -1099,7 +1100,11 @@ impl Game {
         if let Some(consumable) = content.item(&item_id).and_then(|i| i.consumable.clone()) {
             return self.use_item(id, item, uid, &consumable);
         }
+        let unique = content.item(&item_id).is_some_and(|i| i.unique);
         let unit = p.unit_mut(uid).ok_or(CommandError::UnknownUnit)?;
+        if unique && unit.items.contains(&item_id) {
+            return Err(CommandError::CannotUse("a unit can hold only one of these".into()));
+        }
         // A component may be added to a full unit if it combines with one
         // the unit already holds.
         let combines = unit.items.iter().any(|held| content.combine_items(held, &item_id).is_some());
@@ -1167,6 +1172,7 @@ impl Game {
                 self.players[id.0 as usize].unit_mut(uid).expect("unit exists").items = reforged;
             }
             Consumable::Gold(n) => self.add_gold(id, *n),
+            Consumable::Give(grant) => self.give(id, grant)?,
         }
         let item_id = self.players[id.0 as usize].items.remove(item);
         self.emit(GameEvent::ItemUsed { player: id, uid, item: item_id });
@@ -1211,8 +1217,10 @@ impl Game {
         Ok(())
     }
 
-    /// Hands a player what a grant describes, without recording it.
-    fn give(&mut self, id: PlayerId, grant: &Grant) -> Result<(), CommandError> {
+    /// Hands a player what a grant describes, without recording it. This
+    /// is for round types, hooks and action handlers, which run again when
+    /// a game is replayed; from outside the rules use [`Game::grant`].
+    pub fn give(&mut self, id: PlayerId, grant: &Grant) -> Result<(), CommandError> {
         let content = self.content.clone();
         match grant {
             Grant::Gold(n) => self.add_gold(id, *n),

@@ -259,6 +259,9 @@ pub(crate) fn draw_item_tooltip(app: &App, item: &str, at: Vec2) {
     if def.consumable.is_some() {
         lines.push(("Used up when given to a unit".into(), ui().gold));
     }
+    if def.unique {
+        lines.push(("A unit can hold only one".into(), ui().gold));
+    }
     draw_tooltip(&state.display_name(item), &lines, at);
 }
 

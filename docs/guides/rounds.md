@@ -49,7 +49,7 @@ standing.
 | Kind | Made with | What happens |
 | --- | --- | --- |
 | `pvp` | `RoundKindDef::pvp()` | players are paired up and fight. The loser takes damage, and a draw hurts both. With an odd number of players, the one left over fights a copy (a "ghost") of another player's board, and the copied player isn't affected. Pairings avoid recent opponents (`GameRules::avoid_rematch_rounds`) |
-| `pve` | `RoundKindDef::pve([units]).gold(n).items(n)` | everyone fights the same neutral board. Winners get the gold and `n` random components, and losers take damage |
+| `pve` | `RoundKindDef::pve([units]).gold(n).items(n).reward(Grant)` | everyone fights the same neutral board. Winners get the gold, `n` random components and every [grant](events.md#grants) added with `.reward(...)` (a currency, experience, health, a named item or augment), and losers take damage |
 | `draft` | `RoundKindDef::draft(extra).max_cost(c)` | one shared set of units, each carrying a random component, is offered to everyone: one per player plus `extra`, at most cost `c`. Players pick one each in turn, lowest health first. Units nobody picks go back to the pool |
 | `choice` | `RoundKindDef::choice(n, ChoiceOffer::Augments)` or `ChoiceOffer::Items` | each player privately picks one of `n` augments (ones they don't have) or items. Players can reroll the options `GameRules::choice_rerolls` times |
 | custom | `RoundKindDef::custom("kind").param("name", value)` | a round type the game defines, as a script or in Rust (below). `param` passes numbers to it |

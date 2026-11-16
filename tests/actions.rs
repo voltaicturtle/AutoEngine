@@ -224,3 +224,55 @@ fn bots_spend_currencies_that_have_no_other_use() {
     assert!(used > 0, "favor should have been spent on petitions");
     assert!(g.players().iter().all(|p| p.wallet["favor"] < 3 || !p.alive));
 }
+
+#[test]
+fn pve_rounds_and_single_use_items_can_give_any_grant() {
+    use autoengine::content::{BoardUnit, Consumable, ItemDef, RoundDef, RoundKindDef, Schedule};
+    let golem = BoardUnit::new("moss_golem", (3, 4));
+    let hunt = RoundKindDef::pve([golem]).gold(1).reward(Grant::Currency { currency: "souls".into(), amount: 2 }).reward(Grant::Xp(1));
+    let build = |hunt: RoundKindDef| {
+        base()
+            .item(ItemDef::new("soul_jar", "Soul Jar").consumable(Consumable::Give(Grant::Currency { currency: "souls".into(), amount: 3 })))
+            .schedule(Schedule { rounds: vec![RoundDef::new("hunt", 1, hunt)], repeat_from: 0 })
+            .build()
+    };
+    let mut g = start(build(hunt).unwrap());
+    // Only the winner is rewarded.
+    g.add_unit(P0, "ironbark_warden", vec![]);
+    let uid = g.player(P0).bench.iter().flatten().last().unwrap().uid;
+    g.apply(P0, Command::MoveUnit { uid, to: autoengine::game::Slot::Board(3, 4) }).unwrap();
+    g.finish_round().unwrap();
+    assert_eq!((g.currency(P0, "souls"), g.currency(P1, "souls")), (7, 5));
+    // A single-use item hands over its grant and is gone.
+    g.begin_round().unwrap();
+    g.give_item(P0, "soul_jar");
+    let item = g.player(P0).items.iter().position(|i| i == "soul_jar").unwrap();
+    g.apply(P0, Command::EquipItem { item, uid }).unwrap();
+    assert_eq!(g.currency(P0, "souls"), 10);
+    assert!(!g.player(P0).items.contains(&"soul_jar".to_string()));
+
+    // Rewards are checked like every other id.
+    let typo = RoundKindDef::pve([BoardUnit::new("moss_golem", (3, 4))]).reward(Grant::Currency { currency: "sols".into(), amount: 2 });
+    let message = build(typo).err().unwrap().to_string();
+    assert!(message.contains("round `hunt` gives unknown currency `sols`") && message.contains("souls"), "{message}");
+}
+
+#[test]
+fn a_unique_item_fits_once_and_a_unit_can_set_its_own_pool_size() {
+    use autoengine::content::{ItemDef, UnitDef};
+    let content = base()
+        .item(ItemDef::new("crown", "Crown").unique())
+        .unit(UnitDef::new("lone_king", "Lone King").cost(1).pool_size(1))
+        .build()
+        .unwrap();
+    let mut g = start(content);
+    assert_eq!(g.pool_count("lone_king") + g.players().iter().flat_map(|p| p.shop.iter().flatten()).filter(|u| *u == "lone_king").count() as u32, 1);
+    g.add_unit(P0, "lone_king", vec![]);
+    let uid = g.player(P0).bench.iter().flatten().last().unwrap().uid;
+    g.give_item(P0, "crown");
+    g.give_item(P0, "crown");
+    g.apply(P0, Command::EquipItem { item: 0, uid }).unwrap();
+    assert_eq!(g.apply(P0, Command::EquipItem { item: 0, uid }), Err(CommandError::CannotUse("a unit can hold only one of these".into())));
+    assert_eq!(g.player(P0).unit(uid).unwrap().items, vec!["crown".to_string()]);
+    assert_eq!(g.player(P0).items, vec!["crown".to_string()]);
+}

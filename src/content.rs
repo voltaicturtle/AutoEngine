@@ -90,6 +90,10 @@ pub struct UnitDef {
     /// The type of damage its basic attacks deal.
     #[serde(default = "physical")]
     pub attack_kind: DamageKind,
+    /// How many copies the shared pool holds, instead of the number
+    /// `GameRules::pool_sizes` gives units of its cost.
+    #[serde(default)]
+    pub pool_size: Option<u32>,
 }
 
 fn physical() -> DamageKind {
@@ -131,6 +135,7 @@ impl UnitDef {
             model: None,
             targeting: crate::effect::Targeting::Nearest,
             attack_kind: DamageKind::Physical,
+            pool_size: None,
         }
     }
 
@@ -181,6 +186,13 @@ impl UnitDef {
 
     pub fn passive(mut self, passive: Passive) -> Self {
         self.passives.push(passive);
+        self
+    }
+
+    /// Sets how many copies of the unit the shared pool holds, whatever
+    /// its cost: `.pool_size(1)` for a unit only one player can own.
+    pub fn pool_size(mut self, copies: u32) -> Self {
+        self.pool_size = Some(copies);
         self
     }
 
@@ -317,6 +329,9 @@ pub struct ItemDef {
     /// equipping it, and the item is gone.
     #[serde(default)]
     pub consumable: Option<Consumable>,
+    /// A unit can hold only one of it.
+    #[serde(default)]
+    pub unique: bool,
 }
 
 /// What a single-use item does when it is given to a unit.
@@ -331,6 +346,9 @@ pub enum Consumable {
     Reforge,
     /// Gold for the player; the unit does not matter.
     Gold(i64),
+    /// Anything a [`Grant`] can hand the player: a currency, experience,
+    /// health, an item, an augment. The unit does not matter.
+    Give(Grant),
 }
 
 impl ItemDef {
@@ -344,12 +362,19 @@ impl ItemDef {
             grants_traits: Vec::new(),
             recipe: None,
             consumable: None,
+            unique: false,
         }
     }
 
     /// What it does, for players to read.
     pub fn description(mut self, text: impl Into<String>) -> Self {
         self.description = text.into();
+        self
+    }
+
+    /// Lets a unit hold only one of this item.
+    pub fn unique(mut self) -> Self {
+        self.unique = true;
         self
     }
 
@@ -802,6 +827,10 @@ pub enum RoundKindDef {
         /// Number of random component items.
         #[serde(default)]
         items: u32,
+        /// Anything else winning gives: a currency, experience, health, a
+        /// named item or augment.
+        #[serde(default)]
+        rewards: Vec<Grant>,
     },
     /// A shared draft: one pool of units is offered to everyone and players
     /// pick in turn, lowest health first.
@@ -919,7 +948,7 @@ impl RoundKindDef {
     /// Everyone fights this neutral board. Add rewards with
     /// [`gold`](Self::gold) and [`items`](Self::items).
     pub fn pve(enemies: impl IntoIterator<Item = BoardUnit>) -> Self {
-        RoundKindDef::Pve { enemies: enemies.into_iter().collect(), gold: 0, items: 0 }
+        RoundKindDef::Pve { enemies: enemies.into_iter().collect(), gold: 0, items: 0, rewards: Vec::new() }
     }
 
     /// Gold for winning a [`RoundKindDef::Pve`] round. Other kinds are
@@ -935,6 +964,16 @@ impl RoundKindDef {
     pub fn items(mut self, count: u32) -> Self {
         if let RoundKindDef::Pve { items, .. } = &mut self {
             *items = count;
+        }
+        self
+    }
+
+    /// Something else for winning a [`RoundKindDef::Pve`] round:
+    /// `.reward(Grant::Xp(4))`, `.reward(Grant::Heal(5))`, a currency, a
+    /// named item or an augment. Call it once per reward.
+    pub fn reward(mut self, grant: Grant) -> Self {
+        if let RoundKindDef::Pve { rewards, .. } = &mut self {
+            rewards.push(grant);
         }
         self
     }
@@ -1814,6 +1853,38 @@ impl ContentSet {
             }
         }
         let currency_ids = || -> Vec<String> { std::iter::once("gold".to_string()).chain(r.currencies.iter().map(|c| c.id.clone())).collect() };
+        // Whatever hands out a grant must name things that exist.
+        let check_grant = |owner: &str, grant: &Grant| {
+            match grant {
+                Grant::Unit(id) if !self.units.contains_key(id) => {
+                    return invalid(format!("{owner} gives unknown unit `{id}`{}", suggestion(id, self.units.keys())));
+                }
+                Grant::Item(id) if !self.items.contains_key(id) => {
+                    return invalid(format!("{owner} gives unknown item `{id}`{}", suggestion(id, self.items.keys())));
+                }
+                Grant::Augment(id) if !self.augments.contains_key(id) => {
+                    return invalid(format!("{owner} gives unknown augment `{id}`{}", suggestion(id, self.augments.keys())));
+                }
+                Grant::Currency { currency, .. } if currency != "gold" && self.currency(currency).is_none() => {
+                    let known = currency_ids();
+                    return invalid(format!("{owner} gives unknown currency `{currency}`{}", suggestion(currency, known.iter())));
+                }
+                _ => {}
+            }
+            Ok(())
+        };
+        for round in &self.schedule.rounds {
+            if let RoundKindDef::Pve { rewards, .. } = &round.kind {
+                for grant in rewards {
+                    check_grant(&format!("round `{}`", round.name), grant)?;
+                }
+            }
+        }
+        for item in self.items.values() {
+            if let Some(Consumable::Give(grant)) = &item.consumable {
+                check_grant(&format!("item `{}`", item.id), grant)?;
+            }
+        }
         for (i, def) in r.actions.iter().enumerate() {
             let owner = format!("action `{}`", def.id);
             if def.id.is_empty() {
@@ -1835,22 +1906,7 @@ impl ContentSet {
                 return invalid(format!("{owner} can be used 0 times a round, so never"));
             }
             for grant in &def.gives {
-                match grant {
-                    Grant::Unit(id) if !self.units.contains_key(id) => {
-                        return invalid(format!("{owner} gives unknown unit `{id}`{}", suggestion(id, self.units.keys())));
-                    }
-                    Grant::Item(id) if !self.items.contains_key(id) => {
-                        return invalid(format!("{owner} gives unknown item `{id}`{}", suggestion(id, self.items.keys())));
-                    }
-                    Grant::Augment(id) if !self.augments.contains_key(id) => {
-                        return invalid(format!("{owner} gives unknown augment `{id}`{}", suggestion(id, self.augments.keys())));
-                    }
-                    Grant::Currency { currency, .. } if currency != "gold" && self.currency(currency).is_none() => {
-                        let known = currency_ids();
-                        return invalid(format!("{owner} gives unknown currency `{currency}`{}", suggestion(currency, known.iter())));
-                    }
-                    _ => {}
-                }
+                check_grant(&owner, grant)?;
             }
         }
         for id in self.hooks.actions.keys() {
