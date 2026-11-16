@@ -158,6 +158,8 @@ pub struct CombatUnit {
     cooldowns: Vec<u32>,
     /// Time since the last once-a-second resource change.
     second_ms: u32,
+    /// The tick the unit last died on, while it is dead.
+    died_at: Option<u32>,
     shields: Vec<ShieldInstance>,
     statuses: Vec<StatusInstance>,
     passive_state: Vec<PassiveState>,
@@ -301,6 +303,8 @@ pub enum EventKind {
     /// when it enters the fight.
     ResourceChanged { unit: UnitId, resource: String, amount: i64, max: i64 },
     Died { unit: UnitId, killer: UnitId },
+    /// A dead unit is back, at `pos` with `health`.
+    Revived { unit: UnitId, source: UnitId, pos: Hex, health: i64 },
     Ended { winner: Option<Team>, timed_out: bool },
 }
 
@@ -345,6 +349,19 @@ struct PendingTrigger {
     other: Option<UnitId>,
 }
 
+/// An effect on its way: it lands on `target` at `at_tick`.
+struct Delayed {
+    at_tick: u32,
+    source: UnitId,
+    target: UnitId,
+    other: Option<UnitId>,
+    effect: Effect,
+    direct: bool,
+    /// Landings still to come after this one, and the ticks between them.
+    more: u32,
+    every_ticks: u32,
+}
+
 /// One fight, from setup to outcome.
 pub struct Combat {
     board: HexBoard,
@@ -358,6 +375,7 @@ pub struct Combat {
     started: bool,
     events: Vec<Event>,
     pending: VecDeque<PendingTrigger>,
+    delayed: Vec<Delayed>,
     outcome: Option<Outcome>,
     custom_effects: HashMap<String, Arc<CustomEffectFn>>,
     custom_conditions: HashMap<String, Arc<CustomConditionFn>>,
@@ -385,6 +403,7 @@ impl Combat {
             started: false,
             events: Vec::new(),
             pending: VecDeque::new(),
+            delayed: Vec::new(),
             outcome: None,
             custom_effects: HashMap::new(),
             custom_conditions: HashMap::new(),
@@ -506,6 +525,7 @@ impl Combat {
             casting: 0,
             cooldowns,
             second_ms: 0,
+            died_at: None,
             shields: Vec::new(),
             statuses: Vec::new(),
             passive_state,
@@ -545,6 +565,7 @@ impl Combat {
         if overtime > 0 && self.time_ms() > overtime && self.time_ms() - self.config.tick_ms <= overtime {
             self.emit(EventKind::Overtime);
         }
+        self.land_delayed();
         let acting = self.units.len();
         for i in 0..acting {
             if self.units[i].alive {
@@ -944,6 +965,10 @@ impl Combat {
     // ----- effect resolution ----------------------------------------------
 
     fn resolve(&mut self, source: UnitId, other: Option<UnitId>, effects: &[EffectSpec], direct: bool) {
+        let tick_ms = self.config.tick_ms;
+        // A wait is at least one tick, so a delayed effect never lands in
+        // the middle of the tick that started it.
+        let ticks = |ms: u32| ms.div_ceil(tick_ms).max(1);
         for spec in effects {
             for target in self.select(&spec.target, source, other) {
                 if let Some(condition) = &spec.condition
@@ -951,7 +976,53 @@ impl Combat {
                 {
                     continue;
                 }
-                self.apply_effect(source, target, other, &spec.effect, direct);
+                let (times, every_ticks) = spec.repeat.map_or((1, 0), |r| (r.times.max(1), ticks(r.every_ms)));
+                if spec.delay_ms == 0 {
+                    self.apply_effect(source, target, other, &spec.effect, direct);
+                    if times > 1 {
+                        self.delayed.push(Delayed {
+                            at_tick: self.tick + every_ticks,
+                            source,
+                            target,
+                            other,
+                            effect: spec.effect.clone(),
+                            direct,
+                            more: times - 2,
+                            every_ticks,
+                        });
+                    }
+                } else {
+                    self.delayed.push(Delayed {
+                        at_tick: self.tick + ticks(spec.delay_ms),
+                        source,
+                        target,
+                        other,
+                        effect: spec.effect.clone(),
+                        direct,
+                        more: times - 1,
+                        every_ticks,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Lands the delayed effects that are due, in the order they were
+    /// started, and queues the next landing of the ones that repeat.
+    fn land_delayed(&mut self) {
+        if self.delayed.is_empty() {
+            return;
+        }
+        let tick = self.tick;
+        let (due, waiting): (Vec<Delayed>, Vec<Delayed>) = std::mem::take(&mut self.delayed).into_iter().partition(|d| d.at_tick <= tick);
+        self.delayed = waiting;
+        for mut d in due {
+            self.apply_effect(d.source, d.target, d.other, &d.effect, d.direct);
+            self.drain_triggers();
+            if d.more > 0 {
+                d.more -= 1;
+                d.at_tick = tick + d.every_ticks;
+                self.delayed.push(d);
             }
         }
     }
@@ -1069,6 +1140,11 @@ impl Combat {
                 pool
             }
             Selector::OtherAllies => ids(&mut allies().filter(|o| o.id != source)),
+            Selector::FallenAllies(n) => {
+                // The most recently fallen first.
+                let fallen = self.units.iter().filter(|o| !o.alive && o.team == me.team && o.id != source);
+                take_sorted(fallen, *n, |o| std::cmp::Reverse(o.died_at.unwrap_or(0)))
+            }
             Selector::Custom(name) => match self.custom_selectors.get(name) {
                 Some(hook) => {
                     let mut picked = hook(&SelectContext { combat: self, source, other });
@@ -1106,10 +1182,31 @@ impl Combat {
     fn apply_effect(&mut self, source: UnitId, target: UnitId, other: Option<UnitId>, effect: &Effect, direct: bool) {
         // Summons may be anchored on a unit that just died, and custom hooks
         // decide for themselves; everything else needs a living target.
-        if !self.u(target).alive && !matches!(effect, Effect::Summon { .. } | Effect::Custom { .. }) {
+        if !self.u(target).alive && !matches!(effect, Effect::Summon { .. } | Effect::Custom { .. } | Effect::Revive { .. }) {
             return;
         }
         match effect {
+            Effect::Revive { health } => {
+                if self.u(target).alive {
+                    return;
+                }
+                // Where it fell, or as close to there as there is room.
+                let fell = self.u(target).pos;
+                let reach = self.board.cols() + self.board.rows();
+                let Some(pos) = fell.spiral(reach).into_iter().find(|hex| self.board.contains(*hex) && self.unit_at(*hex).is_none()) else {
+                    return;
+                };
+                let health = self.eval(health, source, target).clamp(1, self.u(target).stat(Stat::MaxHealth).max(1));
+                let idx = self.board.index(pos).unwrap();
+                self.occupancy[idx] = Some(target);
+                let unit = self.u_mut(target);
+                unit.alive = true;
+                unit.died_at = None;
+                unit.health = health;
+                unit.pos = pos;
+                unit.target = None;
+                self.emit(EventKind::Revived { unit: target, source, pos, health });
+            }
             Effect::Damage { amount, kind, can_crit } => {
                 let raw = self.eval(amount, source, target);
                 self.deal_damage(source, target, raw, *kind, *can_crit, direct);
@@ -1464,9 +1561,11 @@ impl Combat {
     fn kill(&mut self, id: UnitId, killer: UnitId) {
         let idx = self.board.index(self.u(id).pos).unwrap();
         self.occupancy[idx] = None;
+        let tick = self.tick;
         let unit = self.u_mut(id);
         unit.alive = false;
         unit.health = 0;
+        unit.died_at = Some(tick);
         unit.shields.clear();
         unit.statuses.clear();
         unit.cast_remaining_ms = None;

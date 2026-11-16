@@ -263,6 +263,15 @@ pub enum Effect {
     /// The source jumps to the free hex closest to the selected unit, and
     /// targets it if it is an enemy.
     Leap,
+    /// Brings a dead unit back with this much health (at least 1, at most
+    /// its maximum), where it fell or on the nearest free hex. It returns
+    /// without shields, statuses or a cast in progress, and keeps its
+    /// stacks and resources. Does nothing to the living.
+    ///
+    /// Dead units are reached by [`Selector::FallenAllies`], by
+    /// [`Selector::Source`] in an `OnDeath` passive and by
+    /// [`Selector::EventOther`] in an `OnAllyDeath` one.
+    Revive { health: Amount },
     /// Fires the selected unit's [`Trigger::Signal`] passives of this name,
     /// with the source as the other unit. This is how content makes
     /// occasions of its own for passives to react to.
@@ -319,11 +328,28 @@ impl Effect {
         Effect::GainResource { resource: resource.into(), amount: amount.into() }
     }
 
+    /// Brings a dead unit back; see [`Effect::Revive`].
+    ///
+    /// ```
+    /// use autoengine::effect::{Amount, Effect, Passive, ScaleBy, Selector, Trigger, Who};
+    /// use autoengine::stats::Stat;
+    ///
+    /// // Once a fight, get back up with 40% health.
+    /// let second_wind = Passive::new("Second Wind", Trigger::OnDeath).max_procs(1).effect(
+    ///     Effect::revive(Amount::default().plus(Who::Target, ScaleBy::Stat(Stat::MaxHealth), 400)).to(Selector::Source),
+    /// );
+    /// assert_eq!(second_wind.max_procs, Some(1));
+    /// ```
+    pub fn revive(health: impl Into<Amount>) -> Self {
+        Effect::Revive { health: health.into() }
+    }
+
     /// The amounts the effect works out when it resolves.
     pub fn amounts(&self) -> Vec<&Amount> {
         match self {
             Effect::Damage { amount, .. }
             | Effect::Heal { amount }
+            | Effect::Revive { health: amount }
             | Effect::Shield { amount, .. }
             | Effect::GainResource { amount, .. } => vec![amount],
             Effect::ApplyStatus { status: StatusKind::DamageOverTime { per_second, .. }, .. } => vec![per_second],
@@ -516,6 +542,9 @@ pub enum Selector {
     RandomAllies(u32),
     /// Every ally except the source.
     OtherAllies,
+    /// Up to `n` dead allies, the most recently fallen first. Only
+    /// [`Effect::Revive`] does anything to them.
+    FallenAllies(u32),
     /// Units chosen by a Rust hook registered under this name (see
     /// [`GameBuilder::custom_selector`](crate::content::GameBuilder::custom_selector)).
     Custom(String),
@@ -615,11 +644,63 @@ pub struct EffectSpec {
     pub effect: Effect,
     #[serde(default)]
     pub condition: Option<Condition>,
+    /// How long after it resolves the effect lands, in milliseconds. The
+    /// receivers are chosen when it resolves, and it lands on the ones
+    /// still alive. 0 is at once.
+    #[serde(default)]
+    pub delay_ms: u32,
+    /// Lands the effect more than once on the same receivers.
+    #[serde(default)]
+    pub repeat: Option<Repeat>,
+}
+
+/// How an [`EffectSpec`] repeats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Repeat {
+    /// How many times the effect lands in all.
+    pub times: u32,
+    /// The time between one landing and the next, in milliseconds.
+    pub every_ms: u32,
 }
 
 impl EffectSpec {
     pub fn new(target: Selector, effect: Effect) -> Self {
-        EffectSpec { target, effect, condition: None }
+        EffectSpec { target, effect, condition: None, delay_ms: 0, repeat: None }
+    }
+
+    /// Lands the effect `ms` milliseconds later: a fuse, a wind-up, a shot
+    /// in flight. Who receives it is decided now, and it lands on those
+    /// still alive then, even if its source has died in the meantime.
+    ///
+    /// To choose the receivers when it lands instead, delay a
+    /// [`Effect::signal`] to the source and put the effect in a passive
+    /// waiting for that signal.
+    ///
+    /// ```
+    /// use autoengine::effect::{Effect, Selector};
+    ///
+    /// // A charge that goes off two seconds after it is planted.
+    /// let bomb = Effect::magic(300).to(Selector::CurrentTarget).after(2000);
+    /// assert_eq!(bomb.delay_ms, 2000);
+    /// ```
+    pub fn after(mut self, ms: u32) -> Self {
+        self.delay_ms = ms;
+        self
+    }
+
+    /// Lands the effect `times` times in all, `every_ms` apart, on the same
+    /// receivers: a channel, a burst of shots, a pulsing aura.
+    ///
+    /// ```
+    /// use autoengine::effect::{Effect, Selector};
+    ///
+    /// // Three volleys, half a second apart, the first at once.
+    /// let volley = Effect::physical(40).to(Selector::NearestEnemies(3)).repeat(3, 500);
+    /// assert_eq!(volley.repeat.unwrap().times, 3);
+    /// ```
+    pub fn repeat(mut self, times: u32, every_ms: u32) -> Self {
+        self.repeat = Some(Repeat { times, every_ms });
+        self
     }
 
     /// Only applies the effect to selected units for which `condition` holds.

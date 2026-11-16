@@ -250,6 +250,16 @@ impl Playback {
                 }
                 self.flashes.push((at, Flash::Death { unit }));
             }
+            EventKind::Revived { unit, pos, health, .. } => {
+                if let Some(u) = self.units.get_mut(&unit) {
+                    u.alive = true;
+                    u.health = health;
+                    u.pos = pos;
+                    u.prev_pos = pos;
+                    u.statuses.clear();
+                    u.stunned_until_ms = 0;
+                }
+            }
             EventKind::StacksChanged { unit, stack, count } => {
                 if let Some(u) = self.units.get_mut(&unit) {
                     if count == 0 {

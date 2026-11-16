@@ -1940,6 +1940,11 @@ impl ContentSet {
                 {
                     return invalid(format!("{owner} uses unregistered custom selector `{name}`"));
                 }
+                if let Some(repeat) = spec.repeat
+                    && (repeat.times == 0 || repeat.every_ms == 0)
+                {
+                    return invalid(format!("{owner} repeats an effect {} times every {} ms; both must be at least 1", repeat.times, repeat.every_ms));
+                }
                 if let Effect::Damage { kind, .. }
                 | Effect::ApplyStatus { status: StatusKind::DamageOverTime { kind, .. }, .. } = &spec.effect
                 {

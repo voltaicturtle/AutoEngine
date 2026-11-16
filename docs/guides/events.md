@@ -123,6 +123,7 @@ they appeared. `Spawned` says which unit each one is.
 | `ResourceChanged` | `unit`, `resource`, `amount`, `max` | a unit now has `amount` of a [resource](resources.md) out of `max`. Sent when either changes, and for each resource a unit has when it enters the fight |
 | `Overtime` | | overtime began, and damage grows from now on (see [Fights](fights.md#overtime)) |
 | `Died` | `unit`, `killer` | a unit died |
+| `Revived` | `unit`, `source`, `pos`, `health` | a dead unit is back, at `pos` with `health` |
 | `Ended` | `winner`, `timed_out` | the fight ended. `winner` is the team left standing, or `None` for a draw |
 
 `playback::fight_stats(&record.events)` adds these up into each unit's

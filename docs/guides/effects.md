@@ -52,6 +52,7 @@ the condition for each unit it would hit.
 | `Effect::knockback(hexes)` | pushes it straight away from the source, up to `hexes` steps |
 | `Effect::pull(hexes)` | drags it up to `hexes` steps toward the source, stopping next to it or at another unit |
 | `Effect::leap()` | the *source* jumps to the free hex closest to the selected unit, and targets it if it is an enemy |
+| `Effect::revive(amount)` | brings a dead unit back with that much health (see [Bringing units back](#bringing-units-back)) |
 | `Effect::summon(unit_id, count)` | puts `count` copies of a unit on the selected unit's team, on the free hexes closest to it |
 | `Effect::add_stacks(name, count)` | adds to a named counter on the unit (see [Stacks](#stacks)) |
 | `.capped_at(max)` | added to `add_stacks`, caps the counter |
@@ -62,9 +63,75 @@ the condition for each unit it would hit.
 | `Effect::custom(name)` | runs a Rust hook (see [Rust hooks](#rust-hooks)) |
 | `Effect::custom_with(name, [args])` | runs a Rust hook with numbers passed to it |
 
-Effects skip units that are already dead, except `summon` and custom
-effects. Stun, silence, disarm, root and taunt last shorter on units with
-`Tenacity`. A status applied twice runs twice, each with its own timer.
+Effects skip units that are already dead, except `summon`, `revive` and
+custom effects. Stun, silence, disarm, root and taunt last shorter on units
+with `Tenacity`. A status applied twice runs twice, each with its own timer.
+
+### Later, and more than once
+
+`.to(selector)` gives an `EffectSpec`, and two calls on it set when the
+effect lands:
+
+| Call | Meaning |
+| --- | --- |
+| `.after(ms)` | the effect lands `ms` later: a fuse, a wind-up, a shot in flight |
+| `.repeat(times, every_ms)` | the effect lands `times` times in all, `every_ms` apart: a channel, a burst, a pulse |
+
+```rust
+use autoengine::effect::{Ability, Effect, Selector};
+
+let barrage = Ability::new("Barrage")
+    // Three volleys half a second apart, the first at once.
+    .effect(Effect::physical(40).to(Selector::NearestEnemies(3)).repeat(3, 500))
+    // And a charge on the target that goes off two seconds later.
+    .effect(Effect::magic(300).to(Selector::CurrentTarget).after(2000));
+assert_eq!(barrage.effects[1].delay_ms, 2000);
+```
+
+Who receives the effect is decided when the ability or passive resolves,
+and conditions are checked then. It lands on those still alive, even if
+its source has died in the meantime, and amounts are worked out as it
+lands. Times are rounded up to whole ticks.
+
+To pick the receivers at the moment of landing instead, delay a
+[signal](#signals) to the source and put the effect in a passive waiting
+for it:
+
+```rust
+use autoengine::effect::{Ability, Anchor, Effect, Passive, Selector, Trigger};
+
+// Two seconds after the cast, whoever is standing near the caster then.
+let cast = Ability::new("Quake").effect(Effect::signal("quake").to(Selector::Source).after(2000));
+let quake = Passive::new("Quake lands", Trigger::signal("quake"))
+    .effect(Effect::physical(200).to(Selector::EnemiesWithin { anchor: Anchor::Source, radius: 2 }));
+assert_eq!(cast.effects.len() + quake.effects.len(), 2);
+```
+
+### Bringing units back
+
+`Effect::revive(amount)` stands a dead unit up again with `amount` health
+(at least 1, at most its maximum), where it fell or on the nearest free
+hex. It comes back without shields, statuses or a cast in progress, and
+keeps its stacks and resources. It does nothing to the living.
+
+Three selectors reach the dead: `Source` in an `OnDeath` passive,
+`EventOther` in an `OnAllyDeath` passive, and `FallenAllies(n)` anywhere.
+
+```rust
+use autoengine::effect::{Ability, Amount, Effect, Passive, ScaleBy, Selector, Trigger, Who};
+use autoengine::stats::Stat;
+
+let share = |permille| Amount::default().plus(Who::Target, ScaleBy::Stat(Stat::MaxHealth), permille);
+// Once a fight, get back up with 40% health.
+let second_wind = Passive::new("Second Wind", Trigger::OnDeath).max_procs(1).effect(Effect::revive(share(400)).to(Selector::Source));
+// An ability that raises the ally who fell last, with a quarter of theirs.
+let raise = Ability::new("Raise").effect(Effect::revive(share(250)).to(Selector::FallenAllies(1)));
+assert_eq!(second_wind.max_procs, Some(1));
+assert_eq!(raise.effects.len(), 1);
+```
+
+A unit that revives sends a `Revived` fight event. Death passives without
+`max_procs` fire again each time the unit dies.
 
 ### Stat modifiers
 
@@ -140,6 +207,7 @@ so fights stay repeatable.
 | `AllEnemies` | every living enemy |
 | `AllAllies` | every living ally |
 | `OtherAllies` | every living ally except the source |
+| `FallenAllies(n)` | up to `n` dead allies, the most recently fallen first. Only `revive` does anything to them |
 | `EnemiesWithin { anchor, radius }` | enemies within `radius` hexes of the anchor |
 | `AlliesWithin { anchor, radius }` | allies within `radius` hexes of the anchor |
 | `AlliesWithTag(tag)` | allies carrying a tag, such as a trait id |

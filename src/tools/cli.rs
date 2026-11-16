@@ -624,6 +624,7 @@ fn print_log(combat: &Combat) {
             EventKind::Died { unit, killer } => {
                 format!("{} dies (killed by {})", label(*unit), label(*killer))
             }
+            EventKind::Revived { unit, health, .. } => format!("{} gets back up with {health} health", label(*unit)),
             EventKind::Ended { winner, timed_out } => match (winner, timed_out) {
                 (Some(team), _) => format!("Team {} wins", team.0),
                 (None, true) => "Time ran out: draw".to_string(),

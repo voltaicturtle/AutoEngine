@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::content::{ContentSet, RoundKindDef};
-use crate::effect::{Condition, Effect, StatusKind, Trigger};
+use crate::effect::{Condition, Effect, Selector, StatusKind, Trigger};
 use crate::name::Name;
 
 /// Something in the content that loads but is probably a mistake.
@@ -170,6 +170,22 @@ pub fn lint(content: &ContentSet, assets: Option<&Path>) -> Vec<Warning> {
                 warn(owner.clone(), format!("asks for the status \"{status}\", which nothing in the content applies"));
             }
         });
+    }
+
+    // Reviving only does something to the dead, and few selectors reach them.
+    for (owner, spec) in &effects {
+        if matches!(spec.effect, Effect::Revive { .. })
+            && !matches!(spec.target, Selector::Source | Selector::EventOther | Selector::FallenAllies(_) | Selector::Custom(_))
+        {
+            warn(owner.clone(), "revives units its selector only picks while they are alive; use FallenAllies, or Source or EventOther in a death passive".into());
+        }
+    }
+
+    for (owner, passive) in &passives {
+        let revives_itself = passive.effects.iter().any(|spec| matches!(spec.effect, Effect::Revive { .. }) && spec.target == Selector::Source);
+        if passive.trigger == Trigger::OnDeath && revives_itself && passive.max_procs.is_none() && passive.condition.is_none() {
+            warn(owner.clone(), "revives itself every time it dies, so it can never be killed; give the passive max_procs".into());
+        }
     }
 
     // A currency should come from somewhere and go somewhere, and an action
