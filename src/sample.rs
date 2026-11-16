@@ -1,7 +1,7 @@
 //! The sample game, written in Rust with the content builders.
 //!
 //! It is small and original: eight shop units, a summon and a neutral
-//! monster, a second resource next to mana, a second currency next to gold with two actions that use it, five traits, six items (three components and what they combine
+//! monster, a second resource next to mana, a second currency next to gold with two actions that use it, three kinds of tile, five traits, six items (three components and what they combine
 //! into), seven augments, a round schedule with every built-in round kind and
 //! a scripted one, a sample fight and a few content tests. A game built on
 //! the engine defines the same things the same way, in its own crate.
@@ -17,6 +17,7 @@ use crate::effect::{Ability, Amount, Anchor, Cost, DamageKind, Effect, Passive, 
 use crate::game::{CommandError, Grant};
 use crate::resource::ResourceDef;
 use crate::stats::Stat::{self, *};
+use crate::tile::TileDef;
 use crate::tools::cli::GameSpec;
 use crate::tools::scenario::{Expect, Scenario};
 
@@ -33,9 +34,8 @@ pub fn content() -> ContentSet {
     ContentSet::builder()
         .resource(fury())
         .currency(favor())
-        .action(
-            ActionDef::new("petition", "Petition").description("Trade 3 favor for 4 experience.").costs("favor", 3).gives(Grant::Xp(4)),
-        )
+        .tiles(tiles())
+        .action(ActionDef::new("petition", "Petition").description("Trade 3 favor for 4 experience.").costs("favor", 3).gives(Grant::Xp(4)))
         .action(
             ActionDef::new("offering", "Offering")
                 .description("Give up a unit for as much favor as it is worth. Once a round.")
@@ -69,6 +69,23 @@ pub fn fury() -> ResourceDef {
     ResourceDef::new("fury", "Fury", MAX_FURY).per_attack(12).per_kill(25).per_second(-3).color([235, 120, 50])
 }
 
+/// Tiles: effects that belong to a hex. One is laid by an ability, one
+/// stands on the board for a round, and one is in the way.
+pub fn tiles() -> Vec<TileDef> {
+    vec![
+        TileDef::new("embers", "Embers")
+            .description("Burns the enemies of whoever lit it for 30 magic damage a second.")
+            .enemies_only()
+            .per_second(Effect::magic(Amount::power(30)))
+            .color([235, 110, 45]),
+        TileDef::new("standing_stone", "Standing Stone")
+            .description("Whoever stands here attacks 15% faster.")
+            .mods([AttackSpeed.percent(150)])
+            .color([120, 170, 215]),
+        TileDef::new("boulder", "Boulder").description("Nobody can stand here.").blocking().color([105, 105, 115]),
+    ]
+}
+
 /// A second currency next to gold, to show how one is made: every player
 /// gets one favor a round, and the two actions above earn and spend it.
 pub fn favor() -> CurrencyDef {
@@ -96,6 +113,7 @@ pub fn sample_match() -> MatchSetup {
                 // An augment-style modifier: the whole team heals from damage dealt.
                 .bonus(Bonus::team().mods([Lifesteal.flat(80)])),
         ],
+        tiles: Vec::new(),
     }
 }
 
@@ -157,16 +175,17 @@ pub fn schedule() -> Schedule {
         RoundDef::new("1-3", 1, RoundKindDef::pvp()),
         RoundDef::new("2-1", 2, RoundKindDef::choice(3, ChoiceOffer::Augments)),
         RoundDef::new("2-2", 2, RoundKindDef::pvp()),
-        RoundDef::new("2-3", 2, RoundKindDef::pvp()),
+        // Each side has a standing stone in the middle of its second row.
+        RoundDef::new("2-3", 2, RoundKindDef::pvp()).tile("standing_stone", (3, 5)),
         RoundDef::new("2-4", 2, RoundKindDef::draft(1).max_cost(2)),
         RoundDef::new("2-5", 2, RoundKindDef::pvp()),
         RoundDef::new(
             "2-6",
             2,
-            RoundKindDef::pve([golem(2, (2, 4)), golem(2, (4, 4)), BoardUnit::new("grave_wisp", (3, 6)).star(2)])
-                .gold(3)
-                .items(1),
-        ),
+            RoundKindDef::pve([golem(2, (2, 4)), golem(2, (4, 4)), BoardUnit::new("grave_wisp", (3, 6)).star(2)]).gold(3).items(1),
+        )
+        // A boulder between the two golems: melee units have to go around.
+        .tile_at("boulder", (3, 3)),
         RoundDef::new("3-1", 3, RoundKindDef::pvp()),
         RoundDef::new("3-2", 3, RoundKindDef::choice(3, ChoiceOffer::Augments)),
         RoundDef::new("3-3", 3, RoundKindDef::pvp()),
@@ -270,13 +289,14 @@ pub fn units() -> Vec<UnitDef> {
             ])
             .ability(
                 Ability::new("Searing Flurry")
-                    .description("Strikes its target for 80 plus 150% attack damage, then attacks 40% faster for 3 seconds.")
+                    .description("Strikes its target for 80 plus 150% attack damage and leaves embers under it that burn enemies for 3 seconds, then attacks 40% faster for 3 seconds.")
                     .cast_time(250)
                     .effect(
                         Effect::physical(Amount::power(80).plus(Who::Source, ScaleBy::Stat(AttackDamage), 1500))
                             .with_crit()
                             .to(Selector::CurrentTarget),
                     )
+                    .effect(Effect::tile_for("embers", 3000).to(Selector::CurrentTarget))
                     .effect(Effect::stat_status([AttackSpeed.percent(400)], 3000).to(Selector::Source)),
             )
             .passive(

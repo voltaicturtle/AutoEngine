@@ -90,6 +90,19 @@ pub enum Flash {
     Miss { target: UnitId },
 }
 
+/// A tile on the board at the replay's current time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileMark {
+    /// The tile's id (see [`TileDef`](crate::tile::TileDef)).
+    pub tile: String,
+    pub pos: crate::hex::Hex,
+    /// The side of whoever laid it, if anyone did.
+    pub team: Option<Team>,
+    pub placed_at_ms: u32,
+    /// When it runs out. `None` is never.
+    pub until_ms: Option<u32>,
+}
+
 /// The state of a replay at its current time.
 #[derive(Clone, Debug)]
 pub struct Playback {
@@ -100,6 +113,7 @@ pub struct Playback {
     time_ms: u32,
     units: BTreeMap<UnitId, UnitView>,
     flashes: Vec<(u32, Flash)>,
+    tiles: Vec<TileMark>,
     winner: Option<Team>,
     ended: bool,
     /// When overtime began, if it has.
@@ -133,6 +147,7 @@ impl Playback {
             time_ms: 0,
             units: BTreeMap::new(),
             flashes: Vec::new(),
+            tiles: Vec::new(),
             winner: end.and_then(|(_, winner)| winner),
             ended: false,
             overtime_at_ms: None,
@@ -250,6 +265,14 @@ impl Playback {
                 }
                 self.flashes.push((at, Flash::Death { unit }));
             }
+            EventKind::TilePlaced { tile, pos, team, duration_ms } => {
+                let until_ms = duration_ms.map(|d| at + d);
+                match self.tiles.iter_mut().find(|t| t.tile == tile && t.pos == pos) {
+                    Some(mark) => (mark.team, mark.until_ms) = (team, until_ms),
+                    None => self.tiles.push(TileMark { tile, pos, team, placed_at_ms: at, until_ms }),
+                }
+            }
+            EventKind::TileRemoved { tile, pos } => self.tiles.retain(|t| !(t.tile == tile && t.pos == pos)),
             EventKind::Revived { unit, pos, health, .. } => {
                 if let Some(u) = self.units.get_mut(&unit) {
                     u.alive = true;
@@ -319,6 +342,12 @@ impl Playback {
 
     pub fn unit(&self, id: UnitId) -> Option<&UnitView> {
         self.units.get(&id)
+    }
+
+    /// The tiles on the board at the current time, in the order they were
+    /// laid.
+    pub fn tiles(&self) -> &[TileMark] {
+        &self.tiles
     }
 
     /// Flashes that started within the last `window_ms`, with their age.

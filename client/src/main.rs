@@ -909,6 +909,40 @@ fn board_tiles(ground: &mut Ground, layout: &Layout, own_half: bool, highlight: 
     }
 }
 
+/// Queues a tile lying on a hex: a thin colored slab, or a block for a
+/// tile nobody can stand on.
+fn tile_marker(ground: &mut Ground, app: &App, tile: &str, at: Vec3) {
+    let def = app.net.state.content.as_ref().and_then(|c| c.tile(tile));
+    let color = match def.and_then(|d| d.color) {
+        Some([r, g, b]) => Color::from_rgba(r, g, b, 255),
+        None => unit_color(tile),
+    };
+    if def.is_some_and(|d| d.blocks) {
+        ground.hex_tile(at + vec3(0.0, 0.55, 0.0), 0.70, 0.55, color);
+    } else {
+        ground.hex_tile(at + vec3(0.0, 0.035, 0.0), 0.80, 0.035, color);
+    }
+}
+
+/// The tiles the current round's fights start with, as `(tile, (column,
+/// row))` on the viewer's side of the board and its mirror image.
+fn round_tiles(app: &App) -> Vec<(String, (i32, i32))> {
+    let state = &app.net.state;
+    let (Some(content), Some(view)) = (&state.content, &state.view) else {
+        return Vec::new();
+    };
+    let board = content.board();
+    let mut out = Vec::new();
+    for placement in &view.round_tiles {
+        out.push((placement.tile.clone(), placement.pos));
+        let hex = autoengine::hex::Hex::from_offset(placement.pos.0, placement.pos.1);
+        if placement.mirrored && board.mirror(hex) != hex {
+            out.push((placement.tile.clone(), board.mirror(hex).to_offset()));
+        }
+    }
+    out
+}
+
 fn unit_label(app: &App, unit: &OwnedUnit) -> String {
     app.net.state.display_name(&unit.unit)
 }

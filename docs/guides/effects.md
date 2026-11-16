@@ -53,6 +53,7 @@ the condition for each unit it would hit.
 | `Effect::pull(hexes)` | drags it up to `hexes` steps toward the source, stopping next to it or at another unit |
 | `Effect::leap()` | the *source* jumps to the free hex closest to the selected unit, and targets it if it is an enemy |
 | `Effect::revive(amount)` | brings a dead unit back with that much health (see [Bringing units back](#bringing-units-back)) |
+| `Effect::tile(id)`, `Effect::tile_for(id, ms)` | lays a [tile](tiles.md) under the unit, for the whole fight or for `ms`. `.spread(radius)` covers the hexes around it too |
 | `Effect::summon(unit_id, count)` | puts `count` copies of a unit on the selected unit's team, on the free hexes closest to it |
 | `Effect::add_stacks(name, count)` | adds to a named counter on the unit (see [Stacks](#stacks)) |
 | `.capped_at(max)` | added to `add_stacks`, caps the counter |
@@ -63,8 +64,8 @@ the condition for each unit it would hit.
 | `Effect::custom(name)` | runs a Rust hook (see [Rust hooks](#rust-hooks)) |
 | `Effect::custom_with(name, [args])` | runs a Rust hook with numbers passed to it |
 
-Effects skip units that are already dead, except `summon`, `revive` and
-custom effects. Stun, silence, disarm, root and taunt last shorter on units
+Effects skip units that are already dead, except `summon`, `revive`, `tile`
+and custom effects. Stun, silence, disarm, root and taunt last shorter on units
 with `Tenacity`. A status applied twice runs twice, each with its own timer.
 
 ### Later, and more than once
@@ -282,6 +283,7 @@ the target. A condition about a target that doesn't exist is false.
 | `HasTag { who, tag }` | the unit carries a tag: its traits, including traits its items grant |
 | `StacksAtLeast { who, stack, count }` | the unit has at least `count` of a stack |
 | `AlliesWithTagAtLeast { tag, count }` | at least `count` living units on the source's team carry a tag |
+| `OnTile { who, tile }` | the unit stands on a [tile](tiles.md) of this kind |
 | `HasStatus { who, status }` | the unit has a status with this name: `"stunned"`, `"rooted"` and so on, or the name of a [mark](#statuses) |
 | `ResourceAtLeast { who, resource, permille }` | the unit's bar of a [resource](resources.md) is at least `permille` full |
 | `Condition::chance(permille)` | a random roll from the fight's seed |

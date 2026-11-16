@@ -923,6 +923,7 @@ impl Session {
             status: game.players().iter().map(|p| status(game, p.id)).collect(),
             paused: self.paused_at.is_some(),
             pool: game.pool().clone(),
+            round_tiles: game.round_tiles().to_vec(),
         }
     }
 

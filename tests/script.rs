@@ -25,6 +25,7 @@ fn content(list: &[(&str, &str)], rounds: &[(&str, i64)]) -> Arc<ContentSet> {
             name: kind.to_string(),
             stage: 1,
             kind: RoundKindDef::Custom { kind: kind.to_string(), params: BTreeMap::from([("n".to_string(), *n)]) },
+            tiles: Vec::new(),
         })
         .collect();
     let set = sample().with_scripts(scripts(list)).unwrap().with_schedule(Schedule { rounds, repeat_from: 0 }).unwrap();
@@ -206,6 +207,7 @@ fn the_script_reference_matches_the_engine() {
         name: "all".into(),
         stage: 1,
         kind: RoundKindDef::Custom { kind: "everything".into(), params: Default::default() },
+        tiles: Vec::new(),
     };
     let content = content.with_schedule(Schedule { rounds: vec![custom], repeat_from: 0 }).unwrap();
     let mut game = Game::new(content, 1, &["A", "B"]);

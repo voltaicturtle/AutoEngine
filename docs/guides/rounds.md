@@ -35,6 +35,8 @@ assert_eq!(schedule.rounds.len(), 8);
 | `.repeat_from(index)` | when the list runs out, play again from this index, one stage higher each time. The default, 0, loops from the start |
 | `RoundDef::new(name, stage, kind)` | one round. The name is shown to players. The stage scales how much a lost fight costs |
 
+| `.tile(id, (col, row))`, `.tile_at(id, (col, row))` | on a `RoundDef`: the round's fights start with this [tile](tiles.md) on the board, on both sides' halves or on one exact hex |
+
 Without a schedule, a game is one PvP round, repeated. Add the schedule
 with `ContentSet::builder().schedule(schedule)`, or replace one with
 `content.with_schedule(schedule)`.

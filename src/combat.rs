@@ -30,6 +30,7 @@ use crate::hex::{Hex, HexBoard};
 use crate::resource::{MANA, Pool, ResourceDef};
 use crate::rng::Rng;
 use crate::stats::{Stat, StatMod, Stats};
+use crate::tile::{Affects, TileDef, TileView};
 
 /// Identifies a unit within one combat. Ids are assigned in spawn order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -46,6 +47,8 @@ const PROGRESS_FULL: i64 = 1_000_000;
 /// Upper bound on triggered passives resolved in one go, as a guard against
 /// content that triggers itself forever.
 const MAX_TRIGGER_CHAIN: usize = 10_000;
+/// How many tiles' effects can push a unit from one tile onto the next.
+const MAX_TILE_CHAIN: u32 = 4;
 
 /// How deeply custom effects may call other custom effects.
 const MAX_HOOK_DEPTH: u32 = 16;
@@ -81,6 +84,9 @@ pub struct CombatConfig {
     /// How each kind of damage is mitigated. See the
     /// [`damage`](crate::damage) module.
     pub damage_types: Vec<DamageType>,
+    /// The kinds of tile that can be on the board. See the
+    /// [`tile`](crate::tile) module.
+    pub tiles: Vec<TileDef>,
     /// Damage multiplier from resistance is `k / (k + resist)`.
     pub resist_constant: i64,
     /// Cap on the `DamageReduction` stat, in permille.
@@ -101,6 +107,7 @@ impl Default for CombatConfig {
             max_duration_ms: 60_000,
             resources: vec![ResourceDef::mana()],
             damage_types: DamageType::defaults(),
+            tiles: Vec::new(),
             resist_constant: 100,
             max_damage_reduction: 900,
             overtime_after_ms: 30_000,
@@ -160,6 +167,8 @@ pub struct CombatUnit {
     second_ms: u32,
     /// The tick the unit last died on, while it is dead.
     died_at: Option<u32>,
+    /// The tiles whose stat changes the unit has right now.
+    on_tiles: Vec<OnTile>,
     shields: Vec<ShieldInstance>,
     statuses: Vec<StatusInstance>,
     passive_state: Vec<PassiveState>,
@@ -303,6 +312,20 @@ pub enum EventKind {
     /// when it enters the fight.
     ResourceChanged { unit: UnitId, resource: String, amount: i64, max: i64 },
     Died { unit: UnitId, killer: UnitId },
+    /// A tile is on a hex, newly laid or laid again. `team` is the side of
+    /// whoever laid it, and `duration_ms` how long it has left (`None` is
+    /// the rest of the fight).
+    TilePlaced {
+        tile: String,
+        pos: Hex,
+        team: Option<Team>,
+        duration_ms: Option<u32>,
+    },
+    /// A tile is gone from a hex.
+    TileRemoved {
+        tile: String,
+        pos: Hex,
+    },
     /// A dead unit is back, at `pos` with `health`.
     Revived { unit: UnitId, source: UnitId, pos: Hex, health: i64 },
     Ended { winner: Option<Team>, timed_out: bool },
@@ -330,6 +353,8 @@ pub struct Outcome {
 pub enum SpawnError {
     OffBoard(Hex),
     Occupied(Hex),
+    /// A tile nobody can stand on is there.
+    Blocked(Hex),
 }
 
 impl std::fmt::Display for SpawnError {
@@ -337,6 +362,7 @@ impl std::fmt::Display for SpawnError {
         match self {
             SpawnError::OffBoard(h) => write!(f, "hex {:?} is off the board", h.to_offset()),
             SpawnError::Occupied(h) => write!(f, "hex {:?} is occupied", h.to_offset()),
+            SpawnError::Blocked(h) => write!(f, "hex {:?} is blocked by a tile", h.to_offset()),
         }
     }
 }
@@ -347,6 +373,29 @@ struct PendingTrigger {
     owner: UnitId,
     passive: usize,
     other: Option<UnitId>,
+}
+
+/// A tile on the board.
+#[derive(Clone, Debug)]
+struct TileInstance {
+    /// Tells this tile from every other laid in the fight.
+    uid: u32,
+    /// Which [`TileDef`], by position in the config.
+    def: usize,
+    pos: Hex,
+    owner: Option<UnitId>,
+    team: Option<Team>,
+    remaining_ms: Option<u32>,
+    /// Time since its last once-a-second effect.
+    second_ms: u32,
+}
+
+/// A tile a unit is standing on and affected by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OnTile {
+    uid: u32,
+    def: usize,
+    owner: Option<UnitId>,
 }
 
 /// An effect on its way: it lands on `target` at `at_tick`.
@@ -376,6 +425,12 @@ pub struct Combat {
     events: Vec<Event>,
     pending: VecDeque<PendingTrigger>,
     delayed: Vec<Delayed>,
+    tile_defs: Arc<[TileDef]>,
+    tiles: Vec<TileInstance>,
+    next_tile: u32,
+    /// How many blocking tiles are on each hex.
+    blocked: Vec<u16>,
+    tile_depth: u32,
     outcome: Option<Outcome>,
     custom_effects: HashMap<String, Arc<CustomEffectFn>>,
     custom_conditions: HashMap<String, Arc<CustomConditionFn>>,
@@ -391,6 +446,7 @@ impl Combat {
     pub fn with_config(board: HexBoard, seed: u64, config: CombatConfig) -> Self {
         assert!(config.tick_ms > 0, "tick_ms must be positive");
         let cells = board.len();
+        let tile_defs: Arc<[TileDef]> = config.tiles.clone().into();
         Combat {
             board,
             resources: config.resources.clone().into(),
@@ -404,6 +460,11 @@ impl Combat {
             events: Vec::new(),
             pending: VecDeque::new(),
             delayed: Vec::new(),
+            tile_defs,
+            tiles: Vec::new(),
+            next_tile: 0,
+            blocked: vec![0; cells],
+            tile_depth: 0,
             outcome: None,
             custom_effects: HashMap::new(),
             custom_conditions: HashMap::new(),
@@ -502,6 +563,9 @@ impl Combat {
         if self.occupancy[idx].is_some() {
             return Err(SpawnError::Occupied(pos));
         }
+        if self.blocked[idx] > 0 {
+            return Err(SpawnError::Blocked(pos));
+        }
         let template = template.into();
         let id = UnitId(self.units.len() as u32);
         let stats = Stats::new(template.stats.clone());
@@ -526,6 +590,7 @@ impl Combat {
             cooldowns,
             second_ms: 0,
             died_at: None,
+            on_tiles: Vec::new(),
             shields: Vec::new(),
             statuses: Vec::new(),
             passive_state,
@@ -543,6 +608,7 @@ impl Combat {
             }
         }
         if self.started {
+            self.sync_tiles(id);
             self.fire(id, None, |t| matches!(t, Trigger::CombatStart));
         }
         Ok(id)
@@ -555,6 +621,10 @@ impl Combat {
         }
         if !self.started {
             self.started = true;
+            // Units standing on a tile the fight starts with step onto it now.
+            for i in 0..self.units.len() {
+                self.sync_tiles(UnitId(i as u32));
+            }
             for i in 0..self.units.len() {
                 self.fire(UnitId(i as u32), None, |t| matches!(t, Trigger::CombatStart));
             }
@@ -566,6 +636,7 @@ impl Combat {
             self.emit(EventKind::Overtime);
         }
         self.land_delayed();
+        self.tick_tiles();
         let acting = self.units.len();
         for i in 0..acting {
             if self.units[i].alive {
@@ -670,13 +741,9 @@ impl Combat {
             self.u_mut(id).move_progress += speed * tick_ms as i64;
             if self.u(id).move_progress >= PROGRESS_FULL {
                 let board = &self.board;
-                let occupancy = &self.occupancy;
-                let free = |h: Hex| board.index(h).is_some_and(|i| occupancy[i].is_none());
-                let path = board.find_path(
-                    pos,
-                    |h| h.distance(target_pos) <= range && free(h),
-                    free,
-                );
+                let (occupancy, blocked) = (&self.occupancy, &self.blocked);
+                let free = |h: Hex| board.index(h).is_some_and(|i| occupancy[i].is_none() && blocked[i] == 0);
+                let path = board.find_path(pos, |h| h.distance(target_pos) <= range && free(h), free);
                 match path.and_then(|p| p.first().copied()) {
                     Some(next) => {
                         self.u_mut(id).move_progress -= PROGRESS_FULL;
@@ -874,17 +941,226 @@ impl Combat {
     fn move_unit(&mut self, id: UnitId, to: Hex) {
         let from = self.place(id, to);
         self.emit(EventKind::Moved { unit: id, from, to });
+        self.sync_tiles(id);
     }
 
     fn displace(&mut self, id: UnitId, to: Hex) {
         if self.u(id).pos != to {
             let from = self.place(id, to);
             self.emit(EventKind::Displaced { unit: id, from, to });
+            self.sync_tiles(id);
         }
     }
 
+    /// Whether a unit could stand on a hex: on the board, empty and not
+    /// blocked by a tile.
     fn is_free(&self, hex: Hex) -> bool {
-        self.board.index(hex).is_some_and(|i| self.occupancy[i].is_none())
+        self.board.index(hex).is_some_and(|i| self.occupancy[i].is_none() && self.blocked[i] == 0)
+    }
+
+    // ----- tiles ----------------------------------------------------------
+
+    /// Lays a tile on a hex, for `duration_ms` or for the rest of the fight.
+    /// `owner` is the unit that laid it: its side decides whom the tile
+    /// affects, and it is the source of the tile's effects. Laying a tile
+    /// where the same kind already lies keeps the longer time and hands it
+    /// to the new owner.
+    ///
+    /// Returns `false` if nothing was laid: an unknown tile, a hex off the
+    /// board, or a blocking tile on a hex a unit is standing on.
+    pub fn place_tile(&mut self, tile: &str, pos: Hex, owner: Option<UnitId>, duration_ms: Option<u32>) -> bool {
+        let Some(def) = self.tile_defs.iter().position(|d| d.id == tile) else {
+            return false;
+        };
+        let Some(idx) = self.board.index(pos) else {
+            return false;
+        };
+        let team = owner.map(|o| self.u(o).team);
+        let remaining_ms = match self.tiles.iter_mut().find(|t| t.def == def && t.pos == pos) {
+            Some(existing) => {
+                existing.remaining_ms = match (existing.remaining_ms, duration_ms) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    _ => None,
+                };
+                existing.owner = owner;
+                existing.team = team;
+                existing.remaining_ms
+            }
+            None => {
+                let blocks = self.tile_defs[def].blocks;
+                if blocks && self.occupancy[idx].is_some() {
+                    return false;
+                }
+                let uid = self.next_tile;
+                self.next_tile += 1;
+                self.tiles.push(TileInstance { uid, def, pos, owner, team, remaining_ms: duration_ms, second_ms: 0 });
+                if blocks {
+                    self.blocked[idx] += 1;
+                }
+                duration_ms
+            }
+        };
+        self.emit(EventKind::TilePlaced { tile: tile.to_string(), pos, team, duration_ms: remaining_ms });
+        if let Some(unit) = self.occupancy[idx] {
+            self.sync_tiles(unit);
+        }
+        true
+    }
+
+    /// Takes a kind of tile off a hex. Returns whether one was there.
+    pub fn clear_tile(&mut self, tile: &str, pos: Hex) -> bool {
+        match self.tiles.iter().find(|t| t.pos == pos && self.tile_defs[t.def].id == tile).map(|t| t.uid) {
+            Some(uid) => {
+                self.remove_tile(uid);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The tiles on the board right now, in the order they were laid.
+    pub fn tiles(&self) -> Vec<TileView<'_>> {
+        self.tiles
+            .iter()
+            .map(|t| TileView { def: &self.tile_defs[t.def], pos: t.pos, team: t.team, remaining_ms: t.remaining_ms })
+            .collect()
+    }
+
+    /// Whether a hex has a tile of this kind on it.
+    pub fn has_tile(&self, pos: Hex, tile: &str) -> bool {
+        self.tiles.iter().any(|t| t.pos == pos && self.tile_defs[t.def].id == tile)
+    }
+
+    /// Whether a unit could stand on a hex right now.
+    pub fn can_stand(&self, hex: Hex) -> bool {
+        self.is_free(hex)
+    }
+
+    fn remove_tile(&mut self, uid: u32) {
+        let Some(at) = self.tiles.iter().position(|t| t.uid == uid) else {
+            return;
+        };
+        let tile = self.tiles.remove(at);
+        let idx = self.board.index(tile.pos).expect("tiles are on the board");
+        if self.tile_defs[tile.def].blocks {
+            self.blocked[idx] -= 1;
+        }
+        self.emit(EventKind::TileRemoved { tile: self.tile_defs[tile.def].id.clone(), pos: tile.pos });
+        if let Some(unit) = self.occupancy[idx] {
+            self.sync_tiles(unit);
+        }
+    }
+
+    fn tile_affects(&self, def: usize, tile_team: Option<Team>, unit_team: Team) -> bool {
+        match (self.tile_defs[def].affects, tile_team) {
+            (Affects::Everyone, _) | (_, None) => true,
+            (Affects::Allies, Some(team)) => team == unit_team,
+            (Affects::Enemies, Some(team)) => team != unit_team,
+        }
+    }
+
+    /// Brings a unit in line with the tiles under it after anything that
+    /// could change them: it moved, died or came back, or a tile appeared,
+    /// changed hands or went away. Stat changes follow the tiles exactly;
+    /// enter effects run for tiles that are new to it, and leave effects
+    /// for tiles it walked off (not ones that ran out, and not on death).
+    fn sync_tiles(&mut self, id: UnitId) {
+        if !self.started || (self.tiles.is_empty() && self.u(id).on_tiles.is_empty()) {
+            return;
+        }
+        let unit = self.u(id);
+        let now: Vec<OnTile> = if unit.alive {
+            self.tiles
+                .iter()
+                .filter(|t| t.pos == unit.pos && self.tile_affects(t.def, t.team, unit.team))
+                .map(|t| OnTile { uid: t.uid, def: t.def, owner: t.owner })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let before = unit.on_tiles.clone();
+        let left: Vec<OnTile> = before.iter().filter(|b| !now.iter().any(|n| n.uid == b.uid)).copied().collect();
+        let entered: Vec<OnTile> = now.iter().filter(|n| !before.iter().any(|b| b.uid == n.uid)).copied().collect();
+        if left.is_empty() && entered.is_empty() {
+            return;
+        }
+        self.u_mut(id).on_tiles = now;
+        let defs = self.tile_defs.clone();
+        // Effects of one tile can push a unit onto the next; that has to
+        // stop somewhere.
+        let run_effects = self.tile_depth < MAX_TILE_CHAIN;
+        self.tile_depth += 1;
+        for tile in left {
+            self.change_stats(id, &defs[tile.def].mods, false);
+            let still_there = self.tiles.iter().any(|t| t.uid == tile.uid);
+            if run_effects && still_there && self.u(id).alive {
+                for effect in &defs[tile.def].on_leave {
+                    self.apply_effect(tile.owner.unwrap_or(id), id, None, effect, false);
+                }
+            }
+        }
+        for tile in entered {
+            self.change_stats(id, &defs[tile.def].mods, true);
+            if run_effects {
+                for effect in &defs[tile.def].on_enter {
+                    self.apply_effect(tile.owner.unwrap_or(id), id, None, effect, false);
+                }
+            }
+        }
+        self.tile_depth -= 1;
+    }
+
+    /// Runs out the tiles that were laid for a time, and once a second
+    /// does what each tile does to the unit standing on it.
+    fn tick_tiles(&mut self) {
+        if self.tiles.is_empty() {
+            return;
+        }
+        let tick_ms = self.config.tick_ms;
+        let defs = self.tile_defs.clone();
+        let due: Vec<u32> = self
+            .tiles
+            .iter_mut()
+            .filter_map(|tile| {
+                tile.second_ms += tick_ms;
+                (tile.second_ms >= 1000).then(|| {
+                    tile.second_ms -= 1000;
+                    tile.uid
+                })
+            })
+            .collect();
+        for uid in due {
+            // An earlier tile's effects may have changed who stands where.
+            let Some(tile) = self.tiles.iter().find(|t| t.uid == uid).cloned() else {
+                continue;
+            };
+            if defs[tile.def].per_second.is_empty() {
+                continue;
+            }
+            let Some(unit) = self.unit_at(tile.pos) else {
+                continue;
+            };
+            if !self.tile_affects(tile.def, tile.team, self.u(unit).team) {
+                continue;
+            }
+            for effect in &defs[tile.def].per_second {
+                self.apply_effect(tile.owner.unwrap_or(unit), unit, None, effect, false);
+            }
+            self.drain_triggers();
+        }
+        // A tile laid for two seconds gets its second pulse before it goes.
+        let mut expired = Vec::new();
+        for tile in &mut self.tiles {
+            if let Some(remaining) = &mut tile.remaining_ms {
+                *remaining = remaining.saturating_sub(tick_ms);
+                if *remaining == 0 {
+                    expired.push(tile.uid);
+                }
+            }
+        }
+        for uid in expired {
+            self.remove_tile(uid);
+        }
     }
 
     /// Living units on `id`'s team (itself included) that carry `tag`.
@@ -1064,6 +1340,7 @@ impl Combat {
             Condition::ResourceAtLeast { who: w, resource, permille } => who(w)
                 .and_then(|id| self.u(id).pool(resource))
                 .is_some_and(|p| p.amount * 1000 >= p.max * *permille as i64),
+            Condition::OnTile { who: w, tile } => who(w).is_some_and(|id| self.u(id).alive && self.has_tile(self.u(id).pos, tile)),
             Condition::HasStatus { who: w, status } => {
                 who(w).is_some_and(|id| self.u(id).has_status(|s| s.name() == status))
             }
@@ -1193,10 +1470,18 @@ impl Combat {
     fn apply_effect(&mut self, source: UnitId, target: UnitId, other: Option<UnitId>, effect: &Effect, direct: bool) {
         // Summons may be anchored on a unit that just died, and custom hooks
         // decide for themselves; everything else needs a living target.
-        if !self.u(target).alive && !matches!(effect, Effect::Summon { .. } | Effect::Custom { .. } | Effect::Revive { .. }) {
+        if !self.u(target).alive
+            && !matches!(effect, Effect::Summon { .. } | Effect::Custom { .. } | Effect::Revive { .. } | Effect::PlaceTile { .. })
+        {
             return;
         }
         match effect {
+            Effect::PlaceTile { tile, radius, duration_ms } => {
+                let center = self.u(target).pos;
+                for hex in center.spiral(*radius) {
+                    self.place_tile(tile, hex, Some(source), *duration_ms);
+                }
+            }
             Effect::Revive { health } => {
                 if self.u(target).alive {
                     return;
@@ -1204,7 +1489,7 @@ impl Combat {
                 // Where it fell, or as close to there as there is room.
                 let fell = self.u(target).pos;
                 let reach = self.board.cols() + self.board.rows();
-                let Some(pos) = fell.spiral(reach).into_iter().find(|hex| self.board.contains(*hex) && self.unit_at(*hex).is_none()) else {
+                let Some(pos) = fell.spiral(reach).into_iter().find(|hex| self.is_free(*hex)) else {
                     return;
                 };
                 let health = self.eval(health, source, target).clamp(1, self.u(target).stat(Stat::MaxHealth).max(1));
@@ -1217,6 +1502,7 @@ impl Combat {
                 unit.pos = pos;
                 unit.target = None;
                 self.emit(EventKind::Revived { unit: target, source, pos, health });
+                self.sync_tiles(target);
             }
             Effect::Damage { amount, kind, can_crit } => {
                 let raw = self.eval(amount, source, target);
@@ -1333,7 +1619,7 @@ impl Combat {
                     if remaining == 0 {
                         break;
                     }
-                    if self.board.contains(hex) && self.unit_at(hex).is_none() {
+                    if self.is_free(hex) {
                         let _ = self.spawn(template.clone(), team, hex);
                         remaining -= 1;
                     }
@@ -1581,6 +1867,7 @@ impl Combat {
         unit.statuses.clear();
         unit.cast_remaining_ms = None;
         let team = unit.team;
+        self.sync_tiles(id);
         self.emit(EventKind::Died { unit: id, killer });
         self.fire(id, Some(killer), |t| matches!(t, Trigger::OnDeath));
         if killer != id {

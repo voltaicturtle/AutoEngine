@@ -345,6 +345,9 @@ pub struct CombatRecord {
     /// this is enough to fight it again (see `replay`).
     #[serde(default)]
     pub teams: Vec<TeamSetup>,
+    /// The [tiles](crate::tile) the fight started with.
+    #[serde(default)]
+    pub tiles: Vec<crate::tile::TilePlacement>,
     pub events: Vec<Event>,
 }
 
@@ -624,6 +627,10 @@ impl Game {
     /// Kind of the current round, as reported by its round type.
     pub fn round_kind(&self) -> &str {
         &self.round_kind
+    }
+    /// The [tiles](crate::tile) the current round's fights start with.
+    pub fn round_tiles(&self) -> &[crate::tile::TilePlacement] {
+        &self.content.schedule().round(self.round_index).0.tiles
     }
     /// Stage of the current round, which scales damage.
     pub fn stage(&self) -> u32 {
@@ -1556,7 +1563,9 @@ impl Game {
             Opponent::Neutral => TeamSetup { units: neutral.to_vec(), bonuses: Vec::new() },
         };
         let teams = vec![self.team_setup(home), away_setup];
-        let mut combat = self.content.setup_combat(seed, &teams).expect("boards are validated when they are built");
+        // Every fight of a round starts with the round's tiles.
+        let tiles = self.round_tiles().to_vec();
+        let mut combat = self.content.setup_combat_with(seed, &teams, &tiles).expect("boards are validated when they are built");
         let outcome = combat.run().clone();
         let survivors = match outcome.winner {
             Some(team) => combat.units().iter().filter(|u| u.is_alive() && u.team() == team).count() as u32,
@@ -1581,6 +1590,7 @@ impl Game {
             duration_ms: outcome.duration_ms,
             survivors,
             teams,
+            tiles,
             events: combat.drain_events(),
         });
         // Results and kills, for both sides when both are players.

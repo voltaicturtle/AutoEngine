@@ -51,6 +51,7 @@ use crate::effect::{
 use crate::resource::ResourceDef;
 use crate::hex::{Hex, HexBoard};
 use crate::stats::{Stat, StatBlock, StatMod};
+use crate::tile::{TileDef, TilePlacement};
 
 fn default_true() -> bool {
     true
@@ -866,6 +867,9 @@ pub struct RoundDef {
     #[serde(default = "default_stage")]
     pub stage: u32,
     pub kind: RoundKindDef,
+    /// [Tiles](crate::tile) every fight of the round starts with.
+    #[serde(default)]
+    pub tiles: Vec<TilePlacement>,
 }
 
 /// The order of rounds in a game. When the list
@@ -879,10 +883,7 @@ pub struct Schedule {
 
 impl Default for Schedule {
     fn default() -> Self {
-        Schedule {
-            rounds: vec![RoundDef { name: "Fight".into(), stage: 1, kind: RoundKindDef::Pvp }],
-            repeat_from: 0,
-        }
+        Schedule { rounds: vec![RoundDef { name: "Fight".into(), stage: 1, kind: RoundKindDef::Pvp, tiles: Vec::new() }], repeat_from: 0 }
     }
 }
 
@@ -1011,7 +1012,23 @@ impl RoundKindDef {
 
 impl RoundDef {
     pub fn new(name: impl Into<String>, stage: u32, kind: RoundKindDef) -> Self {
-        RoundDef { name: name.into(), stage, kind }
+        RoundDef { name: name.into(), stage, kind, tiles: Vec::new() }
+    }
+
+    /// Starts every fight of the round with a tile on this hex, for both
+    /// sides: `pos` is `(column, row)` as each side sees its own half, so
+    /// neither has the better ground. A blocking tile is left out of a
+    /// fight where a unit stands on its hex.
+    pub fn tile(mut self, tile: impl Into<String>, pos: (i32, i32)) -> Self {
+        self.tiles.push(TilePlacement { tile: tile.into(), pos, mirrored: true });
+        self
+    }
+
+    /// Starts every fight of the round with a tile on exactly this hex, as
+    /// the home side sees the board.
+    pub fn tile_at(mut self, tile: impl Into<String>, pos: (i32, i32)) -> Self {
+        self.tiles.push(TilePlacement { tile: tile.into(), pos, mirrored: false });
+        self
     }
 }
 
@@ -1089,6 +1106,22 @@ impl TeamSetup {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatchSetup {
     pub teams: Vec<TeamSetup>,
+    /// [Tiles](crate::tile) the fight starts with.
+    #[serde(default)]
+    pub tiles: Vec<TilePlacement>,
+}
+
+impl MatchSetup {
+    pub fn new(teams: impl IntoIterator<Item = TeamSetup>) -> Self {
+        MatchSetup { teams: teams.into_iter().collect(), tiles: Vec::new() }
+    }
+
+    /// Starts the fight with a tile on exactly this hex, as the first team
+    /// sees the board.
+    pub fn tile_at(mut self, tile: impl Into<String>, pos: (i32, i32)) -> Self {
+        self.tiles.push(TilePlacement { tile: tile.into(), pos, mirrored: false });
+        self
+    }
 }
 
 /// The state of one trait for a given board.
@@ -1232,7 +1265,7 @@ pub struct GameBuilder {
 pub type Translations = BTreeMap<String, BTreeMap<String, String>>;
 
 /// The kinds of definition that have translatable text.
-pub const TEXT_KINDS: [&str; 7] = ["unit", "trait", "item", "augment", "resource", "currency", "action"];
+pub const TEXT_KINDS: [&str; 8] = ["unit", "trait", "item", "augment", "resource", "currency", "action", "tile"];
 
 /// The text fields of a unit's ability, by position: `"ability"` and
 /// `"ability_description"` for the first, `"ability_2"` and
@@ -1332,6 +1365,41 @@ impl GameBuilder {
         match currencies.iter_mut().find(|c| c.id == def.id) {
             Some(existing) => *existing = def,
             None => currencies.push(def),
+        }
+        self
+    }
+
+    /// Adds a kind of [tile](crate::tile), or replaces the one with the
+    /// same id.
+    ///
+    /// ```
+    /// use autoengine::content::{ContentSet, UnitDef};
+    /// use autoengine::effect::{Ability, Effect, Selector};
+    /// use autoengine::stats::Stat;
+    /// use autoengine::tile::TileDef;
+    ///
+    /// let game = ContentSet::builder()
+    ///     .tile(TileDef::new("embers", "Embers").enemies_only().per_second(Effect::magic(40)))
+    ///     .unit(UnitDef::new("pyre", "Pyre").stat(Stat::MaxMana, 60).ability(
+    ///         Ability::new("Scorch").effect(Effect::tile_for("embers", 3000).spread(1).to(Selector::CurrentTarget)),
+    ///     ))
+    ///     .build()
+    ///     .unwrap();
+    /// assert!(game.tile("embers").is_some());
+    /// ```
+    pub fn tile(mut self, def: TileDef) -> Self {
+        let tiles = &mut self.rules.combat.tiles;
+        match tiles.iter_mut().find(|t| t.id == def.id) {
+            Some(existing) => *existing = def,
+            None => tiles.push(def),
+        }
+        self
+    }
+
+    /// Adds several kinds of tile; see [`GameBuilder::tile`].
+    pub fn tiles(mut self, defs: impl IntoIterator<Item = TileDef>) -> Self {
+        for def in defs {
+            self = self.tile(def);
         }
         self
     }
@@ -1645,6 +1713,8 @@ impl ContentSet {
             ("currency", "name") => self.currency(id).map(|d| d.name.clone()),
             ("action", "name") => self.action(id).map(|d| d.name.clone()),
             ("action", "description") => self.action(id).map(|d| d.description.clone()),
+            ("tile", "name") => self.tile(id).map(|d| d.name.clone()),
+            ("tile", "description") => self.tile(id).map(|d| d.description.clone()),
             _ => None,
         }?;
         let translated = language
@@ -1685,6 +1755,10 @@ impl ContentSet {
         for def in self.actions() {
             keys.push(text_key("action", &def.id, "name"));
             keys.push(text_key("action", &def.id, "description"));
+        }
+        for def in self.tiles() {
+            keys.push(text_key("tile", &def.id, "name"));
+            keys.push(text_key("tile", &def.id, "description"));
         }
         keys
     }
@@ -1820,6 +1894,7 @@ impl ContentSet {
                         "resource" => self.resource(id).is_some() && *field == "name",
                         "currency" => self.currency(id).is_some() && *field == "name",
                         "action" => self.action(id).is_some() && matches!(*field, "name" | "description"),
+                        "tile" => self.tile(id).is_some() && matches!(*field, "name" | "description"),
                         _ => false,
                     },
                     _ => false,
@@ -1924,6 +1999,15 @@ impl ContentSet {
                 invalid(format!("{owner} refers to unknown resource `{id}`{}", suggestion(id, known.iter())))
             }
         };
+        let tiles = &r.combat.tiles;
+        let check_tile = |owner: &str, id: &str| {
+            if tiles.iter().any(|t| t.id == id) {
+                Ok(())
+            } else {
+                let known: Vec<String> = tiles.iter().map(|t| t.id.clone()).collect();
+                invalid(format!("{owner} refers to unknown tile `{id}`{}", suggestion(id, known.iter())))
+            }
+        };
         let damage_types = &r.combat.damage_types;
         let check_damage_kind = |owner: &str, kind: DamageKind| {
             if damage_types.iter().any(|t| t.kind == kind) {
@@ -1979,6 +2063,7 @@ impl ContentSet {
                             result = invalid(format!("{owner} uses unregistered custom condition `{name}`"));
                         }
                         Condition::ResourceAtLeast { resource, .. } => result = check_resource(owner, resource),
+                        Condition::OnTile { tile, .. } => result = check_tile(owner, tile),
                         _ => {}
                     }
                 });
@@ -2023,11 +2108,38 @@ impl ContentSet {
                     Effect::Custom { name, .. } if !self.hooks.effects.contains_key(name) => {
                         return invalid(format!("{owner} uses unregistered custom effect `{name}`"));
                     }
+                    Effect::PlaceTile { tile, .. } => check_tile(owner, tile)?,
                     _ => {}
                 }
             }
             Ok(())
         };
+        let mut tile_ids = BTreeSet::new();
+        for tile in &r.combat.tiles {
+            let owner = format!("tile `{}`", tile.id);
+            if tile.id.is_empty() {
+                return invalid("a tile needs an id".into());
+            }
+            if !tile_ids.insert(&tile.id) {
+                return invalid(format!("duplicate tile id `{}`", tile.id));
+            }
+            if tile.blocks && (tile.effects().next().is_some() || !tile.mods.is_empty()) {
+                return invalid(format!("{owner} blocks its hex, so nothing can ever stand on it to get its effects"));
+            }
+            // A tile's effects happen to the unit on it.
+            let specs: Vec<EffectSpec> = tile.effects().map(|e| e.clone().to(Selector::Source)).collect();
+            check_effects(&owner, &specs)?;
+        }
+        for round in &self.schedule.rounds {
+            for placement in &round.tiles {
+                let owner = format!("round `{}`", round.name);
+                check_tile(&owner, &placement.tile)?;
+                let (col, row) = placement.pos;
+                if !(0..r.board_cols as i32).contains(&col) || !(0..r.board_rows as i32).contains(&row) {
+                    return invalid(format!("{owner} puts tile `{}` at {:?}, which is off the board", placement.tile, placement.pos));
+                }
+            }
+        }
         let check_passives = |owner: &str, passives: &[Passive]| {
             passives.iter().try_for_each(|p| {
                 check_condition(owner, p.condition.as_ref())?;
@@ -2149,6 +2261,15 @@ impl ContentSet {
     }
     pub fn currency(&self, id: &str) -> Option<&CurrencyDef> {
         self.currencies().iter().find(|c| c.id == id)
+    }
+
+    /// The kinds of [tile](crate::tile) fights can have on the board.
+    pub fn tiles(&self) -> &[TileDef] {
+        &self.rules.combat.tiles
+    }
+
+    pub fn tile(&self, id: &str) -> Option<&TileDef> {
+        self.tiles().iter().find(|t| t.id == id)
     }
 
     /// What players can do during planning besides the built-in commands.
@@ -2405,6 +2526,13 @@ impl ContentSet {
     /// is rotated half a turn so the two face each other. Every unit in the
     /// content set is registered so summons can find it.
     pub fn setup_combat(&self, seed: u64, teams: &[TeamSetup]) -> Result<Combat, ContentError> {
+        self.setup_combat_with(seed, teams, &[])
+    }
+
+    /// [`setup_combat`](Self::setup_combat) on a board that starts with
+    /// [tiles](crate::tile). They are laid once the units stand, so a
+    /// blocking tile is left out where a unit already is.
+    pub fn setup_combat_with(&self, seed: u64, teams: &[TeamSetup], tiles: &[TilePlacement]) -> Result<Combat, ContentError> {
         let board = self.board();
         let mut combat = Combat::with_config(board.clone(), seed, self.rules.combat.clone());
         for (name, hook) in &self.hooks.effects {
@@ -2428,6 +2556,24 @@ impl ContentSet {
                 combat
                     .spawn(p.template.clone(), Team(i as u8), pos)
                     .map_err(|e| ContentError::Invalid(format!("cannot place `{}`: {e}", p.template.name)))?;
+            }
+        }
+        for placement in tiles {
+            if self.tile(&placement.tile).is_none() {
+                let known: Vec<String> = self.tiles().iter().map(|t| t.id.clone()).collect();
+                return invalid(format!(
+                    "the fight starts with unknown tile `{}`{}",
+                    placement.tile,
+                    suggestion(&placement.tile, known.iter())
+                ));
+            }
+            let pos = Hex::from_offset(placement.pos.0, placement.pos.1);
+            if !board.contains(pos) {
+                return invalid(format!("tile `{}` at {:?} is off the board", placement.tile, placement.pos));
+            }
+            combat.place_tile(&placement.tile, pos, None, None);
+            if placement.mirrored && board.mirror(pos) != pos {
+                combat.place_tile(&placement.tile, board.mirror(pos), None, None);
             }
         }
         Ok(combat)

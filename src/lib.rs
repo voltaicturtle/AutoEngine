@@ -87,6 +87,7 @@ pub mod sample;
 pub mod script;
 pub mod session;
 pub mod stats;
+pub mod tile;
 pub mod tools;
 
 /// The types most programs built on the engine need, in one import:
@@ -118,6 +119,8 @@ mod guides {
     struct Resources;
     #[doc = include_str!("../docs/guides/damage.md")]
     struct Damage;
+    #[doc = include_str!("../docs/guides/tiles.md")]
+    struct Tiles;
     #[doc = include_str!("../docs/guides/traits.md")]
     struct Traits;
     #[doc = include_str!("../docs/guides/items.md")]

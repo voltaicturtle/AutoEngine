@@ -190,6 +190,7 @@ fn playback_shows_statuses_while_they_last() {
         duration_ms: c.time_ms(),
         survivors: 0,
         teams: vec![],
+        tiles: vec![],
         events: c.events().to_vec(),
     };
     let mut playback = Playback::new(&record);

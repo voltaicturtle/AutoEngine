@@ -300,6 +300,7 @@ assert_eq!(content.name_in(Some("fr"), "ashen_hound").as_deref(), Some("Chien de
 | `resource.ID.name` | a [resource](resources.md)'s name |
 | `currency.ID.name` | a [currency](#currencies)'s name |
 | `action.ID.name`, `action.ID.description` | an [action](#actions)'s name and description |
+| `tile.ID.name`, `tile.ID.description` | a [tile](tiles.md)'s name and description |
 | `item.ID.name`, `item.ID.description` | an item's name and description |
 | `trait.ID.name`, `trait.ID.description` | a trait's name and description |
 | `augment.ID.name`, `augment.ID.description` | an augment's name and description |

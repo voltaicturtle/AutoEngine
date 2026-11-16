@@ -217,6 +217,10 @@ pub struct GameView {
     /// sitting in shops).
     #[serde(default)]
     pub pool: std::collections::BTreeMap<String, u32>,
+    /// The [tiles](crate::tile) this round's fights start with, as the
+    /// viewer's side sees its own half, so a board can be laid out for them.
+    #[serde(default)]
+    pub round_tiles: Vec<crate::tile::TilePlacement>,
 }
 
 impl GameView {
@@ -246,6 +250,9 @@ pub struct ViewUpdate {
     /// The pool, only when it changed.
     #[serde(default)]
     pub pool: Option<std::collections::BTreeMap<String, u32>>,
+    /// The round's tiles, only when they changed.
+    #[serde(default)]
+    pub round_tiles: Option<Vec<crate::tile::TilePlacement>>,
 }
 
 impl GameView {
@@ -272,7 +279,8 @@ impl GameView {
             && self.awaiting == newer.awaiting
             && self.options == newer.options
             && self.paused == newer.paused
-            && self.pool == newer.pool;
+            && self.pool == newer.pool
+            && self.round_tiles == newer.round_tiles;
         if unchanged {
             return None;
         }
@@ -288,6 +296,7 @@ impl GameView {
             status,
             paused: newer.paused,
             pool: (self.pool != newer.pool).then(|| newer.pool.clone()),
+            round_tiles: (self.round_tiles != newer.round_tiles).then(|| newer.round_tiles.clone()),
         })
     }
 
@@ -303,6 +312,9 @@ impl GameView {
         self.paused = update.paused;
         if let Some(pool) = update.pool {
             self.pool = pool;
+        }
+        if let Some(tiles) = update.round_tiles {
+            self.round_tiles = tiles;
         }
         for player in update.players {
             let seat = player.id.0 as usize;

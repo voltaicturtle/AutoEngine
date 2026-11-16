@@ -263,6 +263,18 @@ pub enum Effect {
     /// The source jumps to the free hex closest to the selected unit, and
     /// targets it if it is an enemy.
     Leap,
+    /// Lays a [tile](crate::tile) on the selected unit's hex and on every
+    /// hex within `radius` of it, for `duration_ms` or for the rest of the
+    /// fight. The source owns the tiles: its side decides whom they
+    /// affect, and it is the source of their effects. A blocking tile is
+    /// not laid on a hex a unit is standing on.
+    PlaceTile {
+        tile: String,
+        #[serde(default)]
+        radius: u32,
+        #[serde(default)]
+        duration_ms: Option<u32>,
+    },
     /// Brings a dead unit back with this much health (at least 1, at most
     /// its maximum), where it fell or on the nearest free hex. It returns
     /// without shields, statuses or a cast in progress, and keeps its
@@ -326,6 +338,34 @@ impl Effect {
     /// Gives some of a resource, or drains it when negative.
     pub fn resource(resource: impl Into<String>, amount: impl Into<Amount>) -> Self {
         Effect::GainResource { resource: resource.into(), amount: amount.into() }
+    }
+
+    /// Lays a tile under each selected unit for the rest of the fight; see
+    /// [`Effect::PlaceTile`] and the [`tile`](crate::tile) module.
+    pub fn tile(tile: impl Into<String>) -> Self {
+        Effect::PlaceTile { tile: tile.into(), radius: 0, duration_ms: None }
+    }
+
+    /// Lays a tile under each selected unit for `duration_ms`.
+    ///
+    /// ```
+    /// use autoengine::effect::{Ability, Effect, Selector};
+    ///
+    /// // Three seconds of burning ground under the target and around it.
+    /// let scorch = Ability::new("Scorch").effect(Effect::tile_for("embers", 3000).spread(1).to(Selector::CurrentTarget));
+    /// assert_eq!(scorch.effects.len(), 1);
+    /// ```
+    pub fn tile_for(tile: impl Into<String>, duration_ms: u32) -> Self {
+        Effect::PlaceTile { tile: tile.into(), radius: 0, duration_ms: Some(duration_ms) }
+    }
+
+    /// Makes a tile effect cover every hex within `radius` as well. Other
+    /// effects are returned unchanged.
+    pub fn spread(mut self, hexes: u32) -> Self {
+        if let Effect::PlaceTile { radius, .. } = &mut self {
+            *radius = hexes;
+        }
+        self
     }
 
     /// Brings a dead unit back; see [`Effect::Revive`].
@@ -578,7 +618,16 @@ pub enum Condition {
     ResourceAtLeast { who: Who, resource: String, permille: u32 },
     /// The unit has a status with this [name](StatusKind::name), such as
     /// `"stunned"` or the name of a [marker](StatusKind::Marker).
-    HasStatus { who: Who, status: String },
+    HasStatus {
+        who: Who,
+        status: String,
+    },
+    /// The unit is standing on a [tile](crate::tile) of this kind, whether
+    /// or not the tile affects it.
+    OnTile {
+        who: Who,
+        tile: String,
+    },
     /// A seeded random roll, in permille.
     Chance { permille: u32 },
     Not(Box<Condition>),

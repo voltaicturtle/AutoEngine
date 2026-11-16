@@ -121,7 +121,12 @@ fn scripts_read_give_and_take_currencies() {
             game.log(`left ${game.amount(0, "souls")}, gems ${game.amount(0, "gems")}`);
         }
     "#;
-    let round = RoundDef { name: "tithe".into(), stage: 1, kind: RoundKindDef::Custom { kind: "tithe".into(), params: BTreeMap::new() } };
+    let round = RoundDef {
+        name: "tithe".into(),
+        stage: 1,
+        kind: RoundKindDef::Custom { kind: "tithe".into(), params: BTreeMap::new() },
+        tiles: Vec::new(),
+    };
     let content = with_souls()
         .with_scripts(BTreeMap::from([("tithe".to_string(), source.to_string())]))
         .unwrap()

@@ -449,7 +449,7 @@ fn fight(spec: &GameSpec, args: &mut Args) -> Result<(), String> {
             let found = (spec.tests)().into_iter().find(|t| t.name.contains(&name));
             let scenario = found.ok_or(format!("no content test has \"{name}\" in its name"))?;
             println!("test: {}", scenario.name);
-            MatchSetup { teams: scenario.teams }
+            MatchSetup { teams: scenario.teams, tiles: scenario.tiles }
         }
         None => match spec.sample_match {
             Some(sample_match) => sample_match(),
@@ -470,7 +470,7 @@ fn fight(spec: &GameSpec, args: &mut Args) -> Result<(), String> {
         println!("team {i} traits: {}", summary.join(", "));
     }
 
-    let mut combat = content.setup_combat(seed, &setup.teams).map_err(|e| e.to_string())?;
+    let mut combat = content.setup_combat_with(seed, &setup.teams, &setup.tiles).map_err(|e| e.to_string())?;
     combat.run();
 
     if !quiet {
@@ -624,7 +624,16 @@ fn print_log(combat: &Combat) {
             EventKind::Died { unit, killer } => {
                 format!("{} dies (killed by {})", label(*unit), label(*killer))
             }
-            EventKind::Revived { unit, health, .. } => format!("{} gets back up with {health} health", label(*unit)),
+            EventKind::TilePlaced { tile, pos, duration_ms, .. } => match duration_ms {
+                Some(ms) => format!("{tile} covers {:?} for {:.1}s", pos.to_offset(), *ms as f32 / 1000.0),
+                None => format!("{tile} covers {:?}", pos.to_offset()),
+            },
+            EventKind::TileRemoved { tile, pos } => {
+                format!("{tile} is gone from {:?}", pos.to_offset())
+            }
+            EventKind::Revived { unit, health, .. } => {
+                format!("{} gets back up with {health} health", label(*unit))
+            }
             EventKind::Ended { winner, timed_out } => match (winner, timed_out) {
                 (Some(team), _) => format!("Team {} wins", team.0),
                 (None, true) => "Time ran out: draw".to_string(),

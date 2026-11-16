@@ -52,6 +52,7 @@ fn last_state(messages: &[ServerMsg]) -> Option<GameView> {
                     status: Vec::new(),
                     paused: false,
                     pool: Default::default(),
+                    round_tiles: Vec::new(),
                 });
                 base.patch(u.clone());
             }
@@ -516,7 +517,7 @@ fn spectators_can_be_shown_the_game_late() {
 #[test]
 fn rounds_of_a_kind_can_have_their_own_planning_time() {
     use autoengine::content::{RoundDef, RoundKindDef, Schedule};
-    let pvp = RoundDef { name: "fight".into(), stage: 1, kind: RoundKindDef::Pvp };
+    let pvp = RoundDef { name: "fight".into(), stage: 1, kind: RoundKindDef::Pvp, tiles: Vec::new() };
     let content = autoengine::sample::content().with_schedule(Schedule { rounds: vec![pvp], repeat_from: 0 }).unwrap();
     let mut rules = content.rules().clone();
     rules.planning_ms_by_kind.insert("pvp".into(), 5_000);

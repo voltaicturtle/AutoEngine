@@ -18,11 +18,8 @@ fn sample() -> ContentSet {
 
 /// The sample content with a schedule that repeats the given kinds.
 fn with_rounds(kinds: Vec<RoundKindDef>) -> Arc<ContentSet> {
-    let rounds = kinds
-        .into_iter()
-        .enumerate()
-        .map(|(i, kind)| RoundDef { name: format!("r{i}"), stage: 1, kind })
-        .collect();
+    let rounds =
+        kinds.into_iter().enumerate().map(|(i, kind)| RoundDef { name: format!("r{i}"), stage: 1, kind, tiles: Vec::new() }).collect();
     Arc::new(sample().with_schedule(Schedule { rounds, repeat_from: 0 }).unwrap())
 }
 
@@ -526,7 +523,7 @@ fn a_player_who_forfeits_goes_out_last_when_the_round_ends() {
 fn forfeiting_during_a_draft_makes_the_pick_so_nobody_waits() {
     use autoengine::content::{RoundDef, RoundKindDef, Schedule};
     use autoengine::game::Command;
-    let draft = RoundDef { name: "draft".into(), stage: 1, kind: RoundKindDef::Draft { extra: 0, max_cost: None } };
+    let draft = RoundDef { name: "draft".into(), stage: 1, kind: RoundKindDef::Draft { extra: 0, max_cost: None }, tiles: Vec::new() };
     let content = autoengine::sample::content().with_schedule(Schedule { rounds: vec![draft], repeat_from: 0 }).unwrap();
     let mut g = autoengine::game::Game::new(content, 1, &["a", "b", "c"]);
     g.begin_round().unwrap();
@@ -563,7 +560,7 @@ fn player_stats_add_up() {
 /// A schedule of player fights only.
 fn pvp_only(players: &[&str], rules: impl FnOnce(&mut autoengine::content::GameRules)) -> autoengine::game::Game {
     use autoengine::content::{RoundDef, RoundKindDef, Schedule};
-    let pvp = RoundDef { name: "fight".into(), stage: 1, kind: RoundKindDef::Pvp };
+    let pvp = RoundDef { name: "fight".into(), stage: 1, kind: RoundKindDef::Pvp, tiles: Vec::new() };
     let mut content = autoengine::sample::content().with_schedule(Schedule { rounds: vec![pvp], repeat_from: 0 }).unwrap();
     let mut r = content.rules().clone();
     rules(&mut r);
@@ -756,7 +753,12 @@ fn single_use_items_cannot_be_recipe_parts() {
 fn choice_offers_can_be_rerolled_a_limited_number_of_times() {
     use autoengine::content::{ChoiceOffer, RoundDef, RoundKindDef, Schedule};
     use autoengine::game::{Command, CommandError, PlayerId};
-    let choice = RoundDef { name: "pick".into(), stage: 1, kind: RoundKindDef::Choice { options: 2, offer: ChoiceOffer::Augments } };
+    let choice = RoundDef {
+        name: "pick".into(),
+        stage: 1,
+        kind: RoundKindDef::Choice { options: 2, offer: ChoiceOffer::Augments },
+        tiles: Vec::new(),
+    };
     let content = autoengine::sample::content().with_schedule(Schedule { rounds: vec![choice], repeat_from: 0 }).unwrap();
     let mut g = autoengine::game::Game::new(content, 4, &["a", "b"]);
     g.begin_round().unwrap();

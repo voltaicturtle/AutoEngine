@@ -251,6 +251,9 @@ pub(crate) fn draw_replay(app: &mut App, layout: &Layout) {
     view.begin();
     let mut ground = Ground::default();
     board_tiles(&mut ground, layout, false, None);
+    for tile in show.playback.tiles() {
+        tile_marker(&mut ground, app, &tile.tile, place(tile.pos.q as f32, tile.pos.r as f32));
+    }
     for u in show.playback.units().filter(|u| u.alive) {
         let (q, r) = u.position_at(now);
         let at = place(q, r) + RING_LIFT;

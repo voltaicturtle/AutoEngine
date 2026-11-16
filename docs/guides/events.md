@@ -124,6 +124,8 @@ they appeared. `Spawned` says which unit each one is.
 | `Overtime` | | overtime began, and damage grows from now on (see [Fights](fights.md#overtime)) |
 | `Died` | `unit`, `killer` | a unit died |
 | `Revived` | `unit`, `source`, `pos`, `health` | a dead unit is back, at `pos` with `health` |
+| `TilePlaced` | `tile`, `pos`, `team`, `duration_ms` | a [tile](tiles.md) is on a hex, newly laid or laid again. `team` is the side of whoever laid it, and `duration_ms` how long it has left |
+| `TileRemoved` | `tile`, `pos` | a tile is gone from a hex |
 | `Ended` | `winner`, `timed_out` | the fight ended. `winner` is the team left standing, or `None` for a draw |
 
 `playback::fight_stats(&record.events)` adds these up into each unit's

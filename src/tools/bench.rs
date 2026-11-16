@@ -37,7 +37,7 @@ pub fn fights(content: &ContentSet, setup: &MatchSetup, count: u32) -> Result<Ti
     let start = Instant::now();
     let mut steps = 0u64;
     for seed in 0..count {
-        let mut combat = content.setup_combat(seed as u64 + 1, &setup.teams).map_err(|e| e.to_string())?;
+        let mut combat = content.setup_combat_with(seed as u64 + 1, &setup.teams, &setup.tiles).map_err(|e| e.to_string())?;
         steps += combat.run().ticks as u64;
     }
     Ok(Timing { count, elapsed: start.elapsed(), steps })

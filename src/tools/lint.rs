@@ -188,6 +188,15 @@ pub fn lint(content: &ContentSet, assets: Option<&Path>) -> Vec<Warning> {
         }
     }
 
+    // A tile has to get onto the board somehow.
+    for tile in content.tiles() {
+        let by_effect = effects.iter().any(|(_, spec)| matches!(&spec.effect, Effect::PlaceTile { tile: id, .. } if *id == tile.id));
+        let by_round = content.schedule().rounds.iter().any(|r| r.tiles.iter().any(|p| p.tile == tile.id));
+        if !by_effect && !by_round {
+            warn(format!("tile {}", tile.id), "nothing in the content lays it: no effect and no round (Rust code still can)".into());
+        }
+    }
+
     // A currency should come from somewhere and go somewhere, and an action
     // should do something. Scripts and Rust hooks can do either, so these
     // only speak up when the content has neither.

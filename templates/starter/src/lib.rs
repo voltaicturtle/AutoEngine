@@ -128,12 +128,10 @@ pub fn schedule() -> Schedule {
 /// Positions are (column, row) from each team's own side: row 4 is the front
 /// line and row 7 the back.
 pub fn sample_match() -> MatchSetup {
-    MatchSetup {
-        teams: vec![
-            TeamSetup::new().unit(BoardUnit::new("shield_bearer", (3, 4))).unit(BoardUnit::new("longbow", (2, 7))),
-            TeamSetup::new().unit(BoardUnit::new("shield_bearer", (3, 4))).unit(BoardUnit::new("field_medic", (4, 6))),
-        ],
-    }
+    MatchSetup::new([
+        TeamSetup::new().unit(BoardUnit::new("shield_bearer", (3, 4))).unit(BoardUnit::new("longbow", (2, 7))),
+        TeamSetup::new().unit(BoardUnit::new("shield_bearer", (3, 4))).unit(BoardUnit::new("field_medic", (4, 6))),
+    ])
 }
 
 /// Fights with an expected result, run by `cargo test` and `cargo run --

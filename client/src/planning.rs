@@ -38,6 +38,11 @@ pub(crate) fn draw_planning(app: &mut App, layout: &Layout) {
     let mut ground = Ground::default();
     let drop_hex = dragged_unit.and_then(|_| layout.hex_at(mouse)).filter(|(_, row)| *row >= layout.rows / 2);
     board_tiles(&mut ground, layout, true, drop_hex);
+    // What the round's fights will start with, so units can be placed for it.
+    let preset = round_tiles(app);
+    for (tile, (col, row)) in &preset {
+        tile_marker(&mut ground, app, tile, layout.hex_world(*col, *row));
+    }
     let drop_bench = dragged_unit.and_then(|_| layout.bench_at(mouse));
     for i in 0..layout.bench_slots {
         let fill = if drop_bench == Some(i) { ui().tile_highlight } else { ui().bench };
@@ -144,6 +149,8 @@ pub(crate) fn draw_planning(app: &mut App, layout: &Layout) {
                 draw_unit_tooltip(app, &unit, mouse);
             } else if let Some(item) = hovered_item {
                 draw_item_tooltip(app, &item, mouse);
+            } else if let Some((tile, _)) = layout.hex_at(mouse).and_then(|hex| preset.iter().find(|(_, at)| *at == hex)) {
+                draw_tile_tooltip(app, tile, mouse);
             }
         }
     }
@@ -231,6 +238,27 @@ pub(crate) fn draw_unit_tooltip(app: &App, unit: &OwnedUnit, at: Vec2) {
         lines.push((format!("Item: {}", state.display_name(item)), ui().muted));
     }
     draw_tooltip(&title, &lines, at);
+}
+
+/// What a tile does, for the mouse over its hex.
+pub(crate) fn draw_tile_tooltip(app: &App, tile: &str, at: Vec2) {
+    let state = &app.net.state;
+    let Some(def) = state.content.as_ref().and_then(|c| c.tile(tile)) else {
+        return;
+    };
+    let mut lines = Vec::new();
+    let description = state.description("tile", tile);
+    if !description.is_empty() {
+        lines.push((description, ui().muted));
+    }
+    for m in &def.mods {
+        let amount = if m.permille != 0 { format!("{:+}%", m.permille / 10) } else { format!("{:+}", m.flat) };
+        lines.push((format!("{amount} {} while standing here", m.stat), ui().good));
+    }
+    if def.blocks {
+        lines.push(("Nobody can stand here".into(), ui().gold));
+    }
+    draw_tooltip(&state.text("tile", tile, "name"), &lines, at);
 }
 
 /// What an item does, for the mouse hovering it.
