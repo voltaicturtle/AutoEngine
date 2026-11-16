@@ -190,6 +190,7 @@ When a unit has no target, or its target dies, it picks a new one:
 | `LowestArmor` | the enemy with the least armor |
 | `HighestStat(stat)` | the enemy with the most of any stat, your own stats included |
 | `LowestStat(stat)` | the enemy with the least of any stat |
+| `Targeting::custom(name)` | the first enemy a [custom selector](effects.md#rust-hooks) registered under that name picks, or the nearest when it picks none |
 
 Ties go to the closest enemy. A taunted unit attacks whoever taunted it,
 whatever its targeting says.

@@ -327,3 +327,32 @@ fn lint_catches_signals_and_statuses_that_lead_nowhere() {
     assert_eq!(game.passives().len(), 4);
     assert_eq!(game.effects().len(), 3 + 4);
 }
+
+#[test]
+fn targeting_can_be_decided_by_a_custom_selector() {
+    // Goes for whoever on the other side has the most missing health.
+    let wounded = |c: &autoengine::combat::SelectContext<'_>| {
+        let me = c.combat().unit(c.source());
+        let mut enemies: Vec<_> = c.combat().units().iter().filter(|u| u.is_alive() && u.team() != me.team()).collect();
+        enemies.sort_by_key(|u| (u.health() - u.stat(Stat::MaxHealth), u.id()));
+        enemies.into_iter().map(|u| u.id()).collect()
+    };
+    let mut hunter = hitter("hunter");
+    hunter.targeting = Targeting::custom("most_wounded");
+    hunter.stats.set(Stat::Range, 10);
+    let mut c = fight(CombatConfig::default());
+    c.register_custom_selector("most_wounded", wounded);
+    let hurt = Passive::new("Hurt", Trigger::CombatStart).effect(Effect::true_damage(500).to(Selector::Source));
+    let me = c.spawn(hunter, Team(0), at(3, 7)).unwrap();
+    let near = c.spawn(dummy("near"), Team(1), at(3, 6)).unwrap();
+    let far = c.spawn(dummy("far").with_passive(hurt), Team(1), at(0, 0)).unwrap();
+    steps(&mut c, 30);
+    assert_eq!(c.unit(me).target(), Some(far));
+    assert_eq!(lost(&c, near), 0);
+    assert!(lost(&c, far) > 500);
+
+    // Content that names a selector nobody registered does not build.
+    let unit = UnitDef::new("hunter", "Hunter").cost(1).targeting(Targeting::custom("most_wonded"));
+    let err = ContentSet::builder().custom_selector("most_wounded", |_| Vec::new()).unit(unit).build().err().unwrap().to_string();
+    assert!(err.contains("targets with unregistered custom selector `most_wonded`") && err.contains("most_wounded"), "{err}");
+}

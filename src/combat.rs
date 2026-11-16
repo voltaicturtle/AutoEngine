@@ -842,6 +842,17 @@ impl Combat {
             Targeting::LowestArmor => enemies.min_by_key(|o| (o.stat(Stat::Armor), near(o))),
             Targeting::HighestStat(stat) => enemies.min_by_key(|o| (std::cmp::Reverse(o.stat(stat)), near(o))),
             Targeting::LowestStat(stat) => enemies.min_by_key(|o| (o.stat(stat), near(o))),
+            Targeting::Custom(name) => {
+                let picked = self.custom_selectors.get(name.as_str()).and_then(|hook| {
+                    hook(&SelectContext { combat: self, source: id, other: None })
+                        .into_iter()
+                        .find(|t| self.units.get(t.0 as usize).is_some_and(|o| o.alive && o.team != me.team))
+                });
+                match picked {
+                    Some(t) => Some(self.u(t)),
+                    None => enemies.min_by_key(|o| near(o)),
+                }
+            }
         }
         .map(|o| o.id);
         self.u_mut(id).target = target;

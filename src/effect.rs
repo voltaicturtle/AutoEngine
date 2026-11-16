@@ -939,6 +939,19 @@ pub enum Targeting {
     HighestStat(Stat),
     /// The enemy with the least of any stat.
     LowestStat(Stat),
+    /// The first enemy picked by the custom selector registered under this
+    /// name (see
+    /// [`GameBuilder::custom_selector`](crate::content::GameBuilder::custom_selector)),
+    /// or the nearest enemy when it picks none.
+    Custom(Name),
+}
+
+impl Targeting {
+    /// Targeting decided by a custom selector hook; see
+    /// [`Targeting::Custom`].
+    pub const fn custom(selector: &'static str) -> Self {
+        Targeting::Custom(Name::new(selector))
+    }
 }
 
 impl UnitTemplate {

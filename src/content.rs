@@ -2036,6 +2036,12 @@ impl ContentSet {
         };
 
         for u in self.units.values() {
+            if let crate::effect::Targeting::Custom(name) = u.targeting
+                && !self.hooks.selectors.contains_key(name.as_str())
+            {
+                let known: Vec<String> = self.hooks.selectors.keys().cloned().collect();
+                return invalid(format!("unit `{}` targets with unregistered custom selector `{name}`{}", u.id, suggestion(name.as_str(), known.iter())));
+            }
             let owner = format!("unit `{}`", u.id);
             for t in &u.traits {
                 check_trait(&owner, t)?;
