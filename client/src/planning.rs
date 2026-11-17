@@ -38,6 +38,11 @@ pub(crate) fn draw_planning(app: &mut App, layout: &Layout) {
     let mut ground = Ground::default();
     let drop_hex = dragged_unit.and_then(|_| layout.hex_at(mouse)).filter(|(_, row)| *row >= layout.rows / 2);
     board_tiles(&mut ground, layout, true, drop_hex);
+    // What the round's fights will start with, so units can be placed for it.
+    let preset = round_tiles(app);
+    for (tile, (col, row)) in &preset {
+        tile_marker(&mut ground, app, tile, layout.hex_world(*col, *row));
+    }
     let drop_bench = dragged_unit.and_then(|_| layout.bench_at(mouse));
     for i in 0..layout.bench_slots {
         let fill = if drop_bench == Some(i) { ui().tile_highlight } else { ui().bench };
@@ -117,7 +122,11 @@ pub(crate) fn draw_planning(app: &mut App, layout: &Layout) {
             app.drag = Some(Drag::Item(i));
         }
         draw_shop(app, layout, &player);
+        let hovered_action = draw_actions(app, layout, &player, mouse);
         handle_drop(app, layout, &player, mouse);
+        if let Some(action) = hovered_action.filter(|_| app.drag.is_none()) {
+            draw_action_tooltip(app, &action, &player, mouse);
+        }
     }
 
     // Whatever is being dragged follows the mouse.
@@ -140,6 +149,8 @@ pub(crate) fn draw_planning(app: &mut App, layout: &Layout) {
                 draw_unit_tooltip(app, &unit, mouse);
             } else if let Some(item) = hovered_item {
                 draw_item_tooltip(app, &item, mouse);
+            } else if let Some((tile, _)) = layout.hex_at(mouse).and_then(|hex| preset.iter().find(|(_, at)| *at == hex)) {
+                draw_tile_tooltip(app, tile, mouse);
             }
         }
     }
@@ -208,11 +219,17 @@ pub(crate) fn draw_unit_tooltip(app: &App, unit: &OwnedUnit, at: Vec2) {
     if !traits.is_empty() {
         lines.push((traits.join(", "), ui().muted));
     }
-    if def.ability.is_some() {
-        let name = content.text(language, "unit", &def.id, "ability").unwrap_or_default();
-        let mana = def.stats.get(&autoengine::stats::Stat::MaxMana).copied().unwrap_or(0);
-        lines.push((if mana > 0 { format!("{name} ({mana} mana)") } else { name }, ui().gold));
-        let description = content.text(language, "unit", &def.id, "ability_description").unwrap_or_default();
+    for (index, ability) in def.abilities.iter().enumerate() {
+        let (name_field, description_field) = autoengine::content::ability_fields(index);
+        let name = content.text(language, "unit", &def.id, &name_field).unwrap_or_default();
+        let cost = content.ability_cost(&def.id, unit.star, index).filter(|(_, amount)| *amount > 0).map(|(resource, amount)| {
+            let what = content.text(language, "resource", &resource.id, "name").unwrap_or_default();
+            format!("{amount} {}", what.to_lowercase())
+        });
+        let wait = (ability.cooldown_ms > 0).then(|| format!("every {:.1}s", ability.cooldown_ms as f32 / 1000.0));
+        let terms: Vec<String> = cost.into_iter().chain(wait).collect();
+        lines.push((if terms.is_empty() { name } else { format!("{name} ({})", terms.join(", ")) }, ui().gold));
+        let description = content.text(language, "unit", &def.id, &description_field).unwrap_or_default();
         if !description.is_empty() {
             lines.push((description, ui().muted));
         }
@@ -221,6 +238,27 @@ pub(crate) fn draw_unit_tooltip(app: &App, unit: &OwnedUnit, at: Vec2) {
         lines.push((format!("Item: {}", state.display_name(item)), ui().muted));
     }
     draw_tooltip(&title, &lines, at);
+}
+
+/// What a tile does, for the mouse over its hex.
+pub(crate) fn draw_tile_tooltip(app: &App, tile: &str, at: Vec2) {
+    let state = &app.net.state;
+    let Some(def) = state.content.as_ref().and_then(|c| c.tile(tile)) else {
+        return;
+    };
+    let mut lines = Vec::new();
+    let description = state.description("tile", tile);
+    if !description.is_empty() {
+        lines.push((description, ui().muted));
+    }
+    for m in &def.mods {
+        let amount = if m.permille != 0 { format!("{:+}%", m.permille / 10) } else { format!("{:+}", m.flat) };
+        lines.push((format!("{amount} {} while standing here", m.stat), ui().good));
+    }
+    if def.blocks {
+        lines.push(("Nobody can stand here".into(), ui().gold));
+    }
+    draw_tooltip(&state.text("tile", tile, "name"), &lines, at);
 }
 
 /// What an item does, for the mouse hovering it.
@@ -249,6 +287,9 @@ pub(crate) fn draw_item_tooltip(app: &App, item: &str, at: Vec2) {
     if def.consumable.is_some() {
         lines.push(("Used up when given to a unit".into(), ui().gold));
     }
+    if def.unique {
+        lines.push(("A unit can hold only one".into(), ui().gold));
+    }
     draw_tooltip(&state.display_name(item), &lines, at);
 }
 
@@ -263,7 +304,12 @@ pub(crate) fn draw_shop(app: &mut App, layout: &Layout, player: &Player) {
             panel(r.x, r.y, r.w, r.h, Color::new(0.10, 0.11, 0.15, 1.0));
             continue;
         };
-        let affordable = player.gold >= def.cost as i64;
+        // A special offer: a higher star level costs every copy it stands
+        // for, and an extra trait is listed with the unit's own.
+        let special = player.shop_specials.get(i).cloned().flatten();
+        let star = special.as_ref().map_or(1, |s| s.star.max(1));
+        let price = def.cost as i64 * content.rules().copies_to_upgrade.pow(star as u32 - 1) as i64;
+        let affordable = player.gold >= price;
         let hover = r.contains(vec2(mx, my)) && app.drag.is_none();
         panel(r.x, r.y, r.w, r.h, if hover { ui().panel_light } else { ui().panel });
         draw_rectangle(r.x, r.y, r.w, 5.0, unit_color(&def.name));
@@ -271,12 +317,18 @@ pub(crate) fn draw_shop(app: &mut App, layout: &Layout, player: &Player) {
             let params = DrawTextureParams { dest_size: Some(vec2(44.0, 44.0)), ..Default::default() };
             draw_texture_ex(&icon, r.x + 6.0, r.y + 16.0, WHITE, params);
         } else {
-            draw_unit_token(vec2(r.x + 28.0, r.y + 38.0), 18.0, &def.name, 1, 0, true, None);
+            draw_unit_token(vec2(r.x + 28.0, r.y + 38.0), 18.0, &def.name, star, 0, true, None);
         }
         label(&app.net.state.display_name(&def.id), r.x + 8.0, r.y + 76.0, 16.0, if affordable { ui().text } else { ui().muted });
-        let traits: Vec<String> = def.traits.iter().map(|t| app.net.state.display_name(t)).collect();
-        label(&traits.join(", "), r.x + 8.0, r.y + 94.0, 14.0, ui().muted);
-        label(&format!("{}g", def.cost), r.x + r.w - 30.0, r.y + 42.0, 20.0, ui().gold);
+        let mut traits: Vec<String> = def.traits.iter().map(|t| app.net.state.display_name(t)).collect();
+        if let Some(extra) = special.as_ref().and_then(|s| s.extra_trait.as_ref()) {
+            traits.push(format!("+{}", app.net.state.display_name(extra)));
+        }
+        label(&traits.join(", "), r.x + 8.0, r.y + 94.0, 14.0, if special.is_some() { ui().gold } else { ui().muted });
+        if star > 1 {
+            label(&"*".repeat(star as usize), r.x + 8.0, r.y + 14.0, 16.0, ui().gold);
+        }
+        label(&format!("{price}g"), r.x + r.w - 30.0 - if price >= 10 { 10.0 } else { 0.0 }, r.y + 42.0, 20.0, ui().gold);
         // Copies still in the pool, besides this one.
         if let Some(left) = app.net.state.view.as_ref().and_then(|v| v.pool.get(&def.id)) {
             label(&format!("{left} left"), r.x + r.w - 50.0, r.y + 62.0, 13.0, ui().muted);
@@ -315,6 +367,99 @@ pub(crate) fn draw_shop(app: &mut App, layout: &Layout, player: &Player) {
     if lock || app.pressed(Action::LockShop) {
         app.command(Command::SetShopLock { locked: !player.shop_locked });
     }
+}
+
+/// A price as players read it: `3 Favor + 2g`.
+fn price_text(app: &App, prices: &[autoengine::content::Price]) -> String {
+    let parts: Vec<String> = prices
+        .iter()
+        .map(|price| match price.currency.as_str() {
+            "gold" => format!("{}g", price.amount),
+            id => format!("{} {}", price.amount, app.net.state.text("currency", id, "name")),
+        })
+        .collect();
+    parts.join(" + ")
+}
+
+/// The game's own actions, as a row of buttons on the right of the item
+/// row. An action aimed at a unit is used by dropping the unit on it.
+/// Returns the action under the mouse.
+fn draw_actions(app: &mut App, layout: &Layout, player: &Player, mouse: Vec2) -> Option<String> {
+    // Rightmost first, so the first action ends up on the left.
+    let buttons: Vec<(String, String, bool, ActionTarget)> = {
+        let content = app.net.state.content.as_ref()?;
+        let button = |def: &autoengine::content::ActionDef| {
+            let name = app.net.state.text("action", &def.id, "name");
+            let text = if def.prices.is_empty() { name } else { format!("{name} ({})", price_text(app, &def.prices)) };
+            (def.id.clone(), text, player.can_use(def).is_ok(), def.target)
+        };
+        content.actions().iter().rev().map(button).collect()
+    };
+    let dragged_unit = match app.drag {
+        Some(Drag::Unit(uid)) => Some(uid),
+        _ => None,
+    };
+    let (y, h) = (layout.item_slot(0).y, 36.0);
+    let mut right = layout.shop_area().x + layout.shop_area().w;
+    let mut hovered = None;
+    let mut used = None;
+    for (id, text, enabled, target) in buttons {
+        let w = theme::text_width(&text, 19.0) + 24.0;
+        let x = right - w;
+        right = x - 6.0;
+        let over = Rect::new(x, y, w, h).contains(mouse);
+        match target {
+            ActionTarget::None => {
+                if button(&text, x, y, w, h, enabled && app.drag.is_none()) {
+                    used = Some(Command::Action { id: id.clone(), arg: 0 });
+                }
+            }
+            ActionTarget::Unit => {
+                // Lights up while a unit is held over it.
+                let ready = enabled && dragged_unit.is_some() && over;
+                draw_rectangle(x, y, w, h, if ready { Color::new(0.30, 0.38, 0.52, 1.0) } else { ui().panel_light });
+                draw_rectangle_lines(x, y, w, h, 1.0, if enabled { ui().gold } else { ui().muted });
+                text_centered(&text, x + w / 2.0, y + h / 2.0 + 6.0, 19.0, if enabled { ui().text } else { ui().muted });
+                if let Some(uid) = dragged_unit.filter(|_| ready && is_mouse_button_released(MouseButton::Left)) {
+                    used = Some(Command::Action { id: id.clone(), arg: i64::from(uid) });
+                }
+            }
+        }
+        if over {
+            hovered = Some(id);
+        }
+    }
+    if let Some(command) = used {
+        // The unit was dropped on the button, not on whatever is behind it.
+        app.drag = None;
+        app.command(command);
+    }
+    hovered
+}
+
+/// What an action does and why it cannot be used, for the mouse over it.
+fn draw_action_tooltip(app: &App, action: &str, player: &Player, at: Vec2) {
+    let state = &app.net.state;
+    let Some(def) = state.content.as_ref().and_then(|c| c.action(action)) else { return };
+    let mut lines = Vec::new();
+    let description = state.description("action", action);
+    if !description.is_empty() {
+        lines.push((description, ui().muted));
+    }
+    if !def.prices.is_empty() {
+        lines.push((format!("Costs {}", price_text(app, &def.prices)), ui().gold));
+    }
+    if def.target == ActionTarget::Unit {
+        lines.push(("Drop one of your units here".into(), ui().text));
+    }
+    if let Some(times) = def.per_round {
+        let left = times.saturating_sub(player.actions_used.get(action).copied().unwrap_or(0));
+        lines.push((format!("{left} of {times} left this round"), ui().muted));
+    }
+    if let Err(why) = player.can_use(def) {
+        lines.push((why.to_string(), ui().bad));
+    }
+    draw_tooltip(&state.text("action", action, "name"), &lines, at);
 }
 
 /// Turns the end of a drag into a command.

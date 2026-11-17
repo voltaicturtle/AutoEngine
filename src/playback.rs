@@ -34,22 +34,39 @@ pub struct UnitView {
     pub stunned_until_ms: u32,
     /// Statuses on the unit by [`StatusKind::name`](crate::effect::StatusKind::name),
     /// each with when it ends; see [`UnitView::statuses_at`].
-    pub statuses: Vec<(&'static str, u32)>,
+    pub statuses: Vec<(String, u32)>,
     /// Named stack counters (see `Effect::AddStacks`), without the empty ones.
     pub stacks: BTreeMap<String, u32>,
+    /// The unit's resource bars (mana and whatever else the game defines),
+    /// in the order they first appeared.
+    pub resources: Vec<ResourceView>,
+}
+
+/// One resource bar of a unit in a replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceView {
+    /// The resource's id, as in [`ResourceDef::id`](crate::resource::ResourceDef).
+    pub id: String,
+    pub amount: i64,
+    pub max: i64,
 }
 
 impl UnitView {
     /// Names of the statuses the unit has at `time_ms`, each once, in the
     /// order they were applied.
-    pub fn statuses_at(&self, time_ms: u32) -> Vec<&'static str> {
-        let mut names = Vec::new();
+    pub fn statuses_at(&self, time_ms: u32) -> Vec<&str> {
+        let mut names: Vec<&str> = Vec::new();
         for (name, until) in &self.statuses {
-            if *until > time_ms && !names.contains(name) {
-                names.push(*name);
+            if *until > time_ms && !names.contains(&name.as_str()) {
+                names.push(name);
             }
         }
         names
+    }
+
+    /// How much of a resource the unit has, by resource id.
+    pub fn resource(&self, id: &str) -> Option<&ResourceView> {
+        self.resources.iter().find(|r| r.id == id)
     }
 
     /// Position in fractional axial coordinates `(q, r)`, easing between
@@ -73,6 +90,19 @@ pub enum Flash {
     Miss { target: UnitId },
 }
 
+/// A tile on the board at the replay's current time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileMark {
+    /// The tile's id (see [`TileDef`](crate::tile::TileDef)).
+    pub tile: String,
+    pub pos: crate::hex::Hex,
+    /// The side of whoever laid it, if anyone did.
+    pub team: Option<Team>,
+    pub placed_at_ms: u32,
+    /// When it runs out. `None` is never.
+    pub until_ms: Option<u32>,
+}
+
 /// The state of a replay at its current time.
 #[derive(Clone, Debug)]
 pub struct Playback {
@@ -83,6 +113,7 @@ pub struct Playback {
     time_ms: u32,
     units: BTreeMap<UnitId, UnitView>,
     flashes: Vec<(u32, Flash)>,
+    tiles: Vec<TileMark>,
     winner: Option<Team>,
     ended: bool,
     /// When overtime began, if it has.
@@ -91,15 +122,33 @@ pub struct Playback {
 
 impl Playback {
     pub fn new(record: &CombatRecord) -> Self {
+        let mut playback = Playback::from_events(record.events.clone(), record.tick_ms);
+        playback.duration_ms = record.duration_ms;
+        playback.winner = record.winner;
+        playback
+    }
+
+    /// Replays any fight from its events, such as
+    /// [`Combat::events`](crate::combat::Combat::events) of one run outside
+    /// a game. `tick_ms` is the fight's
+    /// [`CombatConfig::tick_ms`](crate::combat::CombatConfig).
+    pub fn from_events(events: Vec<Event>, tick_ms: u32) -> Self {
+        let tick_ms = tick_ms.max(1);
+        let end = events.iter().rev().find_map(|e| match e.kind {
+            EventKind::Ended { winner, .. } => Some((e.tick * tick_ms, winner)),
+            _ => None,
+        });
+        let last = events.last().map_or(0, |e| e.tick * tick_ms);
         let mut playback = Playback {
-            events: record.events.clone(),
-            tick_ms: record.tick_ms.max(1),
-            duration_ms: record.duration_ms,
+            events,
+            tick_ms,
+            duration_ms: end.map_or(last, |(at, _)| at),
             cursor: 0,
             time_ms: 0,
             units: BTreeMap::new(),
             flashes: Vec::new(),
-            winner: record.winner,
+            tiles: Vec::new(),
+            winner: end.and_then(|(_, winner)| winner),
             ended: false,
             overtime_at_ms: None,
         };
@@ -141,6 +190,7 @@ impl Playback {
                         stunned_until_ms: 0,
                         statuses: Vec::new(),
                         stacks: BTreeMap::new(),
+                        resources: Vec::new(),
                     },
                 );
             }
@@ -173,12 +223,12 @@ impl Playback {
                     u.shield += amount;
                 }
             }
-            EventKind::CastStarted { unit } => {
+            EventKind::CastStarted { unit, .. } => {
                 if let Some(u) = self.units.get_mut(&unit) {
                     u.casting = true;
                 }
             }
-            EventKind::CastFinished { unit } => {
+            EventKind::CastFinished { unit, .. } => {
                 if let Some(u) = self.units.get_mut(&unit) {
                     u.casting = false;
                 }
@@ -189,7 +239,7 @@ impl Playback {
                     if status == crate::effect::StatusKind::Stun {
                         u.stunned_until_ms = u.stunned_until_ms.max(at + duration_ms);
                     }
-                    u.statuses.push((status.name(), at + duration_ms));
+                    u.statuses.push((status.name().to_string(), at + duration_ms));
                 }
             }
             EventKind::StatusExpired { target, status } => {
@@ -197,12 +247,12 @@ impl Playback {
                 // end it early).
                 if let Some(u) = self.units.get_mut(&target) {
                     let name = status.name();
-                    let soonest = u.statuses.iter().enumerate().filter(|(_, (n, _))| *n == name).min_by_key(|(_, (_, until))| *until);
+                    let soonest = u.statuses.iter().enumerate().filter(|(_, (n, _))| n == name).min_by_key(|(_, (_, until))| *until);
                     if let Some((i, _)) = soonest {
                         u.statuses.remove(i);
                     }
                     if status == crate::effect::StatusKind::Stun {
-                        u.stunned_until_ms = u.statuses.iter().filter(|(n, _)| *n == name).map(|(_, until)| *until).max().unwrap_or(at).min(u.stunned_until_ms);
+                        u.stunned_until_ms = u.statuses.iter().filter(|(n, _)| n == name).map(|(_, until)| *until).max().unwrap_or(at).min(u.stunned_until_ms);
                     }
                 }
             }
@@ -215,6 +265,24 @@ impl Playback {
                 }
                 self.flashes.push((at, Flash::Death { unit }));
             }
+            EventKind::TilePlaced { tile, pos, team, duration_ms } => {
+                let until_ms = duration_ms.map(|d| at + d);
+                match self.tiles.iter_mut().find(|t| t.tile == tile && t.pos == pos) {
+                    Some(mark) => (mark.team, mark.until_ms) = (team, until_ms),
+                    None => self.tiles.push(TileMark { tile, pos, team, placed_at_ms: at, until_ms }),
+                }
+            }
+            EventKind::TileRemoved { tile, pos } => self.tiles.retain(|t| !(t.tile == tile && t.pos == pos)),
+            EventKind::Revived { unit, pos, health, .. } => {
+                if let Some(u) = self.units.get_mut(&unit) {
+                    u.alive = true;
+                    u.health = health;
+                    u.pos = pos;
+                    u.prev_pos = pos;
+                    u.statuses.clear();
+                    u.stunned_until_ms = 0;
+                }
+            }
             EventKind::StacksChanged { unit, stack, count } => {
                 if let Some(u) = self.units.get_mut(&unit) {
                     if count == 0 {
@@ -224,8 +292,28 @@ impl Playback {
                     }
                 }
             }
+            EventKind::ResourceChanged { unit, resource, amount, max } => {
+                if let Some(u) = self.units.get_mut(&unit) {
+                    match u.resources.iter_mut().find(|r| r.id == resource) {
+                        Some(bar) => (bar.amount, bar.max) = (amount, max),
+                        None => u.resources.push(ResourceView { id: resource, amount, max }),
+                    }
+                    u.resources.retain(|r| r.max > 0);
+                }
+            }
+            EventKind::Transformed { unit, name, .. } => {
+                if let Some(u) = self.units.get_mut(&unit) {
+                    u.name = name;
+                }
+            }
+            EventKind::HealthSet { unit, health, max_health } => {
+                if let Some(u) = self.units.get_mut(&unit) {
+                    u.health = health;
+                    u.max_health = max_health;
+                }
+            }
             EventKind::Ended { .. } => self.ended = true,
-            EventKind::PassiveTriggered { .. } => {}
+            EventKind::PassiveTriggered { .. } | EventKind::Rewarded { .. } | EventKind::Grew { .. } => {}
         }
     }
 
@@ -265,6 +353,12 @@ impl Playback {
 
     pub fn unit(&self, id: UnitId) -> Option<&UnitView> {
         self.units.get(&id)
+    }
+
+    /// The tiles on the board at the current time, in the order they were
+    /// laid.
+    pub fn tiles(&self) -> &[TileMark] {
+        &self.tiles
     }
 
     /// Flashes that started within the last `window_ms`, with their age.
@@ -332,7 +426,7 @@ pub fn fight_stats(events: &[Event]) -> Vec<UnitFightStats> {
                     s.shielding_done += amount;
                 }
             }
-            EventKind::CastFinished { unit } => {
+            EventKind::CastFinished { unit, .. } => {
                 if let Some(s) = stats.get_mut(unit) {
                     s.casts += 1;
                 }

@@ -11,10 +11,26 @@
 //! * `AbilityPower`: percent multiplier on power-scaled amounts (`100` = 1x).
 //! * Everything else is a plain amount.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::name::{intern, same};
 
 /// A numeric property of a unit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+///
+/// The engine gives the built-in stats their meaning. A game can add its own
+/// with [`Stat::custom`]: the engine stores and modifies them like any other
+/// stat, and content reads them through scalings, selectors, resources and
+/// Rust hooks.
+///
+/// ```
+/// use autoengine::stats::{Stat, StatBlock};
+///
+/// const LUCK: Stat = Stat::custom("luck");
+///
+/// let stats = StatBlock::base().with(LUCK, 7).with_mods(&[LUCK.flat(3)]);
+/// assert_eq!(stats.get(LUCK), 10);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Stat {
     MaxHealth,
     AttackDamage,
@@ -24,7 +40,8 @@ pub enum Stat {
     AttackSpeed,
     /// Attack range in hexes.
     Range,
-    /// Mana needed to cast. `0` means the unit never casts.
+    /// Capacity of the built-in mana resource, which is also what an ability
+    /// costs by default. `0` means the unit has no mana.
     MaxMana,
     StartingMana,
     /// Mana gained per basic attack.
@@ -43,11 +60,50 @@ pub enum Stat {
     /// Cuts how long crowd control lasts on the unit, in thousandths (at
     /// most 80%).
     Tenacity,
+    /// A stat defined by the game; see [`Stat::custom`].
+    Custom(&'static str),
 }
 
+/// How many built-in stats there are.
 pub const STAT_COUNT: usize = 18;
 
+const NAMES: [&str; STAT_COUNT] = [
+    "MaxHealth",
+    "AttackDamage",
+    "AbilityPower",
+    "Armor",
+    "MagicResist",
+    "AttackSpeed",
+    "Range",
+    "MaxMana",
+    "StartingMana",
+    "ManaPerAttack",
+    "CritChance",
+    "CritDamage",
+    "MoveSpeed",
+    "DamageAmp",
+    "DamageReduction",
+    "Lifesteal",
+    "Dodge",
+    "Tenacity",
+];
+
+/// Longest name a custom stat may have, in bytes.
+pub const MAX_STAT_NAME: usize = crate::name::MAX_NAME;
+
+const fn built_in(name: &str) -> Option<usize> {
+    let mut i = 0;
+    while i < STAT_COUNT {
+        if same(NAMES[i], name) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 impl Stat {
+    /// Every built-in stat.
     pub const ALL: [Stat; STAT_COUNT] = [
         Stat::MaxHealth,
         Stat::AttackDamage,
@@ -69,8 +125,65 @@ impl Stat {
         Stat::Tenacity,
     ];
 
-    const fn index(self) -> usize {
-        self as usize
+    /// A stat of the game's own, such as `Stat::custom("luck")`. Declare it
+    /// once as a constant and use that everywhere. Units have 0 of it unless
+    /// given some.
+    ///
+    /// # Panics
+    ///
+    /// If the name is empty, longer than [`MAX_STAT_NAME`] or the name of a
+    /// built-in stat. In a `const` this is a compile error.
+    pub const fn custom(name: &'static str) -> Stat {
+        assert!(!name.is_empty() && name.len() <= MAX_STAT_NAME, "a custom stat needs a short, non-empty name");
+        assert!(built_in(name).is_none(), "a custom stat cannot take the name of a built-in stat");
+        Stat::Custom(name)
+    }
+
+    /// The stat with this name: a built-in one (`"Armor"`) or else a custom
+    /// one. `None` if the name cannot be a stat's (see [`Stat::custom`]).
+    pub fn named(name: &str) -> Option<Stat> {
+        if let Some(i) = built_in(name) {
+            return Some(Stat::ALL[i]);
+        }
+        intern(name).map(Stat::Custom)
+    }
+
+    /// The stat's name: `"Armor"`, or the name a custom stat was given.
+    pub const fn name(self) -> &'static str {
+        match self.slot() {
+            Ok(i) => NAMES[i],
+            Err(name) => name,
+        }
+    }
+
+    /// Whether the game defined this stat.
+    pub const fn is_custom(self) -> bool {
+        matches!(self, Stat::Custom(_))
+    }
+
+    /// Where a built-in stat is stored, or the name of a custom one.
+    const fn slot(self) -> Result<usize, &'static str> {
+        Ok(match self {
+            Stat::MaxHealth => 0,
+            Stat::AttackDamage => 1,
+            Stat::AbilityPower => 2,
+            Stat::Armor => 3,
+            Stat::MagicResist => 4,
+            Stat::AttackSpeed => 5,
+            Stat::Range => 6,
+            Stat::MaxMana => 7,
+            Stat::StartingMana => 8,
+            Stat::ManaPerAttack => 9,
+            Stat::CritChance => 10,
+            Stat::CritDamage => 11,
+            Stat::MoveSpeed => 12,
+            Stat::DamageAmp => 13,
+            Stat::DamageReduction => 14,
+            Stat::Lifesteal => 15,
+            Stat::Dodge => 16,
+            Stat::Tenacity => 17,
+            Stat::Custom(name) => return Err(name),
+        })
     }
 
     /// A flat modifier to this stat: `Stat::Armor.flat(15)`.
@@ -85,14 +198,38 @@ impl Stat {
     }
 }
 
-/// One value per [`Stat`].
+impl std::fmt::Display for Stat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Stats are written as their name, so they can be the keys of a JSON map.
+impl Serialize for Stat {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for Stat {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = std::borrow::Cow::<str>::deserialize(deserializer)?;
+        Stat::named(&name).ok_or_else(|| serde::de::Error::custom(format!("`{name}` cannot be the name of a stat")))
+    }
+}
+
+/// One value per [`Stat`]. Custom stats a block was never given are 0.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StatBlock([i64; STAT_COUNT]);
+pub struct StatBlock {
+    core: [i64; STAT_COUNT],
+    /// Custom stats that are not zero, ordered by name.
+    custom: Vec<(&'static str, i64)>,
+}
 
 impl StatBlock {
     /// All stats zero.
     pub const fn zero() -> Self {
-        StatBlock([0; STAT_COUNT])
+        StatBlock { core: [0; STAT_COUNT], custom: Vec::new() }
     }
 
     /// Reasonable defaults for a melee unit; override what you need with
@@ -116,15 +253,36 @@ impl StatBlock {
     }
 
     pub fn get(&self, stat: Stat) -> i64 {
-        self.0[stat.index()]
+        match stat.slot() {
+            Ok(i) => self.core[i],
+            Err(name) => self.custom.iter().find(|(n, _)| *n == name).map_or(0, |(_, v)| *v),
+        }
     }
 
     pub fn set(&mut self, stat: Stat, value: i64) {
-        self.0[stat.index()] = value;
+        match stat.slot() {
+            Ok(i) => self.core[i] = value,
+            Err(name) => match self.custom.binary_search_by(|(n, _)| (*n).cmp(name)) {
+                Ok(at) if value == 0 => {
+                    self.custom.remove(at);
+                }
+                Ok(at) => self.custom[at].1 = value,
+                Err(_) if value == 0 => {}
+                Err(at) => self.custom.insert(at, (name, value)),
+            },
+        }
     }
 
     pub fn add(&mut self, stat: Stat, delta: i64) {
-        self.0[stat.index()] += delta;
+        match stat.slot() {
+            Ok(i) => self.core[i] += delta,
+            Err(_) => self.set(stat, self.get(stat) + delta),
+        }
+    }
+
+    /// The custom stats the block holds a value for, ordered by name.
+    pub fn custom(&self) -> impl Iterator<Item = (Stat, i64)> + '_ {
+        self.custom.iter().map(|(name, value)| (Stat::Custom(name), *value))
     }
 
     /// Returns a new block with the modifiers permanently folded in, using
@@ -135,7 +293,8 @@ impl StatBlock {
             stats.apply(m);
         }
         let mut out = StatBlock::zero();
-        for stat in Stat::ALL {
+        let custom = self.custom().map(|(stat, _)| stat).chain(mods.iter().map(|m| m.stat).filter(|s| s.is_custom()));
+        for stat in Stat::ALL.into_iter().chain(custom) {
             out.set(stat, stats.get(stat));
         }
         out
@@ -215,8 +374,44 @@ mod tests {
     #[test]
     fn stat_all_matches_indices() {
         for (i, s) in Stat::ALL.iter().enumerate() {
-            assert_eq!(s.index(), i);
+            assert_eq!(s.slot(), Ok(i));
+            assert_eq!(Stat::named(s.name()), Some(*s));
         }
+    }
+
+    #[test]
+    fn custom_stats_behave_like_built_in_ones() {
+        const LUCK: Stat = Stat::custom("luck");
+        let mut s = Stats::new(StatBlock::base().with(LUCK, 10));
+        s.apply(&LUCK.flat(10));
+        s.apply(&LUCK.percent(500));
+        assert_eq!(s.get(LUCK), 30);
+        assert_eq!(s.get(Stat::custom("unset")), 0);
+        s.remove(&LUCK.flat(10));
+        assert_eq!(s.get(LUCK), 15);
+
+        let folded = StatBlock::base().with_mods(&[LUCK.flat(4)]);
+        assert_eq!(folded.get(LUCK), 4);
+        assert_eq!(folded.custom().collect::<Vec<_>>(), vec![(LUCK, 4)]);
+        // Setting a custom stat back to zero leaves no trace, so equal
+        // blocks compare equal however they were built.
+        assert_eq!(folded.with(LUCK, 0), StatBlock::base());
+    }
+
+    #[test]
+    fn stats_are_written_by_name() {
+        let luck = Stat::custom("luck");
+        assert_eq!(serde_json::to_string(&[Stat::Armor, luck]).unwrap(), r#"["Armor","luck"]"#);
+        let back: Vec<Stat> = serde_json::from_str(r#"["Armor","luck"]"#).unwrap();
+        assert_eq!(back, vec![Stat::Armor, luck]);
+        assert!(serde_json::from_str::<Stat>(r#""""#).is_err());
+        assert!(Stat::named(&"x".repeat(MAX_STAT_NAME + 1)).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "built-in")]
+    fn a_custom_stat_cannot_shadow_a_built_in_one() {
+        let _ = Stat::custom("Armor");
     }
 
     #[test]

@@ -18,11 +18,8 @@ fn sample() -> ContentSet {
 
 /// The sample content with a schedule that repeats the given kinds.
 fn with_rounds(kinds: Vec<RoundKindDef>) -> Arc<ContentSet> {
-    let rounds = kinds
-        .into_iter()
-        .enumerate()
-        .map(|(i, kind)| RoundDef { name: format!("r{i}"), stage: 1, kind })
-        .collect();
+    let rounds =
+        kinds.into_iter().enumerate().map(|(i, kind)| RoundDef { name: format!("r{i}"), stage: 1, kind, tiles: Vec::new() }).collect();
     Arc::new(sample().with_schedule(Schedule { rounds, repeat_from: 0 }).unwrap())
 }
 
@@ -250,8 +247,8 @@ fn odd_lobbies_fight_a_ghost_that_is_not_affected() {
 
 #[test]
 fn pve_round_rewards_winners_and_damages_losers() {
-    let enemies = vec![BoardUnit { unit: "moss_golem".into(), star: 1, items: vec![], pos: (3, 4) }];
-    let mut g = game(vec![RoundKindDef::Pve { enemies, gold: 7, items: 2 }], 2);
+    let enemies = vec![BoardUnit::new("moss_golem", (3, 4))];
+    let mut g = game(vec![RoundKindDef::Pve { enemies, gold: 7, items: 2, rewards: vec![] }], 2);
     field(&mut g, P0, "ironbark_warden", (3, 4));
     g.finish_round().unwrap();
     assert_eq!(g.player(P0).gold, 11);
@@ -444,10 +441,10 @@ fn games_are_deterministic() {
 fn shops_only_offer_copies_that_exist() {
     // Two copies of each unit and eight shops of five: most slots must stay
     // empty, and no unit may be shown more often than it has copies.
-    let mut rules = autoengine::content::GameRules::default();
+    let base = autoengine::sample::content();
+    let mut rules = base.rules().clone();
     rules.pool_sizes.clear();
     rules.default_pool_size = 2;
-    let base = autoengine::sample::content();
     let content = ContentSet::new(base.units().cloned().collect(), base.traits().cloned().collect(), base.items().cloned().collect(), rules)
         .unwrap()
         .with_schedule(Schedule::new([RoundDef::new("fight", 1, RoundKindDef::pvp())]))
@@ -526,7 +523,7 @@ fn a_player_who_forfeits_goes_out_last_when_the_round_ends() {
 fn forfeiting_during_a_draft_makes_the_pick_so_nobody_waits() {
     use autoengine::content::{RoundDef, RoundKindDef, Schedule};
     use autoengine::game::Command;
-    let draft = RoundDef { name: "draft".into(), stage: 1, kind: RoundKindDef::Draft { extra: 0, max_cost: None } };
+    let draft = RoundDef { name: "draft".into(), stage: 1, kind: RoundKindDef::Draft { extra: 0, max_cost: None }, tiles: Vec::new() };
     let content = autoengine::sample::content().with_schedule(Schedule { rounds: vec![draft], repeat_from: 0 }).unwrap();
     let mut g = autoengine::game::Game::new(content, 1, &["a", "b", "c"]);
     g.begin_round().unwrap();
@@ -563,7 +560,7 @@ fn player_stats_add_up() {
 /// A schedule of player fights only.
 fn pvp_only(players: &[&str], rules: impl FnOnce(&mut autoengine::content::GameRules)) -> autoengine::game::Game {
     use autoengine::content::{RoundDef, RoundKindDef, Schedule};
-    let pvp = RoundDef { name: "fight".into(), stage: 1, kind: RoundKindDef::Pvp };
+    let pvp = RoundDef { name: "fight".into(), stage: 1, kind: RoundKindDef::Pvp, tiles: Vec::new() };
     let mut content = autoengine::sample::content().with_schedule(Schedule { rounds: vec![pvp], repeat_from: 0 }).unwrap();
     let mut r = content.rules().clone();
     rules(&mut r);
@@ -742,14 +739,8 @@ fn single_use_items_do_their_thing_and_are_gone() {
 fn single_use_items_cannot_be_recipe_parts() {
     use autoengine::content::{Consumable, ItemDef};
     let base = autoengine::sample::content();
-    let mut builder = autoengine::content::ContentSet::builder();
-    for u in base.units() {
-        builder = builder.unit(u.clone());
-    }
-    for t in base.traits() {
-        builder = builder.trait_def(t.clone());
-    }
-    let err = builder
+    let err = base
+        .into_builder()
         .item(ItemDef::new("magnet", "Magnet").consumable(Consumable::RemoveItems))
         .item(ItemDef::new("rod", "Rod"))
         .item(ItemDef::new("odd", "Odd").recipe("magnet", "rod"))
@@ -762,7 +753,12 @@ fn single_use_items_cannot_be_recipe_parts() {
 fn choice_offers_can_be_rerolled_a_limited_number_of_times() {
     use autoengine::content::{ChoiceOffer, RoundDef, RoundKindDef, Schedule};
     use autoengine::game::{Command, CommandError, PlayerId};
-    let choice = RoundDef { name: "pick".into(), stage: 1, kind: RoundKindDef::Choice { options: 2, offer: ChoiceOffer::Augments } };
+    let choice = RoundDef {
+        name: "pick".into(),
+        stage: 1,
+        kind: RoundKindDef::Choice { options: 2, offer: ChoiceOffer::Augments },
+        tiles: Vec::new(),
+    };
     let content = autoengine::sample::content().with_schedule(Schedule { rounds: vec![choice], repeat_from: 0 }).unwrap();
     let mut g = autoengine::game::Game::new(content, 4, &["a", "b"]);
     g.begin_round().unwrap();
@@ -800,7 +796,7 @@ fn augments_can_pay_out_every_round() {
         builder = builder.item(i.clone());
     }
     let content = builder
-        .augment(AugmentDef::new("patron", "Patron").per_round(RoundGrant { gold: 3, xp: 1, free_rerolls: 2, components: 1 }))
+        .augment(AugmentDef::new("patron", "Patron").per_round(RoundGrant { gold: 3, xp: 1, free_rerolls: 2, components: 1, ..Default::default() }))
         .build()
         .unwrap();
     let mut g = autoengine::game::Game::new(content, 3, &["a", "b"]);

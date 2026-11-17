@@ -10,7 +10,7 @@ fn main() {
 
     // A team is a list of units and where they stand, from that team's own
     // side of the board: row 4 is the front line, row 7 the back.
-    let unit = |id: &str, star, pos| BoardUnit { unit: id.into(), star, items: vec![], pos };
+    let unit = |id: &str, star, pos| BoardUnit::new(id, pos).star(star);
     let home = TeamSetup {
         units: vec![unit("ironbark_warden", 2, (3, 4)), unit("dawnpetal_mender", 1, (3, 7))],
         bonuses: vec![],

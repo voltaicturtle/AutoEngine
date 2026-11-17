@@ -39,6 +39,9 @@ assert_eq!(augments.len(), 5);
 | `.bonus(Bonus)` | team-wide stats or passives for every fight from now on. Can be called more than once |
 | `.gold(n)` | gold given once, when it is picked |
 | `.per_round(RoundGrant)` | something given at the start of every round after it is picked |
+| `.tier(n)` | its tier, such as 1, 2 and 3 for weaker and stronger augments. Choice rounds can offer one tier (`ChoiceOffer::AugmentsOfTier`) or roll one (`ChoiceOffer::AugmentTiers`). The default is 1 |
+| `.perk(Perk)` | grants handed out when something happens: a level up, a reroll, a lost fight. See [Perks](perks.md#perks) |
+| `.rule(RuleMod)` | changes a rule for its holder, such as `Rule::TeamSize.add(1)`. See [Rules a player can bend](perks.md#rules-a-player-can-bend) |
 
 Bonuses work as they do for traits (see [Traits](traits.md#bonuses)), with
 one difference: `Bonus::members()` in an augment means every unit, the same
@@ -49,9 +52,11 @@ as `Bonus::team()`.
 | Field | Given every round |
 | --- | --- |
 | `gold` | gold |
+| `currencies` | other currencies, by id. Add one with `.currency("souls", 3)`; see [Currencies](rules.md#currencies) |
 | `xp` | experience |
 | `free_rerolls` | rerolls that cost no gold. They are used before gold, and unused ones carry over |
 | `components` | random component items |
+| `health` | health back, up to what players start with |
 
 ## How players get augments
 

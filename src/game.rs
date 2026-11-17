@@ -23,7 +23,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::combat::{Event, Team};
-use crate::content::{BoardUnit, ContentSet, RoundKindDef, TeamSetup};
+use crate::content::{ActionDef, ActionTarget, BoardUnit, ChoiceOffer, ContentSet, RoundKindDef, ShopSpecial, TeamSetup};
+use crate::perk::{Perk, Rule, RuleMod, When};
+use crate::stats::StatMod;
 use crate::rng::Rng;
 use crate::round::{self, RoundFactory, RoundType};
 
@@ -40,6 +42,43 @@ pub struct OwnedUnit {
     pub unit: String,
     pub star: u8,
     pub items: Vec<String>,
+    /// Stat changes this unit has earned for good, one entry per stat.
+    #[serde(default)]
+    pub growth: Vec<StatMod>,
+    /// Traits this one unit counts as having besides its own.
+    #[serde(default)]
+    pub traits: Vec<String>,
+}
+
+impl OwnedUnit {
+    /// Adds to the stat changes the unit keeps, merging by stat.
+    fn grow(&mut self, mods: &[StatMod]) {
+        for m in mods {
+            match self.growth.iter_mut().find(|g| g.stat == m.stat) {
+                Some(g) => {
+                    g.flat += m.flat;
+                    g.permille += m.permille;
+                }
+                None => self.growth.push(*m),
+            }
+        }
+    }
+}
+
+/// What a special shop offer comes with besides the unit.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShopOffer {
+    pub star: u8,
+    /// A trait the unit gets, if any.
+    pub extra_trait: Option<String>,
+}
+
+/// A pick waiting on one player, opened by a [`Grant::Choice`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingChoice {
+    pub offer: ChoiceOffer,
+    /// Ids of what can be picked.
+    pub options: Vec<String>,
 }
 
 /// Where a unit can be.
@@ -71,7 +110,19 @@ pub enum Command {
     /// Swap the options the current round offers for new ones, where the
     /// round allows it (see [`Game::rerolls_left`]).
     RerollPick,
+    /// Use one of the game's own actions (see
+    /// [`ActionDef`](crate::content::ActionDef)). `arg` is whatever the
+    /// action needs: the `uid` of a unit for an action aimed at one, and
+    /// otherwise a number only the game's own code gives a meaning to.
+    Action {
+        id: String,
+        #[serde(default)]
+        arg: i64,
+    },
     /// Signal that the player is done for this round.
+    /// Sends a unit to a teammate's bench (see `GameRules::team_size`),
+    /// with its items.
+    Gift { uid: u32, to: PlayerId },
     Ready,
     /// Give up. The player leaves when the round ends, placed below
     /// everyone else who goes out that round; any pick the round is waiting
@@ -86,6 +137,14 @@ pub enum CommandError {
     UnknownPlayer,
     Eliminated,
     NotEnoughGold { need: i64, have: i64 },
+    /// Not enough of a currency other than gold.
+    NotEnough { currency: String, need: i64, have: i64 },
+    /// The game has no currency with that id.
+    UnknownCurrency,
+    /// The game has no action with that id.
+    UnknownAction,
+    /// The action has been used as often as it can be this round.
+    ActionLimit { per_round: u32 },
     EmptyShopSlot,
     SoldOut,
     BenchFull,
@@ -102,6 +161,8 @@ pub enum CommandError {
     GameOver,
     /// The player has forfeited and only waits for the round to end.
     Forfeited,
+    /// That player is not on the same team (or is out of the game).
+    NotATeammate,
     /// A single-use item cannot do anything to that unit; the reason says why.
     CannotUse(String),
     NoRerollsLeft,
@@ -114,6 +175,11 @@ impl std::fmt::Display for CommandError {
             CommandError::UnknownPlayer => write!(f, "no such player"),
             CommandError::Eliminated => write!(f, "the player has been eliminated"),
             CommandError::NotEnoughGold { need, have } => write!(f, "needs {need} gold, has {have}"),
+            CommandError::NotEnough { currency, need, have } => write!(f, "needs {need} {currency}, has {have}"),
+            CommandError::UnknownCurrency => write!(f, "the game has no such currency"),
+            CommandError::UnknownAction => write!(f, "the game has no such action"),
+            CommandError::ActionLimit { per_round: 1 } => write!(f, "already used this round"),
+            CommandError::ActionLimit { per_round } => write!(f, "already used {per_round} times this round"),
             CommandError::EmptyShopSlot => write!(f, "that shop slot is empty"),
             CommandError::SoldOut => write!(f, "no copies of that unit are left"),
             CommandError::BenchFull => write!(f, "the bench is full"),
@@ -128,6 +194,7 @@ impl std::fmt::Display for CommandError {
             CommandError::InvalidOption => write!(f, "that option is not available"),
             CommandError::UnknownRoundKind(kind) => write!(f, "no round type named `{kind}` is registered"),
             CommandError::GameOver => write!(f, "the game is over"),
+            CommandError::NotATeammate => write!(f, "that player is not a teammate still in the game"),
             CommandError::Forfeited => write!(f, "the player has forfeited"),
             CommandError::CannotUse(why) => write!(f, "{why}"),
             CommandError::NoRerollsLeft => write!(f, "no rerolls of these options are left"),
@@ -170,6 +237,21 @@ pub struct Player {
     /// How the game has gone for this player so far.
     #[serde(default)]
     pub stats: PlayerStats,
+    /// How much the player has of each currency besides gold, by id (see
+    /// `GameRules::currencies`).
+    #[serde(default)]
+    pub wallet: BTreeMap<String, i64>,
+    /// How often the player has used each of the game's actions this round.
+    #[serde(default)]
+    pub actions_used: BTreeMap<String, u32>,
+    /// What each shop offer comes with besides the unit, slot for slot with
+    /// `shop` (see `GameRules::shop_specials`). `None` for a plain offer.
+    #[serde(default)]
+    pub shop_specials: Vec<Option<ShopOffer>>,
+    /// Picks waiting on the player, oldest first (see [`Grant::Choice`]).
+    /// `Command::Pick` answers the first one.
+    #[serde(default)]
+    pub choices: Vec<PendingChoice>,
 }
 
 /// Running totals for one player, for end-of-game summaries.
@@ -216,6 +298,32 @@ mod board_serde {
 }
 
 impl Player {
+    /// How much the player has of a currency. `"gold"` is their gold.
+    pub fn balance(&self, currency: &str) -> i64 {
+        if currency == "gold" { self.gold } else { self.wallet.get(currency).copied().unwrap_or(0) }
+    }
+
+    /// Whether the player could use one of the game's actions right now, as
+    /// far as its limit and price go. Clients use this to grey a button
+    /// out; the action's own handler can still refuse.
+    pub fn can_use(&self, action: &ActionDef) -> Result<(), CommandError> {
+        if let Some(per_round) = action.per_round
+            && self.actions_used.get(&action.id).copied().unwrap_or(0) >= per_round
+        {
+            return Err(CommandError::ActionLimit { per_round });
+        }
+        for price in &action.prices {
+            let have = self.balance(&price.currency);
+            if have < price.amount {
+                return Err(match price.currency.as_str() {
+                    "gold" => CommandError::NotEnoughGold { need: price.amount, have },
+                    _ => CommandError::NotEnough { currency: price.currency.clone(), need: price.amount, have },
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Every unit the player owns, board first.
     pub fn units(&self) -> impl Iterator<Item = &OwnedUnit> {
         self.board.values().chain(self.bench.iter().flatten())
@@ -257,7 +365,14 @@ impl Player {
     pub fn board_units(&self) -> Vec<BoardUnit> {
         self.board
             .iter()
-            .map(|(pos, u)| BoardUnit { unit: u.unit.clone(), star: u.star, items: u.items.clone(), pos: *pos })
+            .map(|(pos, u)| BoardUnit {
+                unit: u.unit.clone(),
+                star: u.star,
+                items: u.items.clone(),
+                pos: *pos,
+                growth: u.growth.clone(),
+                traits: u.traits.clone(),
+            })
             .collect()
     }
 }
@@ -290,6 +405,9 @@ pub struct CombatRecord {
     /// this is enough to fight it again (see `replay`).
     #[serde(default)]
     pub teams: Vec<TeamSetup>,
+    /// The [tiles](crate::tile) the fight started with.
+    #[serde(default)]
+    pub tiles: Vec<crate::tile::TilePlacement>,
     pub events: Vec<Event>,
 }
 
@@ -300,9 +418,17 @@ pub enum GameEvent {
     RoundFinished { index: usize },
     ShopRolled { player: PlayerId, offers: Vec<Option<String>> },
     GoldChanged { player: PlayerId, gold: i64 },
+    /// A player now has `amount` of a currency other than gold.
+    CurrencyChanged { player: PlayerId, currency: String, amount: i64 },
+    /// A player used one of the game's own actions, and has paid for it.
+    ActionUsed { player: PlayerId, action: String, arg: i64 },
     XpChanged { player: PlayerId, level: u32, xp: u32 },
     UnitGained { player: PlayerId, uid: u32, unit: String },
     UnitSold { player: PlayerId, uid: u32, unit: String },
+    /// A unit was taken away without being sold (see [`Game::remove_unit`]).
+    UnitRemoved { player: PlayerId, uid: u32, unit: String },
+    /// A unit went from one player to a teammate. It keeps its `uid`.
+    UnitGifted { from: PlayerId, to: PlayerId, uid: u32, unit: String },
     UnitUpgraded { player: PlayerId, uid: u32, unit: String, star: u8 },
     UnitMoved { player: PlayerId, uid: u32, to: Slot },
     ItemGained { player: PlayerId, item: String },
@@ -321,6 +447,8 @@ pub enum GameEvent {
     /// Index into [`Game::combats`] for the full record.
     CombatFinished { combat: usize, home: PlayerId, away: Opponent, winner: Option<Team> },
     PlayerDamaged { player: PlayerId, amount: i64, health: i64 },
+    /// A player got `amount` health back and now has `health`.
+    PlayerHealed { player: PlayerId, amount: i64, health: i64 },
     PlayerForfeited { player: PlayerId },
     PlayerEliminated { player: PlayerId, placement: u32 },
     GameOver { winner: PlayerId },
@@ -381,6 +509,8 @@ pub struct Game {
     opponents: BTreeMap<PlayerId, Vec<PlayerId>>,
     /// The augment every player got at the start, if the game has one.
     lobby_modifier: Option<String>,
+    /// How deep perks are nested: what one hands out can set off another.
+    perk_depth: u32,
 }
 
 /// Something from outside that moved the game along. A game is its content,
@@ -406,7 +536,49 @@ pub enum Grant {
     Item(String),
     Augment(String),
     Damage(i64),
+    /// Health back, up to what players start with.
+    Heal(i64),
+    /// Some of a currency other than gold; negative takes it away.
+    Currency { currency: String, amount: i64 },
+    /// A random component item.
+    Component,
+    /// A random item with this [tag](crate::content::ItemDef::tag).
+    ItemTagged(String),
+    /// A random unit of this cost, taken out of the shared pool.
+    UnitOfCost(u32),
+    /// Rerolls that cost nothing.
+    Rerolls(u32),
+    /// One roll on a [loot table](crate::perk::LootTable).
+    Loot(String),
+    /// Opens a pick of one out of `options` for the player (see
+    /// [`Player::choices`]). One not made by the end of the round is made
+    /// at random.
+    Choice { options: u32, offer: ChoiceOffer },
 }
+
+impl std::fmt::Display for Grant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Grant::Gold(n) => write!(f, "{n} gold"),
+            Grant::Xp(n) => write!(f, "{n} experience"),
+            Grant::Unit(id) => write!(f, "a unit ({id})"),
+            Grant::Item(id) => write!(f, "an item ({id})"),
+            Grant::Augment(id) => write!(f, "an augment ({id})"),
+            Grant::Damage(n) => write!(f, "{n} damage"),
+            Grant::Heal(n) => write!(f, "{n} health"),
+            Grant::Currency { currency, amount } => write!(f, "{amount} {currency}"),
+            Grant::Component => write!(f, "a random component"),
+            Grant::ItemTagged(tag) => write!(f, "a random {tag} item"),
+            Grant::UnitOfCost(cost) => write!(f, "a random unit of cost {cost}"),
+            Grant::Rerolls(n) => write!(f, "{n} free rerolls"),
+            Grant::Loot(table) => write!(f, "a roll for {table}"),
+            Grant::Choice { options, .. } => write!(f, "a pick of one out of {options}"),
+        }
+    }
+}
+
+/// How deep loot tables and perks may set each other off.
+const MAX_GRANT_DEPTH: u32 = 8;
 
 impl Game {
     /// Creates a game with one player per name.
@@ -418,7 +590,8 @@ impl Game {
             .units()
             .filter(|u| u.in_shop)
             .map(|u| {
-                let size = rules.pool_sizes.get(&u.cost).copied().unwrap_or(rules.default_pool_size);
+                let by_cost = rules.pool_sizes.get(&u.cost).copied().unwrap_or(rules.default_pool_size);
+                let size = u.pool_size.unwrap_or(by_cost);
                 (u.id.clone(), size)
             })
             .collect();
@@ -445,6 +618,10 @@ impl Game {
                 forfeited: false,
                 free_rerolls: 0,
                 stats: PlayerStats::default(),
+                wallet: rules.currencies.iter().map(|c| (c.id.clone(), c.starting.max(0))).collect(),
+                actions_used: BTreeMap::new(),
+                shop_specials: Vec::new(),
+                choices: Vec::new(),
             })
             .collect();
         #[cfg(feature = "scripting")]
@@ -471,6 +648,7 @@ impl Game {
             inputs: Vec::new(),
             opponents: BTreeMap::new(),
             lobby_modifier: None,
+            perk_depth: 0,
         };
         let modifiers = game.content.rules().lobby_modifiers.clone();
         if !modifiers.is_empty() {
@@ -555,6 +733,10 @@ impl Game {
     pub fn round_kind(&self) -> &str {
         &self.round_kind
     }
+    /// The [tiles](crate::tile) the current round's fights start with.
+    pub fn round_tiles(&self) -> &[crate::tile::TilePlacement] {
+        &self.content.schedule().round(self.round_index).0.tiles
+    }
     /// Stage of the current round, which scales damage.
     pub fn stage(&self) -> u32 {
         self.stage
@@ -579,11 +761,101 @@ impl Game {
     }
     /// How many units a player may field at their level.
     pub fn board_limit(&self, id: PlayerId) -> usize {
-        let levels = &self.content.rules().levels;
-        levels[(self.player(id).level as usize - 1).min(levels.len() - 1)].board_size
+        self.rule(id, Rule::TeamSize) as usize
     }
-    /// Players the current round is waiting on for a pick.
+    /// The team a player is on (see `GameRules::team_size`). With teams of
+    /// one, every player is a team of their own.
+    pub fn team_of(&self, id: PlayerId) -> u32 {
+        id.0 as u32 / self.content.rules().team_size.max(1)
+    }
+    /// Whether two different players are on the same team.
+    pub fn teammates(&self, a: PlayerId, b: PlayerId) -> bool {
+        a != b && self.team_of(a) == self.team_of(b)
+    }
+    /// The teams that still have someone in the game, in seat order.
+    pub fn alive_teams(&self) -> Vec<u32> {
+        let mut teams: Vec<u32> = self.alive().into_iter().map(|p| self.team_of(p)).collect();
+        teams.dedup();
+        teams
+    }
+    /// What it costs to buy the offer in a shop slot, or `None` for an
+    /// empty slot.
+    pub fn shop_price(&self, id: PlayerId, slot: usize) -> Option<i64> {
+        let p = self.player(id);
+        let unit = p.shop.get(slot).cloned().flatten()?;
+        let star = p.shop_specials.get(slot).cloned().flatten().map_or(1, |s| s.star.max(1));
+        let cost = self.content.unit(&unit).map_or(0, |u| u.cost as i64);
+        Some(cost * self.content.rules().copies_to_upgrade.pow(star as u32 - 1) as i64)
+    }
+    /// How many team slots the units on a player's board take.
+    pub fn board_slots_used(&self, id: PlayerId) -> usize {
+        self.player(id).board.values().map(|u| self.slots_of(u)).sum()
+    }
+    fn slots_of(&self, unit: &OwnedUnit) -> usize {
+        self.content.unit(&unit.unit).map_or(1, |d| d.team_slots as usize)
+    }
+    /// What a [rule](Rule) is for one player right now: the game's rule
+    /// plus the changes from their augments, active trait tiers and the
+    /// items their board units hold.
+    pub fn rule(&self, id: PlayerId, rule: Rule) -> i64 {
+        let rules = self.content.rules();
+        let economy = &rules.economy;
+        let level = self.player(id).level as usize;
+        let base = match rule {
+            Rule::TeamSize => rules.levels[(level.max(1) - 1).min(rules.levels.len() - 1)].board_size as i64,
+            Rule::RerollCost => economy.reroll_cost,
+            Rule::XpCost => economy.xp_cost,
+            Rule::XpPerPurchase => economy.xp_per_purchase as i64,
+            Rule::XpPerRound => economy.xp_per_round as i64,
+            Rule::RoundIncome => economy.round_income,
+            Rule::InterestCap => economy.interest_cap,
+            Rule::WinBonus => economy.win_bonus,
+            Rule::DamageTaken | Rule::ShopLevel => 0,
+        };
+        let total = base + self.perks_and_rules(id).1.iter().filter(|m| m.rule == rule).map(|m| m.add).sum::<i64>();
+        match rule {
+            Rule::DamageTaken | Rule::ShopLevel => total,
+            _ => total.max(0),
+        }
+    }
+    /// The perks and rule changes a player has right now, with where each
+    /// perk comes from left out: augments first, then active trait tiers,
+    /// then items held by board units.
+    pub fn perks_and_rules(&self, id: PlayerId) -> (Vec<Perk>, Vec<RuleMod>) {
+        let content = &self.content;
+        let p = self.player(id);
+        let (mut perks, mut rules) = (Vec::new(), Vec::new());
+        for augment in p.augments.iter().filter_map(|a| content.augment(a)) {
+            perks.extend(augment.perks.iter().cloned());
+            rules.extend(augment.rules.iter().copied());
+        }
+        // Content is checked when it is built, so a board the game made
+        // always counts.
+        for active in content.active_traits(&p.board_units()).unwrap_or_default() {
+            let tier = active.tier.and_then(|t| content.trait_def(&active.id).and_then(|d| d.breakpoints.get(t)));
+            if let Some(tier) = tier {
+                perks.extend(tier.perks.iter().cloned());
+                rules.extend(tier.rules.iter().copied());
+            }
+        }
+        for item in p.board.values().flat_map(|u| &u.items).filter_map(|i| content.item(i)) {
+            perks.extend(item.perks.iter().cloned());
+            rules.extend(item.rules.iter().copied());
+        }
+        (perks, rules)
+    }
+    /// Players the game is waiting on for a pick: those the current round
+    /// waits for, and those with a [pick of their own](Player::choices).
     pub fn awaiting(&self) -> Vec<PlayerId> {
+        let mut waiting = self.round_awaiting();
+        for p in self.players.iter().filter(|p| p.alive && !p.choices.is_empty()) {
+            if !waiting.contains(&p.id) {
+                waiting.push(p.id);
+            }
+        }
+        waiting
+    }
+    fn round_awaiting(&self) -> Vec<PlayerId> {
         self.current.as_ref().map(|r| r.awaiting(self)).unwrap_or_default()
     }
     /// How many more times a player may reroll what the current round
@@ -593,7 +865,12 @@ impl Game {
     }
     /// What the current round offers a player; `None` entries are taken.
     pub fn options(&self, id: PlayerId) -> Vec<Option<String>> {
-        self.current.as_ref().map(|r| r.options(self, id)).unwrap_or_default()
+        let own = self.players.get(id.0 as usize).and_then(|p| p.choices.first());
+        match own {
+            // The round's pick comes first when it is waiting on them.
+            Some(choice) if !self.round_awaiting().contains(&id) => choice.options.iter().cloned().map(Some).collect(),
+            _ => self.current.as_ref().map(|r| r.options(self, id)).unwrap_or_default(),
+        }
     }
     /// True when every remaining player is ready and no picks are pending.
     pub fn all_ready(&self) -> bool {
@@ -666,7 +943,7 @@ impl Game {
         for id in self.alive() {
             if self.round_index > 0 {
                 let p = self.player(id);
-                let interest = (p.gold / economy.interest_per).clamp(0, economy.interest_cap);
+                let interest = (p.gold / economy.interest_per).clamp(0, self.rule(id, Rule::InterestCap));
                 let streak = p.streak.unsigned_abs();
                 let streak_gold = economy
                     .streak_bonuses
@@ -675,12 +952,17 @@ impl Game {
                     .map(|(_, gold)| *gold)
                     .max()
                     .unwrap_or(0);
-                self.add_gold(id, economy.round_income + interest + streak_gold);
-                self.add_xp(id, economy.xp_per_round);
+                self.add_gold(id, self.rule(id, Rule::RoundIncome) + interest + streak_gold);
+                for currency in &content.rules().currencies {
+                    self.add_currency(id, &currency.id, currency.per_round);
+                }
+                self.add_xp(id, self.rule(id, Rule::XpPerRound) as u32);
                 self.augment_grants(id);
+                self.fire(id, When::RoundStart);
             }
             let p = &mut self.players[id.0 as usize];
             p.ready = false;
+            p.actions_used.clear();
             p.stats.rounds += 1;
             if p.shop_locked {
                 p.shop_locked = false;
@@ -715,11 +997,19 @@ impl Game {
         }
         let mut round = self.current.take().expect("a round is in progress");
         round.finish(self);
+        // Picks of their own that players left open are made at random.
+        for id in self.alive() {
+            for _ in 0..64 {
+                let Some(count) = self.player(id).choices.first().map(|c| c.options.len()) else { break };
+                let option = self.rng.below(count.max(1) as u64) as usize;
+                self.pick_own(id, option);
+            }
+        }
         self.emit(GameEvent::RoundFinished { index: self.round_index });
 
         // Eliminations: among players who fell this round, more remaining
         // health places higher; ties go to the earlier seat.
-        let alive_before = self.players.iter().filter(|p| p.alive).count() as u32;
+        let teams_before = self.alive_teams().len() as u32;
         // Players who forfeited go out below everyone else.
         let mut fallen: Vec<(bool, i64, PlayerId)> = self
             .players
@@ -728,13 +1018,27 @@ impl Game {
             .map(|p| (!p.forfeited, p.health, p.id))
             .collect();
         fallen.sort_by_key(|(stayed, health, id)| (*stayed, *health, std::cmp::Reverse(*id)));
-        for (i, (_, _, id)) in fallen.iter().enumerate() {
-            let placement = alive_before - i as u32;
-            self.eliminate(*id, placement);
+        // Teammates go out together and share a placement. A player who
+        // forfeits while their team plays on takes the lowest placement
+        // still open.
+        let falling: Vec<PlayerId> = fallen.iter().map(|(_, _, id)| *id).collect();
+        let mut gone: Vec<u32> = Vec::new();
+        for id in falling.iter().copied() {
+            let team = self.team_of(id);
+            let team_out = self.alive().into_iter().filter(|p| self.team_of(*p) == team).all(|p| falling.contains(&p) || !self.player(p).alive);
+            let placement = if team_out {
+                if !gone.contains(&team) {
+                    gone.push(team);
+                }
+                teams_before - gone.iter().position(|t| *t == team).unwrap() as u32
+            } else {
+                teams_before
+            };
+            self.eliminate(id, placement);
         }
         let alive = self.alive();
-        if alive.len() <= 1 {
-            if let Some(last) = alive.first() {
+        if self.alive_teams().len() <= 1 {
+            for last in &alive {
                 self.players[last.0 as usize].placement = Some(1);
             }
             let winner = self.winner().expect("someone placed first");
@@ -755,6 +1059,10 @@ impl Game {
             let grant = &augment.per_round;
             self.add_gold(id, grant.gold);
             self.add_xp(id, grant.xp);
+            self.heal_player(id, grant.health);
+            for (currency, amount) in &grant.currencies {
+                self.add_currency(id, currency, *amount);
+            }
             self.players[id.0 as usize].free_rerolls += grant.free_rerolls;
             for _ in 0..grant.components {
                 self.give_random_component(id);
@@ -773,13 +1081,15 @@ impl Game {
         places.sort_by_key(|(c, r)| (*r, (c - cols / 2).abs(), *c));
         loop {
             let p = self.player(id);
-            if p.board.len() >= limit {
+            let room = limit.saturating_sub(self.board_slots_used(id));
+            if room == 0 {
                 break;
             }
             let best = p
                 .bench
                 .iter()
                 .flatten()
+                .filter(|u| self.slots_of(u) <= room)
                 .max_by_key(|u| (u.star, self.content.unit(&u.unit).map(|d| d.cost).unwrap_or(0), std::cmp::Reverse(u.uid)))
                 .map(|u| u.uid);
             let place = places.iter().find(|pos| !p.board.contains_key(pos)).copied();
@@ -794,6 +1104,7 @@ impl Game {
         let p = &mut self.players[id.0 as usize];
         p.alive = false;
         p.placement = Some(placement);
+        p.choices.clear();
         let units: Vec<OwnedUnit> =
             std::mem::take(&mut p.board).into_values().chain(p.bench.iter_mut().filter_map(Option::take)).collect();
         for unit in units {
@@ -834,14 +1145,16 @@ impl Game {
         match command {
             Command::BuyUnit { slot } => self.buy_unit(id, slot),
             Command::SellUnit { uid } => self.sell_unit(id, uid),
+            Command::Action { id: action, arg } => self.use_action(id, &action, arg),
             Command::Reroll => {
                 if self.player(id).free_rerolls > 0 {
                     self.players[id.0 as usize].free_rerolls -= 1;
                 } else {
-                    self.spend(id, self.content.rules().economy.reroll_cost)?;
+                    self.spend(id, self.rule(id, Rule::RerollCost))?;
                 }
                 self.players[id.0 as usize].stats.rerolls += 1;
                 self.roll_shop(id);
+                self.fire(id, When::Reroll);
                 Ok(())
             }
             Command::BuyXp => {
@@ -849,10 +1162,11 @@ impl Game {
                 if self.player(id).level as usize >= rules.levels.len() {
                     return Err(CommandError::MaxLevel);
                 }
-                let (cost, xp) = (rules.economy.xp_cost, rules.economy.xp_per_purchase);
+                let (cost, xp) = (self.rule(id, Rule::XpCost), self.rule(id, Rule::XpPerPurchase) as u32);
                 self.spend(id, cost)?;
                 self.players[id.0 as usize].stats.xp_bought += xp;
                 self.add_xp(id, xp);
+                self.fire(id, When::BuyXp);
                 Ok(())
             }
             Command::SetShopLock { locked } => {
@@ -861,6 +1175,13 @@ impl Game {
             }
             Command::MoveUnit { uid, to } => self.move_unit(id, uid, to),
             Command::EquipItem { item, uid } => self.equip_item(id, item, uid),
+            Command::Pick { option } if !self.player(id).choices.is_empty() && !self.round_awaiting().contains(&id) => {
+                if option >= self.player(id).choices[0].options.len() {
+                    return Err(CommandError::InvalidOption);
+                }
+                self.pick_own(id, option);
+                Ok(())
+            }
             Command::Pick { option } => {
                 let mut round = self.current.take().expect("a round is in progress");
                 let result = round.pick(self, id, option);
@@ -872,6 +1193,21 @@ impl Game {
                 let result = round.reroll(self, id);
                 self.current = Some(round);
                 result
+            }
+            Command::Gift { uid, to } => {
+                let ok = self.players.get(to.0 as usize).is_some_and(|p| p.alive) && self.teammates(id, to);
+                if !ok {
+                    return Err(CommandError::NotATeammate);
+                }
+                let free = self.player(to).bench.iter().position(Option::is_none).ok_or(CommandError::BenchFull)?;
+                let p = &mut self.players[id.0 as usize];
+                let slot = p.locate(uid).ok_or(CommandError::UnknownUnit)?;
+                let unit = p.take(slot).expect("located");
+                let name = unit.unit.clone();
+                self.players[to.0 as usize].bench[free] = Some(unit);
+                self.emit(GameEvent::UnitGifted { from: id, to, uid, unit: name.clone() });
+                self.check_upgrades(to, &name);
+                Ok(())
             }
             Command::Ready => {
                 self.players[id.0 as usize].ready = true;
@@ -909,11 +1245,41 @@ impl Game {
         Ok(())
     }
 
+    /// Carries out one of the game's own actions: checks the limit, the
+    /// target and the price, lets the handler refuse, then charges, hands
+    /// over what the action gives and reports it.
+    fn use_action(&mut self, id: PlayerId, action: &str, arg: i64) -> Result<(), CommandError> {
+        let content = self.content.clone();
+        let def = content.action(action).ok_or(CommandError::UnknownAction)?;
+        self.player(id).can_use(def)?;
+        if def.target == ActionTarget::Unit && !self.player(id).units().any(|u| i64::from(u.uid) == arg) {
+            return Err(CommandError::UnknownUnit);
+        }
+        if let Some(handler) = content.action_handler(action) {
+            handler(self, id, arg)?;
+        }
+        for price in &def.prices {
+            if price.currency == "gold" {
+                self.add_gold(id, -price.amount);
+                self.players[id.0 as usize].stats.gold_spent += price.amount;
+            } else {
+                self.add_currency(id, &price.currency, -price.amount);
+            }
+        }
+        for grant in &def.gives {
+            self.give(id, grant)?;
+        }
+        *self.players[id.0 as usize].actions_used.entry(action.to_string()).or_insert(0) += 1;
+        self.emit(GameEvent::ActionUsed { player: id, action: action.to_string(), arg });
+        Ok(())
+    }
+
     fn buy_unit(&mut self, id: PlayerId, slot: usize) -> Result<(), CommandError> {
         let content = self.content.clone();
         let p = self.player(id);
         let unit_id = p.shop.get(slot).cloned().flatten().ok_or(CommandError::EmptyShopSlot)?;
-        let cost = content.unit(&unit_id).map(|u| u.cost as i64).unwrap_or(0);
+        let special = p.shop_specials.get(slot).cloned().flatten();
+        let cost = self.shop_price(id, slot).unwrap_or(0);
         if p.gold < cost {
             return Err(CommandError::NotEnoughGold { need: cost, have: p.gold });
         }
@@ -927,9 +1293,15 @@ impl Game {
             return Err(CommandError::BenchFull);
         }
         self.players[id.0 as usize].shop[slot] = None;
+        if let Some(s) = self.players[id.0 as usize].shop_specials.get_mut(slot) {
+            *s = None;
+        }
         self.spend(id, cost)?;
         self.players[id.0 as usize].stats.units_bought += 1;
-        self.add_unit(id, &unit_id, Vec::new());
+        match special {
+            Some(offer) => self.add_special_unit(id, &unit_id, &offer),
+            None => self.add_unit(id, &unit_id, Vec::new()),
+        }
         Ok(())
     }
 
@@ -938,12 +1310,13 @@ impl Game {
         let slot = p.locate(uid).ok_or(CommandError::UnknownUnit)?;
         let unit = p.take(slot).unwrap();
         p.items.extend(unit.items.iter().cloned());
-        let cost = self.content.unit(&unit.unit).map(|u| u.cost as i64).unwrap_or(0);
-        let copies = self.copies_in(&unit);
+        let value = self.unit_value(&unit);
         self.return_to_pool(&unit);
         self.emit(GameEvent::UnitSold { player: id, uid, unit: unit.unit.clone() });
         self.players[id.0 as usize].stats.units_sold += 1;
-        self.add_gold(id, cost * copies as i64);
+        let refund = self.content.rules().sell_refund_permille as i64;
+        self.add_gold(id, value * refund / 1000);
+        self.fire(id, When::UnitSold);
         Ok(())
     }
 
@@ -960,7 +1333,7 @@ impl Game {
             return Err(CommandError::InvalidSlot);
         }
         let limit = self.board_limit(id);
-        let p = &mut self.players[id.0 as usize];
+        let p = &self.players[id.0 as usize];
         let from = p.locate(uid).ok_or(CommandError::UnknownUnit)?;
         if from == to {
             return Ok(());
@@ -969,10 +1342,17 @@ impl Game {
             Slot::Bench(i) => p.bench[i].is_some(),
             Slot::Board(c, r) => p.board.contains_key(&(c, r)),
         };
-        let grows_board = matches!(to, Slot::Board(..)) && matches!(from, Slot::Bench(_)) && !occupied;
-        if grows_board && p.board.len() >= limit {
-            return Err(CommandError::BoardFull);
+        if let (Slot::Bench(_), Slot::Board(c, r)) = (from, to) {
+            // Coming onto the board, perhaps in exchange for the unit there.
+            let slots = |u: &OwnedUnit| self.content.unit(&u.unit).map_or(1, |d| d.team_slots as usize);
+            let used: usize = p.board.values().map(slots).sum();
+            let coming = p.unit(uid).map_or(1, slots);
+            let leaving = if occupied { p.board.get(&(c, r)).map_or(0, slots) } else { 0 };
+            if coming > leaving && used + coming - leaving > limit {
+                return Err(CommandError::BoardFull);
+            }
         }
+        let p = &mut self.players[id.0 as usize];
         let moving = p.take(from).unwrap();
         if let Some(other) = p.take(to) {
             let other_uid = other.uid;
@@ -992,7 +1372,11 @@ impl Game {
         if let Some(consumable) = content.item(&item_id).and_then(|i| i.consumable.clone()) {
             return self.use_item(id, item, uid, &consumable);
         }
+        let unique = content.item(&item_id).is_some_and(|i| i.unique);
         let unit = p.unit_mut(uid).ok_or(CommandError::UnknownUnit)?;
+        if unique && unit.items.contains(&item_id) {
+            return Err(CommandError::CannotUse("a unit can hold only one of these".into()));
+        }
         // A component may be added to a full unit if it combines with one
         // the unit already holds.
         let combines = unit.items.iter().any(|held| content.combine_items(held, &item_id).is_some());
@@ -1060,6 +1444,18 @@ impl Game {
                 self.players[id.0 as usize].unit_mut(uid).expect("unit exists").items = reforged;
             }
             Consumable::Gold(n) => self.add_gold(id, *n),
+            Consumable::Give(grant) => self.give(id, grant)?,
+            Consumable::Upgrade => {
+                let better = unit.items.iter().enumerate().find_map(|(i, held)| {
+                    let to = content.item(held)?.upgrades_to.clone()?;
+                    content.item(&to).map(|_| (i, to))
+                });
+                let Some((slot, to)) = better else {
+                    return cannot("that unit holds nothing that can be made better");
+                };
+                self.players[id.0 as usize].unit_mut(uid).expect("unit exists").items[slot] = to.clone();
+                self.emit(GameEvent::ItemCombined { player: id, uid, item: to });
+            }
         }
         let item_id = self.players[id.0 as usize].items.remove(item);
         self.emit(GameEvent::ItemUsed { player: id, uid, item: item_id });
@@ -1098,19 +1494,66 @@ impl Game {
         if !p.alive {
             return Err(CommandError::Eliminated);
         }
+        self.give(id, &grant)?;
+        self.inputs.push(Input::Grant { player: id, grant });
+        self.run_hooks();
+        Ok(())
+    }
+
+    /// Hands a player what a grant describes, without recording it. This
+    /// is for round types, hooks and action handlers, which run again when
+    /// a game is replayed; from outside the rules use [`Game::grant`].
+    pub fn give(&mut self, id: PlayerId, grant: &Grant) -> Result<(), CommandError> {
         let content = self.content.clone();
-        match &grant {
+        match grant {
             Grant::Gold(n) => self.add_gold(id, *n),
             Grant::Xp(n) => self.add_xp(id, *n),
             Grant::Unit(unit) if content.unit(unit).is_some() => self.add_unit(id, unit, Vec::new()),
             Grant::Item(item) if content.item(item).is_some() => self.give_item(id, item),
             Grant::Augment(a) if content.augment(a).is_some() => self.give_augment(id, a),
             Grant::Damage(n) => self.damage_player(id, (*n).max(0)),
+            Grant::Heal(n) => self.heal_player(id, *n),
+            Grant::Currency { currency, amount } if currency == "gold" || content.currency(currency).is_some() => {
+                self.add_currency(id, currency, *amount);
+            }
+            Grant::Component => self.give_random_component(id),
+            Grant::ItemTagged(tag) => {
+                let tagged: Vec<String> = content.items().filter(|i| i.tags.contains(tag)).map(|i| i.id.clone()).collect();
+                if !tagged.is_empty() {
+                    let pick = self.rng.below(tagged.len() as u64) as usize;
+                    self.give_item(id, &tagged[pick]);
+                }
+            }
+            Grant::UnitOfCost(cost) => {
+                let available: Vec<(String, u32)> =
+                    self.available_units(None).into_iter().filter(|(u, _)| content.unit(u).is_some_and(|d| d.cost == *cost)).collect();
+                let weights: Vec<u64> = available.iter().map(|(_, n)| *n as u64).collect();
+                if let Some(i) = self.rng.weighted_index(&weights) {
+                    let unit = available[i].0.clone();
+                    self.take_from_pool(&unit);
+                    self.add_unit(id, &unit, Vec::new());
+                }
+            }
+            Grant::Rerolls(n) => self.players[id.0 as usize].free_rerolls += n,
+            Grant::Loot(table) => {
+                let Some(table) = content.loot(table) else { return Err(CommandError::UnknownItem) };
+                if self.perk_depth >= MAX_GRANT_DEPTH {
+                    return Ok(());
+                }
+                let weights: Vec<u64> = table.entries.iter().map(|e| e.weight as u64).collect();
+                if let Some(i) = self.rng.weighted_index(&weights) {
+                    self.perk_depth += 1;
+                    for inner in &table.entries[i].gives {
+                        let _ = self.give(id, inner);
+                    }
+                    self.perk_depth -= 1;
+                }
+            }
+            Grant::Choice { options, offer } => self.offer_choice(id, *options, offer),
+            Grant::Currency { .. } => return Err(CommandError::UnknownCurrency),
             Grant::Unit(_) => return Err(CommandError::UnknownUnit),
             Grant::Item(_) | Grant::Augment(_) => return Err(CommandError::UnknownItem),
         }
-        self.inputs.push(Input::Grant { player: id, grant });
-        self.run_hooks();
         Ok(())
     }
 
@@ -1165,12 +1608,52 @@ impl Game {
         self.emit(GameEvent::GoldChanged { player: id, gold });
     }
 
+    /// How much a player has of a currency. `"gold"` is their gold.
+    pub fn currency(&self, id: PlayerId, currency: &str) -> i64 {
+        self.player(id).balance(currency)
+    }
+
+    /// Gives a player some of a currency, or takes it away when negative
+    /// (never below zero). `"gold"` is the same as [`Game::add_gold`].
+    /// Currencies the content does not define are ignored.
+    pub fn add_currency(&mut self, id: PlayerId, currency: &str, amount: i64) {
+        if currency == "gold" {
+            return self.add_gold(id, amount);
+        }
+        if amount == 0 || self.content.currency(currency).is_none() {
+            return;
+        }
+        let balance = self.players[id.0 as usize].wallet.entry(currency.to_string()).or_insert(0);
+        *balance = (*balance + amount).max(0);
+        let amount = *balance;
+        self.emit(GameEvent::CurrencyChanged { player: id, currency: currency.to_string(), amount });
+    }
+
+    /// Takes `cost` of a currency from a player, or fails and takes nothing
+    /// if they have less. This is how a round type or a hook charges for
+    /// something. `"gold"` spends gold.
+    pub fn spend_currency(&mut self, id: PlayerId, currency: &str, cost: i64) -> Result<(), CommandError> {
+        if currency == "gold" {
+            return self.spend(id, cost.max(0));
+        }
+        let have = self.currency(id, currency);
+        if self.content.currency(currency).is_none() {
+            return Err(CommandError::UnknownCurrency);
+        }
+        if have < cost {
+            return Err(CommandError::NotEnough { currency: currency.to_string(), need: cost, have });
+        }
+        self.add_currency(id, currency, -cost.max(0));
+        Ok(())
+    }
+
     pub fn add_xp(&mut self, id: PlayerId, amount: u32) {
         let levels = &self.content.rules().levels;
         let p = &mut self.players[id.0 as usize];
         if p.level as usize >= levels.len() || amount == 0 {
             return;
         }
+        let before = p.level;
         p.xp += amount;
         while (p.level as usize) < levels.len() && p.xp >= levels[p.level as usize - 1].xp_to_next {
             p.xp -= levels[p.level as usize - 1].xp_to_next;
@@ -1181,6 +1664,9 @@ impl Game {
         }
         let (level, xp) = (p.level, p.xp);
         self.emit(GameEvent::XpChanged { player: id, level, xp });
+        for _ in before..level {
+            self.fire(id, When::LevelUp);
+        }
     }
 
     /// Adds an item to a player's inventory.
@@ -1210,6 +1696,128 @@ impl Game {
         self.players[id.0 as usize].augments.push(augment.to_string());
         self.emit(GameEvent::AugmentGained { player: id, augment: augment.to_string() });
         self.add_gold(id, gold);
+        let gained: Vec<Perk> =
+            self.content.augment(augment).map(|a| a.perks.iter().filter(|p| p.when == When::Gained).cloned().collect()).unwrap_or_default();
+        self.run_perks(id, &gained);
+    }
+
+    /// Sets off a player's [perks](crate::perk) for an occasion.
+    pub fn fire(&mut self, id: PlayerId, when: When) {
+        if when == When::Gained || !self.player(id).alive {
+            return;
+        }
+        let perks: Vec<Perk> = self.perks_and_rules(id).0.into_iter().filter(|p| p.when == when).collect();
+        self.run_perks(id, &perks);
+    }
+
+    fn run_perks(&mut self, id: PlayerId, perks: &[Perk]) {
+        if self.perk_depth >= MAX_GRANT_DEPTH {
+            return;
+        }
+        self.perk_depth += 1;
+        for perk in perks {
+            if perk.chance_permille >= 1000 || self.rng.chance(perk.chance_permille as u64, 1000) {
+                for grant in &perk.gives {
+                    // Checked when the content was built, so this cannot fail.
+                    let _ = self.give(id, grant);
+                }
+            }
+        }
+        self.perk_depth -= 1;
+    }
+
+    /// Everything a [choice](ChoiceOffer) could offer a player, ordered by
+    /// id. `AugmentTiers` lists every tier it names.
+    pub fn choice_candidates(&self, id: PlayerId, offer: &ChoiceOffer) -> Vec<String> {
+        let content = &self.content;
+        let owned = &self.player(id).augments;
+        let augments = |keep: &dyn Fn(u32) -> bool| -> Vec<String> {
+            content.augments().filter(|a| keep(a.tier) && !owned.contains(&a.id)).map(|a| a.id.clone()).collect()
+        };
+        match offer {
+            ChoiceOffer::Augments => augments(&|_| true),
+            ChoiceOffer::AugmentsOfTier(tier) => augments(&|t| t == *tier),
+            ChoiceOffer::AugmentTiers(tiers) => augments(&|t| tiers.iter().any(|(tier, _)| *tier == t)),
+            ChoiceOffer::Items => content.items().map(|i| i.id.clone()).collect(),
+            ChoiceOffer::ItemsTagged(tag) => content.items().filter(|i| i.tags.contains(tag)).map(|i| i.id.clone()).collect(),
+            ChoiceOffer::Components => self.component_items(),
+            ChoiceOffer::Units { cost } => self
+                .available_units(None)
+                .into_iter()
+                .map(|(unit, _)| unit)
+                .filter(|u| content.unit(u).is_some_and(|d| d.cost == *cost))
+                .collect(),
+        }
+    }
+
+    /// Settles which tier an [`ChoiceOffer::AugmentTiers`] offers, by its
+    /// weights. Other offers come back unchanged.
+    pub fn settle_offer(&mut self, offer: &ChoiceOffer) -> ChoiceOffer {
+        match offer {
+            ChoiceOffer::AugmentTiers(tiers) => {
+                let weights: Vec<u64> = tiers.iter().map(|(_, w)| *w as u64).collect();
+                match self.rng.weighted_index(&weights) {
+                    Some(i) => ChoiceOffer::AugmentsOfTier(tiers[i].0),
+                    None => ChoiceOffer::Augments,
+                }
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Hands a player what they picked from a [choice](ChoiceOffer).
+    pub fn give_choice(&mut self, id: PlayerId, offer: &ChoiceOffer, choice: &str) {
+        match offer {
+            ChoiceOffer::Augments | ChoiceOffer::AugmentsOfTier(_) | ChoiceOffer::AugmentTiers(_) => self.give_augment(id, choice),
+            ChoiceOffer::Items | ChoiceOffer::ItemsTagged(_) | ChoiceOffer::Components => self.give_item(id, choice),
+            ChoiceOffer::Units { .. } => {
+                self.take_from_pool(choice);
+                self.add_unit(id, choice, Vec::new());
+            }
+        }
+    }
+
+    /// Opens a pick of one out of `options` for a player (see
+    /// [`Grant::Choice`]). Does nothing when there is nothing to offer.
+    pub fn offer_choice(&mut self, id: PlayerId, options: u32, offer: &ChoiceOffer) {
+        let offer = self.settle_offer(offer);
+        let mut candidates = self.choice_candidates(id, &offer);
+        self.rng.shuffle(&mut candidates);
+        candidates.truncate(options as usize);
+        if candidates.is_empty() {
+            return;
+        }
+        self.emit(GameEvent::ChoiceOffered { player: Some(id), options: candidates.clone() });
+        self.players[id.0 as usize].choices.push(PendingChoice { offer, options: candidates });
+    }
+
+    /// Answers the oldest of a player's own picks.
+    fn pick_own(&mut self, id: PlayerId, option: usize) {
+        let p = &mut self.players[id.0 as usize];
+        if p.choices.is_empty() {
+            return;
+        }
+        let pending = p.choices.remove(0);
+        let Some(choice) = pending.options.get(option).cloned() else { return };
+        self.emit(GameEvent::ChoiceMade { player: id, option, choice: choice.clone() });
+        self.give_choice(id, &pending.offer, &choice);
+    }
+
+    /// Adds to the stat changes one of a player's units keeps for good.
+    /// Does nothing if they have no unit with that `uid`.
+    pub fn grow_unit(&mut self, id: PlayerId, uid: u32, mods: &[StatMod]) {
+        if let Some(unit) = self.players[id.0 as usize].unit_mut(uid) {
+            unit.grow(mods);
+        }
+    }
+
+    /// Makes one of a player's units count as having another trait.
+    pub fn add_unit_trait(&mut self, id: PlayerId, uid: u32, trait_id: &str) {
+        if let Some(unit) = self.players[id.0 as usize].unit_mut(uid) {
+            if !unit.traits.iter().any(|t| t == trait_id) {
+                unit.traits.push(trait_id.to_string());
+            }
+        }
     }
 
     /// Takes one copy of a unit out of the shared pool, if any are left.
@@ -1248,7 +1856,7 @@ impl Game {
     pub fn add_unit(&mut self, id: PlayerId, unit_id: &str, items: Vec<String>) {
         let uid = self.next_uid;
         self.next_uid += 1;
-        let unit = OwnedUnit { uid, unit: unit_id.to_string(), star: 1, items };
+        let unit = OwnedUnit { uid, unit: unit_id.to_string(), star: 1, items, growth: Vec::new(), traits: Vec::new() };
         let p = &mut self.players[id.0 as usize];
         p.stats.best_star = p.stats.best_star.max(1);
         match p.bench.iter().position(Option::is_none) {
@@ -1274,6 +1882,28 @@ impl Game {
         }
     }
 
+    /// Adds a unit bought from a special offer: at its star level and with
+    /// its extra trait.
+    fn add_special_unit(&mut self, id: PlayerId, unit_id: &str, offer: &ShopOffer) {
+        self.add_unit(id, unit_id, Vec::new());
+        // The newest copy is the one with the highest uid.
+        let uid = self.next_uid - 1;
+        let star = offer.star.max(1);
+        if let Some(unit) = self.players[id.0 as usize].unit_mut(uid) {
+            unit.star = unit.star.max(star);
+            if let Some(t) = &offer.extra_trait {
+                unit.traits.push(t.clone());
+            }
+            let star = unit.star;
+            let stats = &mut self.players[id.0 as usize].stats;
+            stats.best_star = stats.best_star.max(star);
+            if star > 1 {
+                self.emit(GameEvent::UnitUpgraded { player: id, uid, unit: unit_id.to_string(), star });
+            }
+        }
+        self.check_upgrades(id, unit_id);
+    }
+
     /// Merges matching copies into higher star levels for as long as possible.
     fn check_upgrades(&mut self, id: PlayerId, unit_id: &str) {
         let rules = self.content.rules();
@@ -1291,13 +1921,24 @@ impl Game {
             }
             let keep = matching[0];
             let mut items = Vec::new();
+            let (mut growth, mut traits) = (Vec::new(), Vec::new());
             for uid in &matching[1..] {
                 let slot = p.locate(*uid).unwrap();
-                items.extend(p.take(slot).unwrap().items);
+                let merged = p.take(slot).unwrap();
+                items.extend(merged.items);
+                growth.extend(merged.growth);
+                traits.extend(merged.traits);
             }
             let mut overflow = Vec::new();
             let kept = p.unit_mut(keep).unwrap();
             kept.star = star + 1;
+            // What the merged copies had earned is not lost.
+            kept.grow(&growth);
+            for t in traits {
+                if !kept.traits.contains(&t) {
+                    kept.traits.push(t);
+                }
+            }
             for item in items {
                 if kept.items.len() < max_items {
                     kept.items.push(item);
@@ -1310,6 +1951,7 @@ impl Game {
             let stats = &mut self.players[id.0 as usize].stats;
             stats.best_star = stats.best_star.max(star + 1);
             self.combine_items_on(id, keep);
+            self.fire(id, When::StarUp);
             // The new unit may complete a set at the next star level.
             star += 1;
         }
@@ -1330,9 +1972,14 @@ impl Game {
     /// Puts the copies a player's shop is holding back into the pool and
     /// empties the shop.
     fn return_shop_to_pool(&mut self, id: PlayerId) {
-        let offers: Vec<String> = self.players[id.0 as usize].shop.iter_mut().filter_map(Option::take).collect();
-        for unit in offers {
-            self.put_in_pool(&unit);
+        let p = &mut self.players[id.0 as usize];
+        let specials = std::mem::take(&mut p.shop_specials);
+        let offers: Vec<(usize, String)> = p.shop.iter_mut().enumerate().filter_map(|(i, o)| Some((i, o.take()?))).collect();
+        for (slot, unit) in offers {
+            let star = specials.get(slot).cloned().flatten().map_or(1, |s| s.star.max(1));
+            for _ in 0..self.content.rules().copies_to_upgrade.pow(star as u32 - 1) {
+                self.put_in_pool(&unit);
+            }
         }
     }
 
@@ -1343,8 +1990,8 @@ impl Game {
         self.return_shop_to_pool(id);
         let content = self.content.clone();
         let rules = content.rules();
-        let level = self.player(id).level as usize;
-        let odds = &rules.levels[(level - 1).min(rules.levels.len() - 1)].shop_odds;
+        let level = (self.player(id).level as i64 + self.rule(id, Rule::ShopLevel)).clamp(1, rules.levels.len() as i64) as usize;
+        let odds = &rules.levels[level - 1].shop_odds;
         let mut offers = Vec::with_capacity(rules.shop_size);
         for _ in 0..rules.shop_size {
             let available = self.available_units(None);
@@ -1366,8 +2013,51 @@ impl Game {
             }
             offers.push(offer);
         }
-        self.players[id.0 as usize].shop = offers.clone();
+        // Some offers come with something extra.
+        let mut specials = vec![None; offers.len()];
+        let player_level = self.player(id).level;
+        for (slot, offer) in offers.iter().enumerate() {
+            let Some(unit) = offer else { continue };
+            for special in rules.shop_specials.iter().filter(|s| player_level >= s.min_level) {
+                if !self.rng.chance(special.chance_permille as u64, 1000) {
+                    continue;
+                }
+                if let Some(made) = self.make_special(unit, special) {
+                    specials[slot] = Some(made);
+                    break;
+                }
+            }
+        }
+        let p = &mut self.players[id.0 as usize];
+        p.shop = offers.clone();
+        p.shop_specials = specials;
         self.emit(GameEvent::ShopRolled { player: id, offers });
+    }
+
+    /// Turns an offer into a special one, taking the extra copies a higher
+    /// star needs out of the pool. `None` if the pool is short or the unit
+    /// already has every trait the special could give.
+    fn make_special(&mut self, unit: &str, special: &ShopSpecial) -> Option<ShopOffer> {
+        let content = self.content.clone();
+        let def = content.unit(unit)?;
+        let extra_trait = if special.traits.is_empty() {
+            None
+        } else {
+            let options: Vec<&String> = special.traits.iter().filter(|t| !def.traits.contains(t)).collect();
+            if options.is_empty() {
+                return None;
+            }
+            Some(options[self.rng.below(options.len() as u64) as usize].clone())
+        };
+        let star = special.star.max(1);
+        let extra = content.rules().copies_to_upgrade.pow(star as u32 - 1) - 1;
+        if self.pool_count(unit) < extra {
+            return None;
+        }
+        for _ in 0..extra {
+            self.take_from_pool(unit);
+        }
+        Some(ShopOffer { star, extra_trait })
     }
 
     /// A player's board and augments as input for combat.
@@ -1391,8 +2081,11 @@ impl Game {
             Opponent::Neutral => TeamSetup { units: neutral.to_vec(), bonuses: Vec::new() },
         };
         let teams = vec![self.team_setup(home), away_setup];
-        let mut combat = self.content.setup_combat(seed, &teams).expect("boards are validated when they are built");
+        // Every fight of a round starts with the round's tiles.
+        let tiles = self.round_tiles().to_vec();
+        let mut combat = self.content.setup_combat_with(seed, &teams, &tiles).expect("boards are validated when they are built");
         let outcome = combat.run().clone();
+        let (rewards, growth) = (combat.rewards().to_vec(), combat.growth().to_vec());
         let survivors = match outcome.winner {
             Some(team) => combat.units().iter().filter(|u| u.is_alive() && u.team() == team).count() as u32,
             None => 0,
@@ -1416,8 +2109,38 @@ impl Game {
             duration_ms: outcome.duration_ms,
             survivors,
             teams,
+            tiles,
             events: combat.drain_events(),
         });
+        // What units earned in the fight goes to the players who own them:
+        // not to a neutral board, and not to the copy of a board.
+        let owners = [Some(home), match away {
+            Opponent::Player(p) => Some(p),
+            _ => None,
+        }];
+        let record = self.combats.last().expect("just recorded");
+        let sizes = [record.teams[0].units.len(), record.teams[1].units.len()];
+        let places: Vec<(PlayerId, (i32, i32), Vec<StatMod>)> = growth
+            .into_iter()
+            .filter_map(|(unit, mods)| {
+                // Units stand in the order the boards listed them.
+                let index = unit.0 as usize;
+                let (team, at) = if index < sizes[0] { (0, index) } else { (1, index - sizes[0]) };
+                let pos = record.teams[team].units.get(at)?.pos;
+                Some((owners[team]?, pos, mods))
+            })
+            .collect();
+        for (player, pos, mods) in places {
+            if let Some(unit) = self.players[player.0 as usize].board.get_mut(&pos) {
+                unit.grow(&mods);
+            }
+        }
+        for (team, grant) in rewards {
+            if let Some(player) = owners.get(team.0 as usize).copied().flatten() {
+                // Checked when the content was built, so this cannot fail.
+                let _ = self.give(player, &grant);
+            }
+        }
         // Results and kills, for both sides when both are players.
         let sides = [Some(home), match away {
             Opponent::Player(p) => Some(p),
@@ -1428,11 +2151,14 @@ impl Game {
             let kills = combat.units().iter().filter(|u| !u.is_alive() && u.team() != Team(team as u8)).count() as u32;
             let stats = &mut self.players[player.0 as usize].stats;
             stats.kills += kills;
+            let won = outcome.winner == Some(Team(team as u8));
             match outcome.winner {
-                Some(t) if t == Team(team as u8) => stats.fights_won += 1,
+                Some(_) if won => stats.fights_won += 1,
                 Some(_) => stats.fights_lost += 1,
                 None => stats.fights_drawn += 1,
             }
+            self.fire(player, if won { When::Won } else { When::Lost });
+            self.fire(player, When::Fought);
         }
         self.emit(GameEvent::CombatFinished { combat: index, home, away, winner: outcome.winner });
         FightResult { home_won: outcome.winner.map(|t| t == Team(0)), survivors }
@@ -1452,11 +2178,63 @@ impl Game {
     }
 
     pub fn damage_player(&mut self, id: PlayerId, amount: i64) {
+        // A player's rules can add to what they take, or take some off.
+        let amount = if amount > 0 { (amount + self.rule(id, Rule::DamageTaken)).max(0) } else { amount };
+        // Teammates share one health total.
+        for member in self.team_members(id) {
+            let p = &mut self.players[member.0 as usize];
+            p.health -= amount;
+            p.stats.damage_taken += amount;
+            let health = p.health;
+            self.emit(GameEvent::PlayerDamaged { player: member, amount, health });
+        }
+    }
+
+    /// Gives a player health back, up to what players start with
+    /// (`GameRules::starting_health`). Does nothing for a player who is
+    /// already there.
+    pub fn heal_player(&mut self, id: PlayerId, amount: i64) {
+        let most = self.content.rules().starting_health;
+        let amount = amount.min(most - self.player(id).health);
+        if amount <= 0 {
+            return;
+        }
+        for member in self.team_members(id) {
+            let p = &mut self.players[member.0 as usize];
+            p.health += amount;
+            let health = p.health;
+            self.emit(GameEvent::PlayerHealed { player: member, amount, health });
+        }
+    }
+
+    /// A player and their teammates still in the game, in seat order. Just
+    /// the player when teams are of one.
+    pub fn team_members(&self, id: PlayerId) -> Vec<PlayerId> {
+        let team = self.team_of(id);
+        let mut members: Vec<PlayerId> = self.players.iter().filter(|p| (p.alive || p.id == id) && self.team_of(p.id) == team).map(|p| p.id).collect();
+        members.sort();
+        members
+    }
+
+    /// Takes a unit away from a player without paying for it: a sacrifice,
+    /// a trade, a unit that leaves. Its items go back to the player's
+    /// inventory and its copies back to the pool. Returns the unit, or
+    /// `None` if the player has no unit with that `uid`.
+    pub fn remove_unit(&mut self, id: PlayerId, uid: u32) -> Option<OwnedUnit> {
         let p = &mut self.players[id.0 as usize];
-        p.health -= amount;
-        p.stats.damage_taken += amount;
-        let health = p.health;
-        self.emit(GameEvent::PlayerDamaged { player: id, amount, health });
+        let slot = p.locate(uid)?;
+        let unit = p.take(slot)?;
+        p.items.extend(unit.items.iter().cloned());
+        self.return_to_pool(&unit);
+        self.emit(GameEvent::UnitRemoved { player: id, uid, unit: unit.unit.clone() });
+        Some(unit)
+    }
+
+    /// What a unit is worth: its price times the copies merged into it.
+    /// Selling it pays this times `GameRules::sell_refund_permille`.
+    pub fn unit_value(&self, unit: &OwnedUnit) -> i64 {
+        let cost = self.content.unit(&unit.unit).map(|u| u.cost as i64).unwrap_or(0);
+        cost * self.copies_in(unit) as i64
     }
 
     /// Updates a player's streak after a fight against another player and
@@ -1466,7 +2244,7 @@ impl Game {
         p.streak = if won { p.streak.max(0) + 1 } else { p.streak.min(0) - 1 };
         p.stats.best_streak = p.stats.best_streak.max(p.streak.max(0) as u32);
         if won {
-            let bonus = self.content.rules().economy.win_bonus;
+            let bonus = self.rule(id, Rule::WinBonus);
             self.add_gold(id, bonus);
         }
     }

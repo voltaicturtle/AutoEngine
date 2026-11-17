@@ -119,15 +119,10 @@ fn ability_casts_when_mana_fills_and_scales_with_power() {
             .with(Stat::AttackSpeed, 1000)
             .with(Stat::AbilityPower, 150),
     )
-    .with_ability(Ability {
-        name: "Bolt".into(),
-        description: String::new(),
-        cast_time_ms: 200,
-        effects: vec![EffectSpec::new(
-            Selector::CurrentTarget,
-            Effect::Damage { amount: Amount::power(100), kind: DamageKind::True, can_crit: false },
-        )],
-    });
+    .with_ability(Ability::new("Bolt").cast_time(200).effect(EffectSpec::new(
+        Selector::CurrentTarget,
+        Effect::Damage { amount: Amount::power(100), kind: DamageKind::True, can_crit: false },
+    )));
     let dummy = UnitTemplate::new(
         "Dummy",
         StatBlock::base().with(Stat::MaxHealth, 10_000).with(Stat::AttackDamage, 0),

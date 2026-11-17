@@ -60,12 +60,14 @@ pub struct ScriptHost {
 #[derive(Clone, Debug)]
 enum Action {
     Gold(INT, INT),
+    Currency(INT, String, INT),
     Xp(INT, INT),
     Item(INT, String),
     RandomItem(INT),
     Unit(INT, String),
     Augment(INT, String),
     Damage(INT, INT),
+    Heal(INT, INT),
     Log(String),
     FightAll,
 }
@@ -80,10 +82,13 @@ struct PlayerSnap {
     units: INT,
     items: INT,
     streak: INT,
+    wallet: BTreeMap<String, INT>,
 }
 
 struct Ctx {
     players: Vec<PlayerSnap>,
+    /// The most health a player can be healed to.
+    max_health: INT,
     stage: INT,
     round: INT,
     round_name: String,
@@ -133,12 +138,16 @@ pub const API: &[(&str, &str)] = &[
     ("get(\"key\")", "a number saved with `set`, or 0"),
     ("set(\"key\", n)", "saves a number for the rest of the game, shared by all scripts"),
     ("give_gold(p, n)", "gives a player gold (negative takes it away)"),
+    ("amount(p, \"id\")", "how much a player has of a currency other than gold"),
+    ("give(p, \"id\", n)", "gives a player some of a currency other than gold (negative takes it away)"),
+    ("take(p, \"id\", n)", "takes n of a currency if the player has that much; says whether it did"),
     ("give_xp(p, n)", "gives a player experience"),
     ("give_item(p, \"id\")", "gives a player an item"),
     ("give_random_item(p)", "gives a player a random component item"),
     ("give_unit(p, \"id\")", "puts a unit on a player's bench, if there is room"),
     ("give_augment(p, \"id\")", "gives a player an augment"),
     ("damage(p, n)", "takes health from a player"),
+    ("heal(p, n)", "gives a player health back, up to what players start with"),
     ("log(\"text\")", "shows a line in every client's log"),
     ("fight_all()", "pairs everyone up to fight, as a Pvp round does"),
 ];
@@ -150,9 +159,13 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("RoundFinished", "index"),
     ("ShopRolled", "player, offers"),
     ("GoldChanged", "player, gold"),
+    ("CurrencyChanged", "player, currency, amount"),
+    ("ActionUsed", "player, action, arg"),
     ("XpChanged", "player, level, xp"),
     ("UnitGained", "player, uid, unit"),
     ("UnitSold", "player, uid, unit"),
+    ("UnitRemoved", "player, uid, unit"),
+    ("UnitGifted", "from, to, uid, unit"),
     ("UnitUpgraded", "player, uid, unit, star"),
     ("UnitMoved", "player, uid, to"),
     ("ItemGained", "player, item"),
@@ -166,6 +179,7 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("PlayerReady", "player"),
     ("CombatFinished", "combat, home, away, winner"),
     ("PlayerDamaged", "player, amount, health"),
+    ("PlayerHealed", "player, amount, health"),
     ("PlayerForfeited", "player"),
     ("PlayerEliminated", "player, placement"),
     ("GameOver", "winner"),
@@ -227,9 +241,41 @@ fn register_api(engine: &mut Engine) {
         g.player(p, |s| s.gold = (s.gold + n).max(0));
         g.push(Action::Gold(p, n));
     });
+    // Other currencies follow the same rule, and "gold" is gold. Ones the
+    // game does not define read as 0 and cannot be given.
+    fn balance<'a>(s: &'a mut PlayerSnap, id: &str) -> Option<&'a mut INT> {
+        if id == "gold" { Some(&mut s.gold) } else { s.wallet.get_mut(id) }
+    }
+    engine.register_fn("amount", |g: &mut ScriptGame, p: INT, id: &str| g.player(p, |s| balance(s, id).map_or(0, |b| *b)));
+    engine.register_fn("give", |g: &mut ScriptGame, p: INT, id: &str, n: INT| {
+        g.player(p, |s| {
+            if let Some(balance) = balance(s, id) {
+                *balance = (*balance + n).max(0);
+            }
+        });
+        g.push(Action::Currency(p, id.to_string(), n));
+    });
+    engine.register_fn("take", |g: &mut ScriptGame, p: INT, id: &str, n: INT| -> bool {
+        let paid = g.player(p, |s| match balance(s, id) {
+            Some(balance) if n >= 0 && *balance >= n => {
+                *balance -= n;
+                true
+            }
+            _ => false,
+        });
+        if paid {
+            g.push(Action::Currency(p, id.to_string(), -n));
+        }
+        paid
+    });
     engine.register_fn("damage", |g: &mut ScriptGame, p: INT, n: INT| {
         g.player(p, |s| s.health -= n.max(0));
         g.push(Action::Damage(p, n));
+    });
+    engine.register_fn("heal", |g: &mut ScriptGame, p: INT, n: INT| {
+        let most = g.with(|c| c.max_health);
+        g.player(p, |s| s.health = s.health.max((s.health + n.max(0)).min(most)));
+        g.push(Action::Heal(p, n));
     });
     engine.register_fn("give_xp", |g: &mut ScriptGame, p: INT, n: INT| g.push(Action::Xp(p, n)));
     engine.register_fn("give_item", |g: &mut ScriptGame, p: INT, id: &str| g.push(Action::Item(p, id.to_string())));
@@ -367,8 +413,10 @@ impl ScriptHost {
                     units: p.units().count() as INT,
                     items: p.items.len() as INT,
                     streak: p.streak as INT,
+                    wallet: game.content().currencies().iter().map(|c| (c.id.clone(), game.currency(p.id, &c.id))).collect(),
                 })
                 .collect(),
+            max_health: game.content().rules().starting_health,
             stage: game.stage() as INT,
             round: game.round_index() as INT + 1,
             round_name: game.round_name().to_string(),
@@ -407,6 +455,12 @@ fn apply(game: &mut Game, action: Action, script: &str) -> Result<(), String> {
     };
     match action {
         Action::Gold(p, n) => game.add_gold(player(p)?, n),
+        Action::Currency(p, currency, n) => {
+            if currency != "gold" && game.content().currency(&currency).is_none() {
+                return Err(format!("there is no currency \"{currency}\""));
+            }
+            game.add_currency(player(p)?, &currency, n);
+        }
         Action::Xp(p, n) => game.add_xp(player(p)?, n.clamp(0, u32::MAX as INT) as u32),
         Action::Item(p, item) => {
             if game.content().item(&item).is_none() {
@@ -430,6 +484,7 @@ fn apply(game: &mut Game, action: Action, script: &str) -> Result<(), String> {
             game.give_augment(player(p)?, &augment);
         }
         Action::Damage(p, n) => game.damage_player(player(p)?, n.max(0)),
+        Action::Heal(p, n) => game.heal_player(player(p)?, n),
         Action::Log(message) => game.emit(GameEvent::Script { script: script.to_string(), message }),
         Action::FightAll => PvpRound.finish(game),
     }

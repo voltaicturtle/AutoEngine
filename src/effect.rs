@@ -29,9 +29,12 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::name::Name;
 use crate::stats::{Stat, StatBlock, StatMod};
 
-/// How damage is mitigated.
+/// The type of some damage, which decides how it is mitigated. The rules
+/// for each kind are a [`DamageType`](crate::damage::DamageType) in the
+/// fight's settings, and a game can add kinds of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DamageKind {
     /// Reduced by armor.
@@ -40,6 +43,28 @@ pub enum DamageKind {
     Magic,
     /// Ignores resistances.
     True,
+    /// A kind the game defines; see [`DamageKind::custom`].
+    Custom(Name),
+}
+
+impl DamageKind {
+    /// A damage type of the game's own, such as `DamageKind::custom("fire")`.
+    /// Declare it once as a constant, and describe it to the game with
+    /// [`GameBuilder::damage_type`](crate::content::GameBuilder::damage_type).
+    pub const fn custom(id: &'static str) -> Self {
+        DamageKind::Custom(Name::new(id))
+    }
+
+    /// A short lower-case id: `"physical"`, `"magic"`, `"true"`, or the
+    /// name a custom kind was given.
+    pub const fn id(self) -> &'static str {
+        match self {
+            DamageKind::Physical => "physical",
+            DamageKind::Magic => "magic",
+            DamageKind::True => "true",
+            DamageKind::Custom(name) => name.as_str(),
+        }
+    }
 }
 
 /// Which unit a scaling value or condition is read from.
@@ -62,6 +87,8 @@ pub enum ScaleBy {
     Stacks(String),
     /// Living units on the unit's team (itself included) carrying a tag.
     AlliesWithTag(String),
+    /// How much of a resource the unit has right now, by resource id.
+    Resource(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,10 +120,20 @@ impl Amount {
         Amount { flat: value, power_scaled: true, ..Default::default() }
     }
 
+    /// The value of one of the source's stats.
+    pub fn stat(stat: Stat) -> Self {
+        Amount::default().plus(Who::Source, ScaleBy::Stat(stat), 1000)
+    }
+
     /// Adds a scaling term, e.g. 150% of the source's attack damage.
     pub fn plus(mut self, who: Who, by: ScaleBy, permille: i64) -> Self {
         self.scalings.push(Scaling { who, by, permille });
         self
+    }
+
+    /// Whether it is always nothing.
+    pub fn is_zero(&self) -> bool {
+        self.flat == 0 && self.scalings.is_empty()
     }
 }
 
@@ -115,7 +152,7 @@ pub enum StatusKind {
     StatMods(Vec<StatMod>),
     /// Damage every tick, expressed per second.
     DamageOverTime { per_second: Amount, kind: DamageKind },
-    /// Cannot start casting. Mana still builds up.
+    /// Cannot start casting. Resources still build up.
     Silence,
     /// Cannot make basic attacks, but can move and cast.
     Disarm,
@@ -130,6 +167,14 @@ pub enum StatusKind {
     Invulnerable,
     /// New debuffs do not take hold (see [`StatusKind::is_debuff`]).
     Unstoppable,
+    /// Enemies cannot choose the unit: selectors and basic attacks pass it
+    /// over, and anyone aiming at it looks for someone else. Effects
+    /// already on their way still land.
+    Untargetable,
+    /// Does nothing by itself: a named mark for conditions to look for
+    /// ([`Condition::HasStatus`]), such as "burning" or "marked". A
+    /// `harmful` mark counts as a debuff.
+    Marker { name: String, harmful: bool },
 }
 
 impl StatusKind {
@@ -146,13 +191,16 @@ impl StatusKind {
             | StatusKind::Wound { .. }
             | StatusKind::DamageOverTime { .. } => true,
             StatusKind::StatMods(mods) => mods.iter().any(StatMod::lowers),
-            StatusKind::Invulnerable | StatusKind::Unstoppable => false,
+            StatusKind::Invulnerable | StatusKind::Unstoppable | StatusKind::Untargetable => false,
+            StatusKind::Marker { harmful, .. } => *harmful,
         }
     }
 
-    /// A short name for logs and tooltips.
-    pub fn name(&self) -> &'static str {
+    /// A short name for logs, tooltips and [`Condition::HasStatus`]. A
+    /// marker's name is the one it was given.
+    pub fn name(&self) -> &str {
         match self {
+            StatusKind::Marker { name, .. } => name,
             StatusKind::Stun => "stunned",
             StatusKind::StatMods(_) => "stat-modified",
             StatusKind::DamageOverTime { .. } => "afflicted",
@@ -163,6 +211,7 @@ impl StatusKind {
             StatusKind::Wound { .. } => "wounded",
             StatusKind::Invulnerable => "invulnerable",
             StatusKind::Unstoppable => "unstoppable",
+            StatusKind::Untargetable => "untargetable",
         }
     }
 }
@@ -183,8 +232,10 @@ pub enum Effect {
         #[serde(default)]
         duration_ms: Option<u32>,
     },
-    /// Positive or negative.
-    GainMana { amount: i64 },
+    /// Gives the unit some of a resource (see the
+    /// [`resource`](crate::resource) module), or takes it away when the
+    /// amount is negative. Does nothing to a unit without that resource.
+    GainResource { resource: String, amount: Amount },
     ApplyStatus { status: StatusKind, duration_ms: u32 },
     /// Stat changes that last for the rest of the combat.
     ModifyStats { mods: Vec<StatMod> },
@@ -217,6 +268,42 @@ pub enum Effect {
     /// The source jumps to the free hex closest to the selected unit, and
     /// targets it if it is an enemy.
     Leap,
+    /// Lays a [tile](crate::tile) on the selected unit's hex and on every
+    /// hex within `radius` of it, for `duration_ms` or for the rest of the
+    /// fight. The source owns the tiles: its side decides whom they
+    /// affect, and it is the source of their effects. A blocking tile is
+    /// not laid on a hex a unit is standing on.
+    PlaceTile {
+        tile: String,
+        #[serde(default)]
+        radius: u32,
+        #[serde(default)]
+        duration_ms: Option<u32>,
+    },
+    /// Brings a dead unit back with this much health (at least 1, at most
+    /// its maximum), where it fell or on the nearest free hex. It returns
+    /// without shields, statuses or a cast in progress, and keeps its
+    /// stacks and resources. Does nothing to the living.
+    ///
+    /// Dead units are reached by [`Selector::FallenAllies`], by
+    /// [`Selector::Source`] in an `OnDeath` passive and by
+    /// [`Selector::EventOther`] in an `OnAllyDeath` one.
+    Revive { health: Amount },
+    /// Hands the player whose unit receives it something to keep after the
+    /// fight; see [`Effect::reward`].
+    Reward { grant: Box<crate::game::Grant> },
+    /// Changes the receiver's stats for good; see [`Effect::grow`].
+    Grow { mods: Vec<StatMod> },
+    /// Turns the receiver into another unit; see [`Effect::transform`].
+    Transform { unit: String },
+    /// Makes a copy of the receiver; see [`Effect::copy`].
+    Copy { health_permille: u32 },
+    /// The source and the receiver trade places.
+    Swap,
+    /// Fires the selected unit's [`Trigger::Signal`] passives of this name,
+    /// with the source as the other unit. This is how content makes
+    /// occasions of its own for passives to react to.
+    Signal { name: Name },
     /// Runs a Rust hook registered under `name` (see
     /// [`GameBuilder::custom_effect`](crate::content::GameBuilder::custom_effect)),
     /// once per selected unit. `args` are passed through to the hook so one
@@ -259,8 +346,129 @@ impl Effect {
         Effect::Shield { amount: amount.into(), duration_ms: Some(duration_ms) }
     }
 
-    pub fn mana(amount: i64) -> Self {
-        Effect::GainMana { amount }
+    /// Gives mana, or drains it when negative.
+    pub fn mana(amount: impl Into<Amount>) -> Self {
+        Effect::resource(crate::resource::MANA, amount)
+    }
+
+    /// Gives some of a resource, or drains it when negative.
+    pub fn resource(resource: impl Into<String>, amount: impl Into<Amount>) -> Self {
+        Effect::GainResource { resource: resource.into(), amount: amount.into() }
+    }
+
+    /// Lays a tile under each selected unit for the rest of the fight; see
+    /// [`Effect::PlaceTile`] and the [`tile`](crate::tile) module.
+    pub fn tile(tile: impl Into<String>) -> Self {
+        Effect::PlaceTile { tile: tile.into(), radius: 0, duration_ms: None }
+    }
+
+    /// Lays a tile under each selected unit for `duration_ms`.
+    ///
+    /// ```
+    /// use autoengine::effect::{Ability, Effect, Selector};
+    ///
+    /// // Three seconds of burning ground under the target and around it.
+    /// let scorch = Ability::new("Scorch").effect(Effect::tile_for("embers", 3000).spread(1).to(Selector::CurrentTarget));
+    /// assert_eq!(scorch.effects.len(), 1);
+    /// ```
+    pub fn tile_for(tile: impl Into<String>, duration_ms: u32) -> Self {
+        Effect::PlaceTile { tile: tile.into(), radius: 0, duration_ms: Some(duration_ms) }
+    }
+
+    /// Makes a tile effect cover every hex within `radius` as well. Other
+    /// effects are returned unchanged.
+    pub fn spread(mut self, hexes: u32) -> Self {
+        if let Effect::PlaceTile { radius, .. } = &mut self {
+            *radius = hexes;
+        }
+        self
+    }
+
+    /// Brings a dead unit back; see [`Effect::Revive`].
+    ///
+    /// ```
+    /// use autoengine::effect::{Amount, Effect, Passive, ScaleBy, Selector, Trigger, Who};
+    /// use autoengine::stats::Stat;
+    ///
+    /// // Once a fight, get back up with 40% health.
+    /// let second_wind = Passive::new("Second Wind", Trigger::OnDeath).max_procs(1).effect(
+    ///     Effect::revive(Amount::default().plus(Who::Target, ScaleBy::Stat(Stat::MaxHealth), 400)).to(Selector::Source),
+    /// );
+    /// assert_eq!(second_wind.max_procs, Some(1));
+    /// ```
+    /// Hands the player whose unit receives it something to keep after the
+    /// fight: gold for a kill, a drop from a monster. Aim it at one of the
+    /// player's units: `Selector::Source` in a passive of their own unit,
+    /// `Selector::EventOther` (the killer) in a monster's `OnDeath`.
+    /// Nothing is handed out for a team no player owns (a neutral board,
+    /// or a copy of another player's board).
+    ///
+    /// ```
+    /// use autoengine::effect::{Effect, Passive, Selector, Trigger};
+    /// use autoengine::game::Grant;
+    ///
+    /// // A monster that drops a roll on a loot table for whoever kills it.
+    /// let drop = Passive::new("Hoard", Trigger::OnDeath).effect(Effect::reward(Grant::Loot("orbs".into())).to(Selector::EventOther));
+    /// // A unit that earns its player a gold piece for every kill.
+    /// let bounty = Passive::new("Bounty", Trigger::OnKill).effect(Effect::reward(Grant::Gold(1)).to(Selector::Source));
+    /// assert_ne!(drop, bounty);
+    /// ```
+    pub fn reward(grant: crate::game::Grant) -> Self {
+        Effect::Reward { grant: Box::new(grant) }
+    }
+
+    /// Changes the receiver's stats for good: at once in this fight, and in
+    /// every later one, for as long as the player keeps the unit. For a
+    /// unit no player owns (a summon, a neutral monster) it lasts the
+    /// fight.
+    ///
+    /// ```
+    /// use autoengine::effect::{Effect, Passive, Selector, Trigger};
+    /// use autoengine::stats::Stat;
+    ///
+    /// // Every kill makes it a little stronger, forever.
+    /// let hunger = Passive::new("Hunger", Trigger::OnKill).effect(Effect::grow([Stat::AbilityPower.flat(2)]).to(Selector::Source));
+    /// assert_eq!(hunger.effects.len(), 1);
+    /// ```
+    pub fn grow(mods: impl IntoIterator<Item = StatMod>) -> Self {
+        Effect::Grow { mods: mods.into_iter().collect() }
+    }
+
+    /// Turns the receiver into another unit, by id: a second form. It
+    /// keeps its place, its share of health, its statuses, its traits and
+    /// what its items and traits gave it, and takes the other unit's base
+    /// stats, abilities and passives.
+    pub fn transform(unit: impl Into<String>) -> Self {
+        Effect::Transform { unit: unit.into() }
+    }
+
+    /// Makes a copy of the receiver next to it, on the source's side, with
+    /// `health_permille` of its health: 500 is a copy at half health. The
+    /// copy has the same stats, items and passives.
+    pub fn copy(health_permille: u32) -> Self {
+        Effect::Copy { health_permille }
+    }
+
+    /// Enemies cannot choose the receiver for `duration_ms`.
+    pub fn untargetable(duration_ms: u32) -> Self {
+        Effect::ApplyStatus { status: StatusKind::Untargetable, duration_ms }
+    }
+
+    pub fn revive(health: impl Into<Amount>) -> Self {
+        Effect::Revive { health: health.into() }
+    }
+
+    /// The amounts the effect works out when it resolves.
+    pub fn amounts(&self) -> Vec<&Amount> {
+        match self {
+            Effect::Damage { amount, .. }
+            | Effect::Heal { amount }
+            | Effect::Revive { health: amount }
+            | Effect::Shield { amount, .. }
+            | Effect::GainResource { amount, .. } => vec![amount],
+            Effect::ApplyStatus { status: StatusKind::DamageOverTime { per_second, .. }, .. } => vec![per_second],
+            _ => Vec::new(),
+        }
     }
 
     pub fn stun(duration_ms: u32) -> Self {
@@ -299,6 +507,23 @@ impl Effect {
 
     pub fn unstoppable(duration_ms: u32) -> Self {
         Effect::ApplyStatus { status: StatusKind::Unstoppable, duration_ms }
+    }
+
+    /// Puts a named mark on the unit for conditions to look for. It does
+    /// nothing by itself and is not a debuff.
+    pub fn mark(name: impl Into<String>, duration_ms: u32) -> Self {
+        Effect::ApplyStatus { status: StatusKind::Marker { name: name.into(), harmful: false }, duration_ms }
+    }
+
+    /// A mark that counts as a debuff: cleansing removes it and an
+    /// unstoppable unit shrugs it off.
+    pub fn harmful_mark(name: impl Into<String>, duration_ms: u32) -> Self {
+        Effect::ApplyStatus { status: StatusKind::Marker { name: name.into(), harmful: true }, duration_ms }
+    }
+
+    /// Fires the selected units' passives that wait for this signal.
+    pub fn signal(name: &'static str) -> Self {
+        Effect::Signal { name: Name::new(name) }
     }
 
     pub fn execute(permille: u32) -> Self {
@@ -423,6 +648,36 @@ pub enum Selector {
     HighestStatEnemies { stat: Stat, n: u32 },
     /// The `n` allies (the source included) with the most of a stat.
     HighestStatAllies { stat: Stat, n: u32 },
+    /// The `n` enemies with the least of a stat.
+    LowestStatEnemies { stat: Stat, n: u32 },
+    /// The `n` allies (the source included) with the least of a stat.
+    LowestStatAllies { stat: Stat, n: u32 },
+    /// Up to `n` allies picked at random, the source included.
+    RandomAllies(u32),
+    /// Every ally except the source.
+    OtherAllies,
+    /// Up to `n` dead allies, the most recently fallen first. Only
+    /// [`Effect::Revive`] does anything to them.
+    FallenAllies(u32),
+    /// Enemies standing on the straight line from the source through its
+    /// target, up to `length` hexes out, nearest first: a bolt that goes
+    /// through everything.
+    EnemiesInLine { length: u32 },
+    /// Enemies within `length` hexes in a cone a sixth of a circle wide,
+    /// pointed at the source's target.
+    EnemiesInCone { length: u32 },
+    /// The source and its allies in the same row of the board.
+    AlliesInRow,
+    /// The biggest group of enemies that fits within `radius` hexes of one
+    /// of them. Between groups of the same size, the nearest.
+    EnemyCluster { radius: u32 },
+    /// The source's target, then the nearest enemy within `range` hexes of
+    /// it not chosen yet, and so on, for `count` units in all: a bolt that
+    /// jumps from one to the next.
+    Chain { count: u32, range: u32 },
+    /// Units chosen by a Rust hook registered under this name (see
+    /// [`GameBuilder::custom_selector`](crate::content::GameBuilder::custom_selector)).
+    Custom(String),
 }
 
 /// A yes/no question asked when a passive fires or an effect resolves.
@@ -448,6 +703,27 @@ pub enum Condition {
     /// At least `count` living units on the source's team (itself included)
     /// carry a tag.
     AlliesWithTagAtLeast { tag: String, count: u32 },
+    /// The unit has a resource filled to at least this share of its
+    /// capacity, in permille. False for a unit without the resource.
+    ResourceAtLeast { who: Who, resource: String, permille: u32 },
+    /// The unit has a status with this [name](StatusKind::name), such as
+    /// `"stunned"` or the name of a [marker](StatusKind::Marker).
+    HasStatus {
+        who: Who,
+        status: String,
+    },
+    /// The unit is standing on a [tile](crate::tile) of this kind, whether
+    /// or not the tile affects it.
+    OnTile {
+        who: Who,
+        tile: String,
+    },
+    /// The unit stands within `rows` rows of its side's front line: 1 is
+    /// the front row only. A unit past the middle of the board counts as
+    /// in front. Placement decides it at the start of a fight, so a
+    /// `CombatStart` passive with this condition gives front-row and
+    /// back-row units different effects.
+    InFrontRows { who: Who, rows: u32 },
     /// A seeded random roll, in permille.
     Chance { permille: u32 },
     Not(Box<Condition>),
@@ -513,11 +789,83 @@ pub struct EffectSpec {
     pub effect: Effect,
     #[serde(default)]
     pub condition: Option<Condition>,
+    /// How long after it resolves the effect lands, in milliseconds. The
+    /// receivers are chosen when it resolves, and it lands on the ones
+    /// still alive. 0 is at once.
+    #[serde(default)]
+    pub delay_ms: u32,
+    /// Lands the effect more than once on the same receivers.
+    #[serde(default)]
+    pub repeat: Option<Repeat>,
+    /// Extra wait for each hex between the source and the receiver, in
+    /// milliseconds: something that flies there.
+    #[serde(default)]
+    pub travel_ms_per_hex: u32,
+}
+
+/// How an [`EffectSpec`] repeats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Repeat {
+    /// How many times the effect lands in all.
+    pub times: u32,
+    /// The time between one landing and the next, in milliseconds.
+    pub every_ms: u32,
 }
 
 impl EffectSpec {
     pub fn new(target: Selector, effect: Effect) -> Self {
-        EffectSpec { target, effect, condition: None }
+        EffectSpec { target, effect, condition: None, delay_ms: 0, repeat: None, travel_ms_per_hex: 0 }
+    }
+
+    /// Lands the effect `ms` milliseconds later: a fuse, a wind-up, a shot
+    /// in flight. Who receives it is decided now, and it lands on those
+    /// still alive then, even if its source has died in the meantime.
+    ///
+    /// To choose the receivers when it lands instead, delay a
+    /// [`Effect::signal`] to the source and put the effect in a passive
+    /// waiting for that signal.
+    ///
+    /// ```
+    /// use autoengine::effect::{Effect, Selector};
+    ///
+    /// // A charge that goes off two seconds after it is planted.
+    /// let bomb = Effect::magic(300).to(Selector::CurrentTarget).after(2000);
+    /// assert_eq!(bomb.delay_ms, 2000);
+    /// ```
+    pub fn after(mut self, ms: u32) -> Self {
+        self.delay_ms = ms;
+        self
+    }
+
+    /// Lands the effect `times` times in all, `every_ms` apart, on the same
+    /// receivers: a channel, a burst of shots, a pulsing aura.
+    ///
+    /// ```
+    /// use autoengine::effect::{Effect, Selector};
+    ///
+    /// // Three volleys, half a second apart, the first at once.
+    /// let volley = Effect::physical(40).to(Selector::NearestEnemies(3)).repeat(3, 500);
+    /// assert_eq!(volley.repeat.unwrap().times, 3);
+    /// ```
+    /// Makes the effect fly to each receiver, taking `ms_per_hex` for every
+    /// hex in between, so the far ones are reached later. Adds to
+    /// [`after`](Self::after).
+    ///
+    /// ```
+    /// use autoengine::effect::{Effect, Selector};
+    ///
+    /// // A wave that rolls outward from the caster.
+    /// let wave = Effect::magic(150).to(Selector::EnemiesInCone { length: 4 }).travel(100);
+    /// assert_eq!(wave.travel_ms_per_hex, 100);
+    /// ```
+    pub fn travel(mut self, ms_per_hex: u32) -> Self {
+        self.travel_ms_per_hex = ms_per_hex;
+        self
+    }
+
+    pub fn repeat(mut self, times: u32, every_ms: u32) -> Self {
+        self.repeat = Some(Repeat { times, every_ms });
+        self
     }
 
     /// Only applies the effect to selected units for which `condition` holds.
@@ -531,7 +879,48 @@ impl EffectSpec {
     }
 }
 
-/// An active ability, cast automatically when the unit's mana is full.
+/// What a unit pays to cast an ability. The unit casts as soon as it can
+/// pay (and the ability is off cooldown).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Cost {
+    /// A full bar of a resource, which the cast empties. A unit with none
+    /// of the resource never casts.
+    Full(String),
+    /// A fixed amount of a resource.
+    Amount { resource: String, amount: i64 },
+    /// Nothing. Give the ability a cooldown, or the unit does little else.
+    Free,
+}
+
+impl Cost {
+    /// A full bar of a resource.
+    pub fn full(resource: impl Into<String>) -> Self {
+        Cost::Full(resource.into())
+    }
+
+    /// A fixed amount of a resource.
+    pub fn of(resource: impl Into<String>, amount: i64) -> Self {
+        Cost::Amount { resource: resource.into(), amount }
+    }
+
+    /// The resource it is paid in, if any.
+    pub fn resource(&self) -> Option<&str> {
+        match self {
+            Cost::Full(resource) | Cost::Amount { resource, .. } => Some(resource),
+            Cost::Free => None,
+        }
+    }
+}
+
+/// A full bar of mana.
+impl Default for Cost {
+    fn default() -> Self {
+        Cost::full(crate::resource::MANA)
+    }
+}
+
+/// An active ability, cast automatically as soon as the unit can pay its
+/// [`Cost`]: by default, when its mana is full.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ability {
     pub name: String,
@@ -541,12 +930,37 @@ pub struct Ability {
     /// Time the unit spends casting before the effects resolve.
     #[serde(default)]
     pub cast_time_ms: u32,
+    /// What the unit pays to cast it.
+    #[serde(default)]
+    pub cost: Cost,
+    /// The least time between two casts, counted from when a cast starts.
+    #[serde(default)]
+    pub cooldown_ms: u32,
     pub effects: Vec<EffectSpec>,
 }
 
 impl Ability {
     pub fn new(name: impl Into<String>) -> Self {
-        Ability { name: name.into(), description: String::new(), cast_time_ms: 0, effects: Vec::new() }
+        Ability {
+            name: name.into(),
+            description: String::new(),
+            cast_time_ms: 0,
+            cost: Cost::default(),
+            cooldown_ms: 0,
+            effects: Vec::new(),
+        }
+    }
+
+    /// What the unit pays to cast it: `.cost(Cost::of("energy", 40))`.
+    pub fn cost(mut self, cost: Cost) -> Self {
+        self.cost = cost;
+        self
+    }
+
+    /// The least time between two casts.
+    pub fn cooldown(mut self, ms: u32) -> Self {
+        self.cooldown_ms = ms;
+        self
     }
 
     /// What it does, for players to read.
@@ -569,12 +983,24 @@ impl Ability {
 /// When a passive fires.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Trigger {
+    /// The owner dodged a basic attack; the other unit is the attacker.
+    OnDodge,
+    /// The owner was healed by an ability or an effect of one (not by
+    /// lifesteal or a passive); the other unit is the healer.
+    OnHealed,
+    /// An ally finished casting; the other unit is the caster.
+    OnAllyCast,
+    /// An enemy died; the other unit is the one that died.
+    OnEnemyDeath,
+    /// An [`Effect::Signal`] of this name reached the owner; the other unit
+    /// is the one that sent it.
+    Signal(Name),
     CombatStart,
     /// The owner lands a basic attack.
     OnAttack,
     /// The owner takes damage from an attack or ability.
     OnDamaged,
-    /// The owner finishes casting its ability.
+    /// The owner finishes casting an ability.
     OnCast,
     OnKill,
     OnDeath,
@@ -588,6 +1014,13 @@ pub enum Trigger {
     Every { interval_ms: u32 },
     /// The owner's health drops to or below this share of its maximum.
     HealthBelow { permille: u32 },
+}
+
+impl Trigger {
+    /// Fires when an [`Effect::signal`] of this name reaches the owner.
+    pub const fn signal(name: &'static str) -> Self {
+        Trigger::Signal(Name::new(name))
+    }
 }
 
 /// A triggered set of effects. Traits, items and augments attach these to
@@ -641,12 +1074,16 @@ pub struct UnitTemplate {
     pub id: String,
     pub name: String,
     pub stats: StatBlock,
-    pub ability: Option<Ability>,
+    /// The abilities it casts. Each tick it casts the first one it can pay
+    /// for, so put the ones that should win first.
+    pub abilities: Vec<Ability>,
     pub passives: Vec<Passive>,
     /// Free-form labels (traits, roles) that selectors can match on.
     pub tags: Vec<String>,
     /// Which enemy the unit goes after when it needs a new target.
     pub targeting: Targeting,
+    /// The type of damage its basic attacks deal.
+    pub attack_kind: DamageKind,
 }
 
 /// How a unit picks its target when it has none (or its target died).
@@ -663,6 +1100,23 @@ pub enum Targeting {
     HighestDamage,
     /// The enemy with the least armor.
     LowestArmor,
+    /// The enemy with the most of any stat.
+    HighestStat(Stat),
+    /// The enemy with the least of any stat.
+    LowestStat(Stat),
+    /// The first enemy picked by the custom selector registered under this
+    /// name (see
+    /// [`GameBuilder::custom_selector`](crate::content::GameBuilder::custom_selector)),
+    /// or the nearest enemy when it picks none.
+    Custom(Name),
+}
+
+impl Targeting {
+    /// Targeting decided by a custom selector hook; see
+    /// [`Targeting::Custom`].
+    pub const fn custom(selector: &'static str) -> Self {
+        Targeting::Custom(Name::new(selector))
+    }
 }
 
 impl UnitTemplate {
@@ -671,11 +1125,18 @@ impl UnitTemplate {
             id: String::new(),
             name: name.into(),
             stats,
-            ability: None,
+            abilities: Vec::new(),
             passives: Vec::new(),
             tags: Vec::new(),
             targeting: Targeting::Nearest,
+            attack_kind: DamageKind::Physical,
         }
+    }
+
+    /// The type of damage its basic attacks deal, instead of physical.
+    pub fn with_attack_kind(mut self, kind: DamageKind) -> Self {
+        self.attack_kind = kind;
+        self
     }
 
     pub fn with_id(mut self, id: impl Into<String>) -> Self {
@@ -683,8 +1144,10 @@ impl UnitTemplate {
         self
     }
 
+    /// Adds an ability. A unit can have several; see
+    /// [`UnitTemplate::abilities`].
     pub fn with_ability(mut self, ability: Ability) -> Self {
-        self.ability = Some(ability);
+        self.abilities.push(ability);
         self
     }
 

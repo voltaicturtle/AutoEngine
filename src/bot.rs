@@ -14,6 +14,7 @@
 //!   level any further. It wins about three games in four against normal
 //!   bots with the sample content.
 
+use crate::content::ActionTarget;
 use crate::game::{Command, Game, PlayerId, Slot};
 use crate::rng::Rng;
 use crate::stats::Stat;
@@ -112,8 +113,29 @@ fn easy_turn(game: &mut Game, id: PlayerId, rng: &mut Rng) {
     let _ = game.apply(id, Command::Ready);
 }
 
+/// Spends currencies other than gold on the game's own actions. Bots only
+/// use plain actions that cost no gold and need no target: for those,
+/// holding on to the currency gains nothing.
+fn use_actions(game: &mut Game, id: PlayerId) {
+    let actions: Vec<String> = game
+        .content()
+        .actions()
+        .iter()
+        .filter(|a| a.target == ActionTarget::None && !a.prices.is_empty() && a.prices.iter().all(|p| p.currency != "gold"))
+        .map(|a| a.id.clone())
+        .collect();
+    for action in actions {
+        for _ in 0..8 {
+            if game.apply(id, Command::Action { id: action.clone(), arg: 0 }).is_err() {
+                break;
+            }
+        }
+    }
+}
+
 fn normal_turn(game: &mut Game, id: PlayerId, rng: &mut Rng) {
     make_pick(game, id, rng);
+    use_actions(game, id);
     shop(game, id);
     let reserve = if game.round_index() < 4 { 0 } else { RESERVE };
     let economy = game.content().rules().economy.clone();
@@ -307,6 +329,7 @@ fn option_value(game: &Game, id: PlayerId, option: &str) -> i64 {
 
 fn hard_turn(game: &mut Game, id: PlayerId, rng: &mut Rng) {
     make_pick_as(game, id, rng, Difficulty::Hard);
+    use_actions(game, id);
     shop(game, id);
     let reserve = if game.round_index() < 4 { 0 } else { RESERVE };
     let economy = game.content().rules().economy.clone();
@@ -368,7 +391,7 @@ fn lineup_score(game: &Game, id: PlayerId, uids: &[u32]) -> i64 {
     let board: Vec<crate::content::BoardUnit> = units
         .iter()
         .enumerate()
-        .map(|(i, u)| crate::content::BoardUnit { unit: u.unit.clone(), star: u.star, items: u.items.clone(), pos: (i as i32, 0) })
+        .map(|(i, u)| crate::content::BoardUnit { items: u.items.clone(), growth: u.growth.clone(), traits: u.traits.clone(), ..crate::content::BoardUnit::new(u.unit.clone(), (i as i32, 0)).star(u.star) })
         .collect();
     let traits: i64 = game
         .content()

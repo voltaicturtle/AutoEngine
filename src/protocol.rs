@@ -33,6 +33,8 @@ pub fn clean_chat(text: &str) -> Option<String> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DevCommand {
     Gold(i64),
+    /// Some of a currency other than gold, by id.
+    Currency(String, i64),
     Xp(u32),
     /// Add a unit by id, without paying or touching the shop.
     Unit(String),
@@ -47,7 +49,7 @@ pub enum DevCommand {
 impl DevCommand {
     /// Reads a console line such as `gold 50`, `unit ashen_hound` or `skip`.
     pub fn parse(line: &str) -> Result<DevCommand, String> {
-        const HELP: &str = "commands: gold N, xp N, unit ID, item ID, augment ID, hurt N, skip";
+        const HELP: &str = "commands: gold N, give CURRENCY N, xp N, unit ID, item ID, augment ID, hurt N, skip";
         let mut words = line.split_whitespace();
         let command = words.next().ok_or(HELP)?;
         let arg = words.next();
@@ -55,6 +57,10 @@ impl DevCommand {
         let id = || arg.map(str::to_string).ok_or(format!("{command} needs an id"));
         Ok(match command {
             "gold" => DevCommand::Gold(number()?),
+            "give" => {
+                let amount = words.next().and_then(|a| a.parse::<i64>().ok()).ok_or("give needs a currency and a number")?;
+                DevCommand::Currency(id()?, amount)
+            }
             "xp" => DevCommand::Xp(number()?.clamp(0, 10_000) as u32),
             "unit" => DevCommand::Unit(id()?),
             "item" => DevCommand::Item(id()?),
@@ -211,6 +217,10 @@ pub struct GameView {
     /// sitting in shops).
     #[serde(default)]
     pub pool: std::collections::BTreeMap<String, u32>,
+    /// The [tiles](crate::tile) this round's fights start with, as the
+    /// viewer's side sees its own half, so a board can be laid out for them.
+    #[serde(default)]
+    pub round_tiles: Vec<crate::tile::TilePlacement>,
 }
 
 impl GameView {
@@ -240,6 +250,9 @@ pub struct ViewUpdate {
     /// The pool, only when it changed.
     #[serde(default)]
     pub pool: Option<std::collections::BTreeMap<String, u32>>,
+    /// The round's tiles, only when they changed.
+    #[serde(default)]
+    pub round_tiles: Option<Vec<crate::tile::TilePlacement>>,
 }
 
 impl GameView {
@@ -266,7 +279,8 @@ impl GameView {
             && self.awaiting == newer.awaiting
             && self.options == newer.options
             && self.paused == newer.paused
-            && self.pool == newer.pool;
+            && self.pool == newer.pool
+            && self.round_tiles == newer.round_tiles;
         if unchanged {
             return None;
         }
@@ -282,6 +296,7 @@ impl GameView {
             status,
             paused: newer.paused,
             pool: (self.pool != newer.pool).then(|| newer.pool.clone()),
+            round_tiles: (self.round_tiles != newer.round_tiles).then(|| newer.round_tiles.clone()),
         })
     }
 
@@ -297,6 +312,9 @@ impl GameView {
         self.paused = update.paused;
         if let Some(pool) = update.pool {
             self.pool = pool;
+        }
+        if let Some(tiles) = update.round_tiles {
+            self.round_tiles = tiles;
         }
         for player in update.players {
             let seat = player.id.0 as usize;

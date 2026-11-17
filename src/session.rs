@@ -288,6 +288,7 @@ impl Session {
         let game = self.game.as_mut().expect("a started session has a game");
         let grant = match command {
             DevCommand::Gold(n) => Grant::Gold(n),
+            DevCommand::Currency(currency, amount) => Grant::Currency { currency, amount },
             DevCommand::Xp(n) => Grant::Xp(n),
             DevCommand::Unit(unit) => Grant::Unit(unit),
             DevCommand::Item(item) => Grant::Item(item),
@@ -922,6 +923,7 @@ impl Session {
             status: game.players().iter().map(|p| status(game, p.id)).collect(),
             paused: self.paused_at.is_some(),
             pool: game.pool().clone(),
+            round_tiles: game.round_tiles().to_vec(),
         }
     }
 

@@ -42,7 +42,7 @@ pub(crate) fn draw_console(app: &App, layout: &Layout) {
     draw_rectangle(area.x, y, area.w, 34.0, Color::new(0.0, 0.0, 0.0, 0.85));
     let cursor = if (get_time() * 2.0) as i64 % 2 == 0 { "_" } else { " " };
     label(&format!("> {line}{cursor}"), area.x + 10.0, y + 23.0, 20.0, ui().good);
-    let hint = "gold N   xp N   unit ID   item ID   augment ID   hurt N   skip";
+    let hint = "gold N   give CURRENCY N   xp N   unit ID   item ID   augment ID   hurt N   skip";
     label(hint, area.x + area.w - theme::text_width(hint, 14.0) - 10.0, y + 22.0, 14.0, ui().muted);
 }
 

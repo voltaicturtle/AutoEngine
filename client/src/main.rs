@@ -56,7 +56,7 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 
 use autoengine::combat::UnitId;
-use autoengine::content::UnitDef;
+use autoengine::content::{ActionTarget, UnitDef};
 use autoengine::game::{Command, Opponent, OwnedUnit, Player, PlayerId, Slot};
 use autoengine::hex::Hex;
 use autoengine::net::{GameClient, Status};
@@ -65,7 +65,7 @@ use autoengine::protocol::DevCommand;
 use autoengine::protocol::{ClientMsg, ViewPhase};
 use macroquad::prelude::*;
 
-use draw::{Layout, button, draw_health_bar, draw_pips, draw_unit_token, label, panel, text_centered, unit_color};
+use draw::{Layout, button, draw_health_bar, draw_resource_bar, draw_pips, draw_unit_token, label, panel, text_centered, unit_color};
 use model::{Model, Pose, RawModel};
 use scene::Ground;
 use settings::{Action, Settings};
@@ -787,7 +787,19 @@ fn draw_top_bar(app: &App) {
         };
         let x = w - 520.0;
         label(&format!("Health {}", me.health.max(0)), x, 29.0, 22.0, if me.health > 30 { ui().good } else { ui().bad });
-        label(&format!("Gold {}", me.gold), x + 140.0, 29.0, 22.0, ui().gold);
+        label(&format!("Gold {}", me.gold), x + 140.0, if app.net.state.content.as_ref().is_some_and(|c| !c.currencies().is_empty()) { 24.0 } else { 29.0 }, 22.0, ui().gold);
+        // The game's other currencies, in a smaller line under the gold.
+        if let Some(content) = &app.net.state.content {
+            let language = app.net.state.language.as_deref();
+            let mut at = x + 140.0;
+            for currency in content.currencies() {
+                let name = content.text(language, "currency", &currency.id, "name").unwrap_or_default();
+                let text = format!("{name} {}", me.wallet.get(&currency.id).copied().unwrap_or(0));
+                let [r, g, b] = currency.color.unwrap_or([200, 200, 210]);
+                label(&text, at, 41.0, 13.0, Color::from_rgba(r, g, b, 255));
+                at += theme::text_width(&text, 13.0) + 12.0;
+            }
+        }
         label(&format!("Level {}  ({xp})", me.level), x + 250.0, 29.0, 22.0, ui().text);
     } else {
         label("Spectating", w - 140.0, 29.0, 22.0, ui().muted);
@@ -895,6 +907,40 @@ fn board_tiles(ground: &mut Ground, layout: &Layout, own_half: bool, highlight: 
             ground.hex_tile(layout.hex_world(col, row), 0.94, 0.22, fill);
         }
     }
+}
+
+/// Queues a tile lying on a hex: a thin colored slab, or a block for a
+/// tile nobody can stand on.
+fn tile_marker(ground: &mut Ground, app: &App, tile: &str, at: Vec3) {
+    let def = app.net.state.content.as_ref().and_then(|c| c.tile(tile));
+    let color = match def.and_then(|d| d.color) {
+        Some([r, g, b]) => Color::from_rgba(r, g, b, 255),
+        None => unit_color(tile),
+    };
+    if def.is_some_and(|d| d.blocks) {
+        ground.hex_tile(at + vec3(0.0, 0.55, 0.0), 0.70, 0.55, color);
+    } else {
+        ground.hex_tile(at + vec3(0.0, 0.035, 0.0), 0.80, 0.035, color);
+    }
+}
+
+/// The tiles the current round's fights start with, as `(tile, (column,
+/// row))` on the viewer's side of the board and its mirror image.
+fn round_tiles(app: &App) -> Vec<(String, (i32, i32))> {
+    let state = &app.net.state;
+    let (Some(content), Some(view)) = (&state.content, &state.view) else {
+        return Vec::new();
+    };
+    let board = content.board();
+    let mut out = Vec::new();
+    for placement in &view.round_tiles {
+        out.push((placement.tile.clone(), placement.pos));
+        let hex = autoengine::hex::Hex::from_offset(placement.pos.0, placement.pos.1);
+        if placement.mirrored && board.mirror(hex) != hex {
+            out.push((placement.tile.clone(), board.mirror(hex).to_offset()));
+        }
+    }
+    out
 }
 
 fn unit_label(app: &App, unit: &OwnedUnit) -> String {

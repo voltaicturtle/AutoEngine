@@ -13,7 +13,7 @@
 //! use autoengine::prelude::*;
 //!
 //! let content = autoengine::sample::content();
-//! let unit = |id: &str, pos| BoardUnit { unit: id.into(), star: 1, items: vec![], pos };
+//! let unit = |id: &str, pos| BoardUnit::new(id, pos);
 //! let home = TeamSetup { units: vec![unit("ironbark_warden", (3, 4))], bonuses: vec![] };
 //! let away = TeamSetup { units: vec![unit("ashen_hound", (3, 4))], bonuses: vec![] };
 //!
@@ -67,16 +67,20 @@ pub mod bot;
 pub mod client;
 pub mod combat;
 pub mod content;
+pub mod damage;
 pub mod effect;
 pub mod game;
 pub mod hex;
 pub mod hub;
 pub mod ladder;
 pub mod matchlog;
+pub mod name;
 pub mod net;
 pub mod playback;
+pub mod perk;
 pub mod protocol;
 pub mod replay;
+pub mod resource;
 pub mod rng;
 pub mod round;
 pub mod sample;
@@ -84,6 +88,7 @@ pub mod sample;
 pub mod script;
 pub mod session;
 pub mod stats;
+pub mod tile;
 pub mod tools;
 
 /// The types most programs built on the engine need, in one import:
@@ -111,6 +116,14 @@ mod guides {
     struct Units;
     #[doc = include_str!("../docs/guides/effects.md")]
     struct Effects;
+    #[doc = include_str!("../docs/guides/resources.md")]
+    struct Resources;
+    #[doc = include_str!("../docs/guides/damage.md")]
+    struct Damage;
+    #[doc = include_str!("../docs/guides/tiles.md")]
+    struct Tiles;
+    #[doc = include_str!("../docs/guides/perks.md")]
+    struct Perks;
     #[doc = include_str!("../docs/guides/traits.md")]
     struct Traits;
     #[doc = include_str!("../docs/guides/items.md")]

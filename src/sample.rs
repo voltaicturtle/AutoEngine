@@ -1,8 +1,9 @@
 //! The sample game, written in Rust with the content builders.
 //!
 //! It is small and original: eight shop units, a summon and a neutral
-//! monster, five traits, six items (three components and what they combine
-//! into), seven augments, a round schedule with every built-in round kind and
+//! monster, a second resource next to mana, a second currency next to gold with two actions that use it, three kinds of tile, five traits, six items (three components and what they combine
+//! into), nine augments, a loot table the monster drops from, a rare
+//! two-star shop offer, a round schedule with every built-in round kind and
 //! a scripted one, a sample fight and a few content tests. A game built on
 //! the engine defines the same things the same way, in its own crate.
 //!
@@ -10,11 +11,15 @@
 //! folder; the content only names them.
 
 use crate::content::{
-    AugmentDef, BoardUnit, Bonus, ChoiceOffer, Consumable, ContentSet, ItemDef, MatchSetup, RoundDef, RoundKindDef, Schedule,
-    TeamSetup, TraitDef, UnitDef,
+    ActionDef, AugmentDef, BoardUnit, Bonus, ChoiceOffer, Consumable, ContentSet, CurrencyDef, ItemDef, MatchSetup, RoundDef, RoundKindDef, Schedule,
+    ShopSpecial, TeamSetup, TraitDef, UnitDef,
 };
-use crate::effect::{Ability, Amount, Anchor, DamageKind, Effect, Passive, ScaleBy, Selector, Trigger, Who};
-use crate::stats::Stat::*;
+use crate::perk::{LootTable, Perk, Rule, When};
+use crate::effect::{Ability, Amount, Anchor, Cost, DamageKind, Effect, Passive, ScaleBy, Selector, Trigger, Who};
+use crate::game::{CommandError, Grant};
+use crate::resource::ResourceDef;
+use crate::stats::Stat::{self, *};
+use crate::tile::TileDef;
 use crate::tools::cli::GameSpec;
 use crate::tools::scenario::{Expect, Scenario};
 
@@ -29,6 +34,26 @@ pub fn spec() -> GameSpec {
 /// The whole sample game.
 pub fn content() -> ContentSet {
     ContentSet::builder()
+        .resource(fury())
+        .currency(favor())
+        .tiles(tiles())
+        // Moss golems drop a little favor now and then.
+        .loot(LootTable::new("moss_cache").entry(1, [Grant::Currency { currency: "favor".into(), amount: 1 }]).nothing(2))
+        // Now and then a shop at level 5 or higher offers a two-star unit.
+        .shop_special(ShopSpecial::new(20).from_level(5).star(2))
+        .action(ActionDef::new("petition", "Petition").description("Trade 3 favor for 4 experience.").costs("favor", 3).gives(Grant::Xp(4)))
+        .action(
+            ActionDef::new("offering", "Offering")
+                .description("Give up a unit for as much favor as it is worth. Once a round.")
+                .on_unit()
+                .per_round(1),
+        )
+        .action_handler("offering", |game, player, uid| {
+            let unit = u32::try_from(uid).ok().and_then(|uid| game.remove_unit(player, uid)).ok_or(CommandError::UnknownUnit)?;
+            let worth = game.unit_value(&unit);
+            game.add_currency(player, "favor", worth);
+            Ok(())
+        })
         .units(units())
         .trait_defs(traits())
         .items(items())
@@ -38,6 +63,39 @@ pub fn content() -> ContentSet {
         .script("second_wind", include_str!("../content/scripts/second_wind.rhai"))
         .build()
         .expect("the sample content is valid")
+}
+
+/// How much fury a unit can hold. Units without any don't have fury.
+pub const MAX_FURY: Stat = Stat::custom("max_fury");
+
+/// A second resource next to mana, to show how one is made: fury comes from
+/// attacking and killing and fades when the fighting stops. The Ashen Hound
+/// runs on it.
+pub fn fury() -> ResourceDef {
+    ResourceDef::new("fury", "Fury", MAX_FURY).per_attack(12).per_kill(25).per_second(-3).color([235, 120, 50])
+}
+
+/// Tiles: effects that belong to a hex. One is laid by an ability, one
+/// stands on the board for a round, and one is in the way.
+pub fn tiles() -> Vec<TileDef> {
+    vec![
+        TileDef::new("embers", "Embers")
+            .description("Burns the enemies of whoever lit it for 30 magic damage a second.")
+            .enemies_only()
+            .per_second(Effect::magic(Amount::power(30)))
+            .color([235, 110, 45]),
+        TileDef::new("standing_stone", "Standing Stone")
+            .description("Whoever stands here attacks 15% faster.")
+            .mods([AttackSpeed.percent(150)])
+            .color([120, 170, 215]),
+        TileDef::new("boulder", "Boulder").description("Nobody can stand here.").blocking().color([105, 105, 115]),
+    ]
+}
+
+/// A second currency next to gold, to show how one is made: every player
+/// gets one favor a round, and the two actions above earn and spend it.
+pub fn favor() -> CurrencyDef {
+    CurrencyDef::new("favor", "Favor").per_round(1).color([230, 200, 120])
 }
 
 /// Two boards to fight each other. Positions are `(column, row)` from each
@@ -61,6 +119,7 @@ pub fn sample_match() -> MatchSetup {
                 // An augment-style modifier: the whole team heals from damage dealt.
                 .bonus(Bonus::team().mods([Lifesteal.flat(80)])),
         ],
+        tiles: Vec::new(),
     }
 }
 
@@ -122,16 +181,17 @@ pub fn schedule() -> Schedule {
         RoundDef::new("1-3", 1, RoundKindDef::pvp()),
         RoundDef::new("2-1", 2, RoundKindDef::choice(3, ChoiceOffer::Augments)),
         RoundDef::new("2-2", 2, RoundKindDef::pvp()),
-        RoundDef::new("2-3", 2, RoundKindDef::pvp()),
+        // Each side has a standing stone in the middle of its second row.
+        RoundDef::new("2-3", 2, RoundKindDef::pvp()).tile("standing_stone", (3, 5)),
         RoundDef::new("2-4", 2, RoundKindDef::draft(1).max_cost(2)),
         RoundDef::new("2-5", 2, RoundKindDef::pvp()),
         RoundDef::new(
             "2-6",
             2,
-            RoundKindDef::pve([golem(2, (2, 4)), golem(2, (4, 4)), BoardUnit::new("grave_wisp", (3, 6)).star(2)])
-                .gold(3)
-                .items(1),
-        ),
+            RoundKindDef::pve([golem(2, (2, 4)), golem(2, (4, 4)), BoardUnit::new("grave_wisp", (3, 6)).star(2)]).gold(3).items(1),
+        )
+        // A boulder between the two golems: melee units have to go around.
+        .tile_at("boulder", (3, 3)),
         RoundDef::new("3-1", 3, RoundKindDef::pvp()),
         RoundDef::new("3-2", 3, RoundKindDef::choice(3, ChoiceOffer::Augments)),
         RoundDef::new("3-3", 3, RoundKindDef::pvp()),
@@ -157,13 +217,15 @@ pub fn traits() -> Vec<TraitDef> {
             .description("Cinder units attack faster.")
             .breakpoint(2, [Bonus::members().mods([AttackSpeed.percent(200)])])
             .breakpoint(3, [Bonus::members().mods([AttackSpeed.percent(450)])]),
-        TraitDef::new("tide", "Tide").description("Tide units steadily restore mana to themselves.").breakpoint(
-            2,
-            [Bonus::members().passive(
-                Passive::new("Rising Tide", Trigger::Every { interval_ms: 2000 })
-                    .effect(Effect::mana(10).to(Selector::Source)),
-            )],
-        ),
+        TraitDef::new("tide", "Tide")
+            .description("Tide units steadily restore mana to themselves, and every lost fight brings in 1 favor.")
+            .breakpoint(
+                2,
+                [Bonus::members().passive(
+                    Passive::new("Rising Tide", Trigger::Every { interval_ms: 2000 }).effect(Effect::mana(10).to(Selector::Source)),
+                )],
+            )
+            .perk(Perk::on(When::Lost).gives(Grant::Currency { currency: "favor".into(), amount: 1 })),
         TraitDef::new("hollow", "Hollow")
             .description("When a Hollow unit dies, the whole team hits harder.")
             .breakpoint(
@@ -235,13 +297,14 @@ pub fn units() -> Vec<UnitDef> {
             ])
             .ability(
                 Ability::new("Searing Flurry")
-                    .description("Strikes its target for 80 plus 150% attack damage, then attacks 40% faster for 3 seconds.")
+                    .description("Strikes its target for 80 plus 150% attack damage and leaves embers under it that burn enemies for 3 seconds, then attacks 40% faster for 3 seconds.")
                     .cast_time(250)
                     .effect(
                         Effect::physical(Amount::power(80).plus(Who::Source, ScaleBy::Stat(AttackDamage), 1500))
                             .with_crit()
                             .to(Selector::CurrentTarget),
                     )
+                    .effect(Effect::tile_for("embers", 3000).to(Selector::CurrentTarget))
                     .effect(Effect::stat_status([AttackSpeed.percent(400)], 3000).to(Selector::Source)),
             )
             .passive(
@@ -297,18 +360,21 @@ pub fn units() -> Vec<UnitDef> {
             .model("models/ashen_hound.obj", 80)
             .cost(1)
             .traits(["cinder", "hollow"])
+            // What a hound learns in a fight it keeps.
+            .passive(Passive::new("Pack Memory", Trigger::OnKill).effect(Effect::grow([AttackDamage.flat(2)]).to(Selector::Source)))
             .stats([
                 (MaxHealth, 550),
                 (AttackDamage, 50),
                 (Armor, 20),
                 (MagicResist, 20),
                 (AttackSpeed, 800),
-                (MaxMana, 50),
+                (MAX_FURY, 60),
                 (MoveSpeed, 2400),
             ])
             .ability(
                 Ability::new("Cinder Bite")
                     .description("Bites its target for 200% attack damage and melts 40% of its armor for 4 seconds.")
+                    .cost(Cost::of("fury", 45))
                     .effect(
                         Effect::physical(Amount::flat(0).plus(Who::Source, ScaleBy::Stat(AttackDamage), 2000))
                             .with_crit()
@@ -346,7 +412,11 @@ pub fn units() -> Vec<UnitDef> {
         UnitDef::new("moss_golem", "Moss Golem")
             .model("models/moss_golem.obj", 125)
             .summon_only()
-            .stats([(MaxHealth, 450), (AttackDamage, 35), (Armor, 10), (MagicResist, 10), (AttackSpeed, 550)]),
+            .stats([(MaxHealth, 450), (AttackDamage, 35), (Armor, 10), (MagicResist, 10), (AttackSpeed, 550)])
+            .passive(
+                Passive::new("Moss Cache", Trigger::OnDeath)
+                    .effect(Effect::reward(Grant::Loot("moss_cache".into())).to(Selector::EventOther)),
+            ),
     ]
 }
 
@@ -417,5 +487,10 @@ pub fn augments() -> Vec<AugmentDef> {
         AugmentDef::new("opening_gambit", "Opening Gambit")
             .description("Your team starts each fight with a 150 shield for 6 seconds.")
             .bonus(at_start("Opening Gambit", 150)),
+        AugmentDef::new("wide_camp", "Wide Camp").description("Field one more unit, but rerolls cost 1 more.").rule(Rule::TeamSize.add(1)).rule(Rule::RerollCost.add(1)),
+        AugmentDef::new("scavenger", "Scavenger")
+            .description("Pick one of two components now. Each won fight has a one in three chance to give another.")
+            .perk(Perk::on(When::Gained).gives(Grant::Choice { options: 2, offer: ChoiceOffer::Components }))
+            .perk(Perk::on(When::Won).gives(Grant::Component).chance(333)),
     ]
 }

@@ -61,6 +61,9 @@ fn default_seed() -> u64 {
 pub struct Scenario {
     pub name: String,
     pub teams: Vec<TeamSetup>,
+    /// [Tiles](crate::tile) the fight starts with.
+    #[serde(default)]
+    pub tiles: Vec<crate::tile::TilePlacement>,
     /// How many times to fight, each with different dice.
     #[serde(default = "default_runs")]
     pub runs: u32,
@@ -73,7 +76,14 @@ pub struct Scenario {
 impl Scenario {
     /// One run with seed 1 and no expectations yet.
     pub fn new(name: impl Into<String>, teams: impl IntoIterator<Item = TeamSetup>) -> Self {
-        Scenario { name: name.into(), teams: teams.into_iter().collect(), runs: 1, seed: 1, expect: Vec::new() }
+        Scenario { name: name.into(), teams: teams.into_iter().collect(), tiles: Vec::new(), runs: 1, seed: 1, expect: Vec::new() }
+    }
+
+    /// Starts the fight with a tile on exactly this hex, as the first team
+    /// sees the board.
+    pub fn tile_at(mut self, tile: impl Into<String>, pos: (i32, i32)) -> Self {
+        self.tiles.push(crate::tile::TilePlacement { tile: tile.into(), pos, mirrored: false });
+        self
     }
 
     /// How many times to fight, each with different dice.
@@ -130,7 +140,7 @@ pub fn run_scenario(content: &ContentSet, scenario: &Scenario) -> ScenarioResult
     let mut runs = Vec::new();
     for i in 0..result.runs {
         let seed = scenario.seed.wrapping_add(i as u64);
-        match content.setup_combat(seed, &scenario.teams) {
+        match content.setup_combat_with(seed, &scenario.teams, &scenario.tiles) {
             Ok(mut combat) => {
                 let outcome = combat.run().clone();
                 runs.push(Run { seed, winner: outcome.winner, seconds: outcome.duration_ms / 1000, combat });
@@ -203,7 +213,7 @@ pub fn run_scenario(content: &ContentSet, scenario: &Scenario) -> ScenarioResult
                         }
                         Expect::Casts(..) => {
                             let cast = run.combat.events().iter().any(|e| {
-                                matches!(&e.kind, EventKind::CastStarted { unit }
+                                matches!(&e.kind, EventKind::CastStarted { unit, .. }
                                     if run.units(*team, &name).any(|u| u.id() == *unit))
                             });
                             if !cast {

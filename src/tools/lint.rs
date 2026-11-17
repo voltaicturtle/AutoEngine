@@ -1,8 +1,11 @@
 //! The content checker behind `autoengine check`.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::content::{ContentSet, RoundKindDef};
+use crate::effect::{Condition, Effect, Selector, StatusKind, Trigger};
+use crate::name::Name;
 
 /// Something in the content that loads but is probably a mistake.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +44,50 @@ pub fn lint(content: &ContentSet, assets: Option<&Path>) -> Vec<Warning> {
                 warn(subject.clone(), "is sold in the shop but has no traits".into());
             }
         }
+        // An ability the unit can never pay for is dead weight.
+        for ability in &unit.abilities {
+            let Some(resource) = ability.cost.resource().and_then(|id| content.resource(id)) else { continue };
+            let Ok(template) = content.base_template(&unit.id, 1) else { continue };
+            let capacity = template.stats.get(resource.max);
+            let short = match ability.cost {
+                crate::effect::Cost::Amount { amount, .. } => capacity < amount,
+                _ => capacity <= 0,
+            };
+            if short {
+                warn(
+                    subject.clone(),
+                    format!(
+                        "can never cast {}: it has {capacity} {} (the {} stat) at one star",
+                        ability.name, resource.id, resource.max
+                    ),
+                );
+            }
+        }
+        // With several abilities the first affordable one is cast, so an
+        // earlier ability that is always affordable first hides a later one.
+        let price = |a: &crate::effect::Ability| {
+            let resource = content.resource(a.cost.resource()?)?;
+            let capacity = content.base_template(&unit.id, 1).ok()?.stats.get(resource.max);
+            Some((resource.id.clone(), match a.cost {
+                crate::effect::Cost::Amount { amount, .. } => amount,
+                _ => capacity,
+            }))
+        };
+        for (later_at, later) in unit.abilities.iter().enumerate() {
+            let hidden_by = unit.abilities[..later_at].iter().find(|earlier| {
+                earlier.cooldown_ms == 0
+                    && matches!((price(earlier), price(later)), (Some((a, cost)), Some((b, at_least))) if a == b && cost <= at_least)
+            });
+            if let Some(earlier) = hidden_by {
+                warn(
+                    subject.clone(),
+                    format!(
+                        "can never cast {}: {} is listed first, costs no more of the same resource and has no cooldown",
+                        later.name, earlier.name
+                    ),
+                );
+            }
+        }
         match (&unit.model, assets) {
             (Some(model), Some(dir)) if !dir.join(&model.file).is_file() => {
                 warn(subject.clone(), format!("model file {} is missing; clients will draw a stand-in", model.file));
@@ -65,6 +112,133 @@ pub fn lint(content: &ContentSet, assets: Option<&Path>) -> Vec<Warning> {
                     format!("the breakpoint at {} cannot be reached: only {members} shop units have the trait", breakpoint.count),
                 );
             }
+        }
+    }
+
+    // A signal only does something when one thing sends it and another
+    // waits for it, and the two are easy to spell differently.
+    let passives = content.passives();
+    let effects = content.effects();
+    let sent: BTreeSet<Name> = effects
+        .iter()
+        .filter_map(|(_, spec)| match &spec.effect {
+            Effect::Signal { name } => Some(*name),
+            _ => None,
+        })
+        .collect();
+    let heard: BTreeSet<Name> = passives
+        .iter()
+        .filter_map(|(_, p)| match p.trigger {
+            Trigger::Signal(name) => Some(name),
+            _ => None,
+        })
+        .collect();
+    for (owner, passive) in &passives {
+        if let Trigger::Signal(name) = passive.trigger
+            && !sent.contains(&name)
+        {
+            warn(owner.clone(), format!("waits for the signal \"{name}\", which nothing in the content sends (a Rust hook still can)"));
+        }
+    }
+    for (owner, spec) in &effects {
+        if let Effect::Signal { name } = &spec.effect
+            && !heard.contains(name)
+        {
+            warn(owner.clone(), format!("sends the signal \"{name}\", which nothing waits for"));
+        }
+    }
+    // A condition that asks for a status nothing can apply is never true.
+    const BUILT_IN: [&str; 10] = [
+        "stunned", "stat-modified", "afflicted", "silenced", "disarmed", "rooted", "taunted", "wounded", "invulnerable", "unstoppable",
+    ];
+    let marks: BTreeSet<&str> = effects
+        .iter()
+        .filter_map(|(_, spec)| match &spec.effect {
+            Effect::ApplyStatus { status: StatusKind::Marker { name, .. }, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut asked: Vec<(&String, &Condition)> = Vec::new();
+    asked.extend(passives.iter().filter_map(|(owner, p)| Some((owner, p.condition.as_ref()?))));
+    asked.extend(effects.iter().filter_map(|(owner, spec)| Some((owner, spec.condition.as_ref()?))));
+    for (owner, condition) in asked {
+        condition.walk(&mut |c| {
+            if let Condition::HasStatus { status, .. } = c
+                && !BUILT_IN.contains(&status.as_str())
+                && !marks.contains(status.as_str())
+            {
+                warn(owner.clone(), format!("asks for the status \"{status}\", which nothing in the content applies"));
+            }
+        });
+    }
+
+    // Reviving only does something to the dead, and few selectors reach them.
+    for (owner, spec) in &effects {
+        if matches!(spec.effect, Effect::Revive { .. })
+            && !matches!(spec.target, Selector::Source | Selector::EventOther | Selector::FallenAllies(_) | Selector::Custom(_))
+        {
+            warn(owner.clone(), "revives units its selector only picks while they are alive; use FallenAllies, or Source or EventOther in a death passive".into());
+        }
+    }
+
+    for (owner, passive) in &passives {
+        let revives_itself = passive.effects.iter().any(|spec| matches!(spec.effect, Effect::Revive { .. }) && spec.target == Selector::Source);
+        if passive.trigger == Trigger::OnDeath && revives_itself && passive.max_procs.is_none() && passive.condition.is_none() {
+            warn(owner.clone(), "revives itself every time it dies, so it can never be killed; give the passive max_procs".into());
+        }
+    }
+
+    // A tile has to get onto the board somehow.
+    for tile in content.tiles() {
+        let by_effect = effects.iter().any(|(_, spec)| matches!(&spec.effect, Effect::PlaceTile { tile: id, .. } if *id == tile.id));
+        let by_round = content.schedule().rounds.iter().any(|r| r.tiles.iter().any(|p| p.tile == tile.id));
+        if !by_effect && !by_round {
+            warn(format!("tile {}", tile.id), "nothing in the content lays it: no effect and no round (Rust code still can)".into());
+        }
+    }
+
+    // A currency should come from somewhere and go somewhere, and an action
+    // should do something. Scripts and Rust hooks can do either, so these
+    // only speak up when the content has neither.
+    let has_code = !content.scripts().is_empty();
+    let all_grants = content.grants();
+    let grants = |currency: &str| {
+        all_grants.iter().any(|(_, g)| matches!(g, crate::game::Grant::Currency { currency: c, amount } if c == currency && *amount > 0))
+    };
+    // A loot table is only worth having if something rolls on it.
+    for table in content.loot_tables() {
+        let rolled = all_grants.iter().any(|(owner, g)| matches!(g, crate::game::Grant::Loot(id) if *id == table.id) && *owner != format!("loot table {}", table.id));
+        if !rolled && !has_code {
+            warn(format!("loot table {}", table.id), "nothing in the content rolls on it".into());
+        }
+    }
+    // `When::Gained` is the moment an augment is picked; traits and items
+    // are never picked up that way.
+    let never = |perks: &[crate::perk::Perk]| perks.iter().any(|p| p.when == crate::perk::When::Gained);
+    for t in content.traits().filter(|t| t.breakpoints.iter().any(|b| never(&b.perks))) {
+        warn(format!("trait {}", t.id), "has a perk for When::Gained, which only happens for augments".into());
+    }
+    for item in content.items().filter(|i| never(&i.perks)) {
+        warn(format!("item {}", item.id), "has a perk for When::Gained, which only happens for augments".into());
+    }
+    for currency in content.currencies() {
+        let subject = format!("currency {}", currency.id);
+        let paid = currency.starting > 0
+            || currency.per_round > 0
+            || content.augments().any(|a| a.per_round.currencies.get(&currency.id).is_some_and(|n| *n > 0))
+            || grants(&currency.id);
+        let handled = content.actions().iter().any(|a| content.action_handler(&a.id).is_some());
+        if !paid && !has_code && !handled {
+            warn(subject.clone(), "nothing in the content gives it to players".into());
+        }
+        let spent = content.actions().iter().flat_map(|a| &a.prices).any(|p| p.currency == currency.id);
+        if !spent && !has_code && !handled {
+            warn(subject, "nothing in the content lets players spend it".into());
+        }
+    }
+    for action in content.actions() {
+        if action.gives.is_empty() && content.action_handler(&action.id).is_none() && !has_code {
+            warn(format!("action {}", action.id), "gives nothing and has no handler, so using it does nothing".into());
         }
     }
 

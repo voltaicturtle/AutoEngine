@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use autoengine::content::ContentSet;
-use autoengine::game::{Command, GameEvent, PlayerId, Slot};
+use autoengine::game::{Command, GameEvent, Opponent, PlayerId, Slot};
 use autoengine::net::{Connection, serve};
 use autoengine::protocol::{ClientMsg, GameView, PROTOCOL_VERSION, ServerMsg, ViewPhase, decode, encode};
 use autoengine::session::{ConnId, Session, SessionConfig};
@@ -52,6 +52,7 @@ fn last_state(messages: &[ServerMsg]) -> Option<GameView> {
                     status: Vec::new(),
                     paused: false,
                     pool: Default::default(),
+                    round_tiles: Vec::new(),
                 });
                 base.patch(u.clone());
             }
@@ -350,7 +351,8 @@ fn a_client_can_play_over_tcp() {
             }
         }
         if let ServerMsg::CombatSeed { record, .. } = message {
-            assert_eq!(record.home, PlayerId(0));
+            // Which of the two is at home is up to the dice.
+            assert!(record.home == PlayerId(0) || record.away == Opponent::Player(PlayerId(0)));
             assert!(record.events.is_empty(), "the log is left out; the client fights it again");
             fights += 1;
         }
@@ -515,7 +517,7 @@ fn spectators_can_be_shown_the_game_late() {
 #[test]
 fn rounds_of_a_kind_can_have_their_own_planning_time() {
     use autoengine::content::{RoundDef, RoundKindDef, Schedule};
-    let pvp = RoundDef { name: "fight".into(), stage: 1, kind: RoundKindDef::Pvp };
+    let pvp = RoundDef { name: "fight".into(), stage: 1, kind: RoundKindDef::Pvp, tiles: Vec::new() };
     let content = autoengine::sample::content().with_schedule(Schedule { rounds: vec![pvp], repeat_from: 0 }).unwrap();
     let mut rules = content.rules().clone();
     rules.planning_ms_by_kind.insert("pvp".into(), 5_000);

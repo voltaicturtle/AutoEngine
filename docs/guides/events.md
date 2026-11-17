@@ -73,9 +73,13 @@ or `game.drain_events()` (the ones since the last call).
 | `RoundFinished` | `index` | a round has resolved, before eliminations |
 | `ShopRolled` | `player`, `offers` | a player's shop got new offers: at the start of a round, or after a reroll. `offers` holds unit ids, with `None` (`()` in Rhai) for empty slots |
 | `GoldChanged` | `player`, `gold` | a player's gold changed. `gold` is the new total |
+| `CurrencyChanged` | `player`, `currency`, `amount` | a player's balance of a currency other than gold changed. `amount` is the new total |
+| `ActionUsed` | `player`, `action`, `arg` | a player used one of the game's own [actions](rules.md#actions) and has paid for it |
 | `XpChanged` | `player`, `level`, `xp` | a player gained experience. These are the new level and experience |
 | `UnitGained` | `player`, `uid`, `unit` | a player got a unit: bought, drafted, granted or duplicated. `uid` identifies this copy for the rest of the game |
 | `UnitSold` | `player`, `uid`, `unit` | a unit was sold |
+| `UnitRemoved` | `player`, `uid`, `unit` | a unit was taken away without being sold (`Game::remove_unit`) |
+| `UnitGifted` | `from`, `to`, `uid`, `unit` | a player sent a unit to a [teammate](rules.md#teams) (`Command::Gift`) |
 | `UnitUpgraded` | `player`, `uid`, `unit`, `star` | copies merged. `uid` is the unit that was kept, and `star` its new star level |
 | `UnitMoved` | `player`, `uid`, `to` | a unit moved to a bench slot or a board place |
 | `ItemGained` | `player`, `item` | an item went into a player's inventory |
@@ -89,6 +93,7 @@ or `game.drain_events()` (the ones since the last call).
 | `PlayerReady` | `player` | a player said they are done planning |
 | `CombatFinished` | `combat`, `home`, `away`, `winner` | a fight finished. `combat` indexes `game.combats()` for the full record, and `winner` is `0` (home), `1` (away) or `None` for a draw |
 | `PlayerDamaged` | `player`, `amount`, `health` | a player lost health. `health` is what is left |
+| `PlayerHealed` | `player`, `amount`, `health` | a player got health back. `health` is the new total |
 | `PlayerForfeited` | `player` | a player gave up. They leave when the round ends |
 | `PlayerEliminated` | `player`, `placement` | a player is out, finishing in `placement` (1 is the winner) |
 | `GameOver` | `winner` | the game ended |
@@ -110,14 +115,22 @@ they appeared. `Spawned` says which unit each one is.
 | `Damaged` | `source`, `target`, `amount`, `absorbed`, `kind`, `crit` | damage landed. `amount` is health lost and `absorbed` is what shields took |
 | `Healed` | `source`, `target`, `amount` | health restored. `source` is the healer, or the unit itself for lifesteal |
 | `Shielded` | `source`, `target`, `amount` | a shield was given |
-| `CastStarted` | `unit` | a unit started casting its ability |
-| `CastFinished` | `unit` | the cast finished and its effects happened |
+| `CastStarted` | `unit`, `ability` | a unit started casting an ability. `ability` is its position among the unit's abilities, starting at 0 |
+| `CastFinished` | `unit`, `ability` | the cast finished and its effects happened |
 | `PassiveTriggered` | `unit`, `passive` | a passive fired. `passive` is its index in the unit's template |
 | `StatusApplied` | `source`, `target`, `status`, `duration_ms` | a status took hold, for this long after tenacity |
 | `StatusExpired` | `target`, `status` | a status ran out |
 | `StacksChanged` | `unit`, `stack`, `count` | a stack changed. `count` is the new count |
+| `ResourceChanged` | `unit`, `resource`, `amount`, `max` | a unit now has `amount` of a [resource](resources.md) out of `max`. Sent when either changes, and for each resource a unit has when it enters the fight |
 | `Overtime` | | overtime began, and damage grows from now on (see [Fights](fights.md#overtime)) |
 | `Died` | `unit`, `killer` | a unit died |
+| `Revived` | `unit`, `source`, `pos`, `health` | a dead unit is back, at `pos` with `health` |
+| `TilePlaced` | `tile`, `pos`, `team`, `duration_ms` | a [tile](tiles.md) is on a hex, newly laid or laid again. `team` is the side of whoever laid it, and `duration_ms` how long it has left |
+| `TileRemoved` | `tile`, `pos` | a tile is gone from a hex |
+| `Rewarded` | `unit`, `team`, `grant` | the player who owns the unit earned a grant to keep (`Effect::reward`). The game hands it over after the fight |
+| `Grew` | `unit`, `mods` | the unit's stats changed for good (`Effect::grow`) |
+| `Transformed` | `unit`, `into`, `name` | the unit turned into another (`Effect::transform`). `name` is what it is called now |
+| `HealthSet` | `unit`, `health`, `max_health` | the unit's health and most health were set outright: a copy that starts hurt, a new form |
 | `Ended` | `winner`, `timed_out` | the fight ended. `winner` is the team left standing, or `None` for a draw |
 
 `playback::fight_stats(&record.events)` adds these up into each unit's
@@ -139,8 +152,10 @@ one place.
 | `SetShopLock { locked }` | keeps the current offers for the next round |
 | `MoveUnit { uid, to }` | moves a unit to `Slot::Bench(i)` or `Slot::Board(col, row)`. If the place is taken, the two units swap |
 | `EquipItem { item, uid }` | gives item number `item` from the player's inventory to a unit, or uses it if it is single-use |
-| `Pick { option }` | picks an option the round offers |
+| `Pick { option }` | picks an option the round offers, or answers the player's oldest [pick of their own](perks.md#picks-of-a-players-own) once the round's pick is done |
 | `RerollPick` | swaps the round's options for new ones, where the round allows it |
+| `Action { id, arg }` | uses one of the game's own [actions](rules.md#actions). `arg` is the unit's `uid` for an action on a unit |
+| `Gift { uid, to }` | sends a unit, with its items, to a [teammate](rules.md#teams)'s bench |
 | `Ready` | done planning. A hosted game ends planning early when everyone is ready |
 | `Forfeit` | gives up. The player leaves when the round ends, placed below everyone else who goes out that round. This can't be undone |
 
@@ -152,6 +167,10 @@ one place.
 | `Forfeited` | the player has forfeited and is only waiting for the round to end |
 | `GameOver` | the game is over |
 | `NotEnoughGold { need, have }` | can't afford it |
+| `NotEnough { currency, need, have }` | not enough of a currency other than gold (from `spend_currency`) |
+| `UnknownCurrency` | the game has no currency with that id |
+| `UnknownAction` | the game has no action with that id |
+| `ActionLimit { per_round }` | the action has been used as often as it can be this round |
 | `EmptyShopSlot` | nothing in that shop slot |
 | `SoldOut` | no copies of that unit are left in the pool |
 | `BenchFull` | no room on the bench |
@@ -167,6 +186,7 @@ one place.
 | `InvalidOption` | that option doesn't exist or is taken |
 | `NoRerollsLeft` | no rerolls of the options are left |
 | `UnknownRoundKind(kind)` | the schedule names a round kind nothing registered (from `begin_round`) |
+| `NotATeammate` | a gift to someone who is not a teammate still in the game |
 
 ## Grants
 
@@ -179,11 +199,22 @@ directly, because they run again on replay.
 | `Grant` | Gives |
 | --- | --- |
 | `Gold(n)` | gold |
+| `Currency { currency, amount }` | some of a currency other than gold. A negative amount takes it away |
 | `Xp(n)` | experience |
 | `Unit(id)` | a one-star unit, without taking a copy from the pool |
 | `Item(id)` | an item |
 | `Augment(id)` | an augment |
 | `Damage(n)` | takes health |
+| `Heal(n)` | gives health back, up to what players start with |
+| `Component` | a random component item |
+| `ItemTagged(tag)` | a random item with this [tag](items.md#itemdef-calls) |
+| `UnitOfCost(cost)` | a random unit of this cost, taken out of the pool |
+| `Rerolls(n)` | free rerolls |
+| `Loot(table)` | one roll on a [loot table](perks.md#loot-tables) |
+| `Choice { options, offer }` | a [pick of the player's own](perks.md#picks-of-a-players-own) of one out of `options` |
+
+The same grants are what [perks](perks.md), loot tables, PvE rewards,
+single-use items, actions and `Effect::reward` hand out.
 
 Every input that moves a game along (`Input::BeginRound`, `FinishRound`,
 accepted commands and grants) is recorded in `game.inputs()`.

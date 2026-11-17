@@ -37,7 +37,9 @@ assert_eq!(content.traits().count(), 2);
 - A breakpoint is active when at least `count` **different** units with the
   trait are on the board. Two copies of the same unit count once.
 - Bench units don't count.
-- A unit counts if it has the trait itself or holds an item that grants it.
+- A unit counts if it has the trait itself, was given it on its own (a
+  [special shop offer](perks.md#special-shop-offers) or
+  `game.add_unit_trait`), or holds an item that grants it.
 - Only the **highest** breakpoint reached applies. Each breakpoint lists
   everything it gives, so the higher one doesn't add to the lower one.
 - `content.active_traits(&board_units)` reports, for a board, each trait's
@@ -51,6 +53,9 @@ assert_eq!(content.traits().count(), 2);
 | `TraitDef::new(id, name)` | a trait with no breakpoints |
 | `.description(text)` | the tooltip text |
 | `.breakpoint(count, [bonuses])` | a tier active from `count` members. Add tiers in increasing order. A trait needs at least one |
+| `.breakpoint_exactly(count, [bonuses])` | a tier active only at exactly `count` members, such as a trait for a lone unit |
+| `.perk(Perk)` | grants the player gets while the tier added last is active, when something happens. See [Perks](perks.md#perks) |
+| `.rule(RuleMod)` | changes a rule for the player while the tier added last is active. See [Rules a player can bend](perks.md#rules-a-player-can-bend) |
 
 ## Bonuses
 

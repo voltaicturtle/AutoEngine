@@ -224,14 +224,17 @@ fn check(spec: &GameSpec, args: &mut Args) -> Result<(), String> {
     // Mistakes that stop the content building are errors; warnings are not.
     let content = spec.load()?;
     println!(
-        "{}: {} units, {} traits, {} items, {} augments, {} rounds, {} scripts",
+        "{}: {} units, {} traits, {} items, {} augments, {} rounds, {} scripts, {} resources, {} currencies, {} actions",
         spec.name,
         content.units().count(),
         content.traits().count(),
         content.items().count(),
         content.augments().count(),
         content.schedule().rounds.len(),
-        content.scripts().len()
+        content.scripts().len(),
+        content.resources().len(),
+        content.currencies().len(),
+        content.actions().len()
     );
     let warnings = tools::lint(&content, spec.assets.as_deref());
     for warning in &warnings {
@@ -446,7 +449,7 @@ fn fight(spec: &GameSpec, args: &mut Args) -> Result<(), String> {
             let found = (spec.tests)().into_iter().find(|t| t.name.contains(&name));
             let scenario = found.ok_or(format!("no content test has \"{name}\" in its name"))?;
             println!("test: {}", scenario.name);
-            MatchSetup { teams: scenario.teams }
+            MatchSetup { teams: scenario.teams, tiles: scenario.tiles }
         }
         None => match spec.sample_match {
             Some(sample_match) => sample_match(),
@@ -467,7 +470,7 @@ fn fight(spec: &GameSpec, args: &mut Args) -> Result<(), String> {
         println!("team {i} traits: {}", summary.join(", "));
     }
 
-    let mut combat = content.setup_combat(seed, &setup.teams).map_err(|e| e.to_string())?;
+    let mut combat = content.setup_combat_with(seed, &setup.teams, &setup.tiles).map_err(|e| e.to_string())?;
     combat.run();
 
     if !quiet {
@@ -602,11 +605,11 @@ fn print_log(combat: &Combat) {
             EventKind::Shielded { target, amount, .. } => {
                 format!("{} gains a {} shield", label(*target), amount)
             }
-            EventKind::CastStarted { unit } => {
-                let name = combat.unit(*unit).template().ability.as_ref().map(|a| a.name.as_str());
+            EventKind::CastStarted { unit, ability } => {
+                let name = combat.unit(*unit).template().abilities.get(*ability).map(|a| a.name.as_str());
                 format!("{} begins casting {}", label(*unit), name.unwrap_or("?"))
             }
-            EventKind::CastFinished { unit } => format!("{} finishes casting", label(*unit)),
+            EventKind::CastFinished { unit, .. } => format!("{} finishes casting", label(*unit)),
             EventKind::PassiveTriggered { unit, passive } => format!(
                 "{} triggers {}",
                 label(*unit),
@@ -616,10 +619,28 @@ fn print_log(combat: &Combat) {
                 let what = status.name();
                 format!("{} is {} for {}ms", label(*target), what, duration_ms)
             }
-            EventKind::StatusExpired { .. } => continue,
+            // Too frequent to read; the casts they lead to are logged.
+            EventKind::StatusExpired { .. } | EventKind::ResourceChanged { .. } => continue,
             EventKind::Died { unit, killer } => {
                 format!("{} dies (killed by {})", label(*unit), label(*killer))
             }
+            EventKind::TilePlaced { tile, pos, duration_ms, .. } => match duration_ms {
+                Some(ms) => format!("{tile} covers {:?} for {:.1}s", pos.to_offset(), *ms as f32 / 1000.0),
+                None => format!("{tile} covers {:?}", pos.to_offset()),
+            },
+            EventKind::TileRemoved { tile, pos } => {
+                format!("{tile} is gone from {:?}", pos.to_offset())
+            }
+            EventKind::Revived { unit, health, .. } => {
+                format!("{} gets back up with {health} health", label(*unit))
+            }
+            EventKind::Rewarded { unit, grant, .. } => format!("{} earns its player {grant}", label(*unit)),
+            EventKind::Grew { unit, mods } => {
+                let what: Vec<String> = mods.iter().map(|m| format!("{:+} {}", if m.flat != 0 { m.flat } else { m.permille / 10 }, m.stat.name())).collect();
+                format!("{} grows for good: {}", label(*unit), what.join(", "))
+            }
+            EventKind::Transformed { unit, name, .. } => format!("{} turns into {name}", label(*unit)),
+            EventKind::HealthSet { unit, health, max_health } => format!("{} is at {health} of {max_health} health", label(*unit)),
             EventKind::Ended { winner, timed_out } => match (winner, timed_out) {
                 (Some(team), _) => format!("Team {} wins", team.0),
                 (None, true) => "Time ran out: draw".to_string(),

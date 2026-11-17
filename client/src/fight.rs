@@ -199,6 +199,15 @@ pub(crate) fn draw_replay(app: &mut App, layout: &Layout) {
                         DamageKind::Physical => effects.hit_physical,
                         DamageKind::Magic => effects.hit_magic,
                         DamageKind::True => effects.hit_true,
+                        // A game's own damage type: the true-damage burst in its color.
+                        DamageKind::Custom(_) => {
+                            let color = app.net.state.content.as_ref().and_then(|c| c.damage_type(*kind)?.color);
+                            let mut burst = effects.hit_true;
+                            if let Some([r, g, b]) = color {
+                                burst.color = Color::from_rgba(r, g, b, 255);
+                            }
+                            burst
+                        }
                     };
                     if *crit {
                         burst.count = burst.count * effects.crit_percent as usize / 100;
@@ -242,6 +251,9 @@ pub(crate) fn draw_replay(app: &mut App, layout: &Layout) {
     view.begin();
     let mut ground = Ground::default();
     board_tiles(&mut ground, layout, false, None);
+    for tile in show.playback.tiles() {
+        tile_marker(&mut ground, app, &tile.tile, place(tile.pos.q as f32, tile.pos.r as f32));
+    }
     for u in show.playback.units().filter(|u| u.alive) {
         let (q, r) = u.position_at(now);
         let at = place(q, r) + RING_LIFT;
@@ -303,7 +315,14 @@ pub(crate) fn draw_replay(app: &mut App, layout: &Layout) {
     for u in show.playback.units().filter(|u| u.alive) {
         let Some((head, _, size)) = head_of(&show.playback, u.id) else { continue };
         let full = u.max_health.max(1) as f32;
-        draw_health_bar(head, (size * 1.1).clamp(28.0, 70.0), u.health as f32 / full, u.shield as f32 / full, u.team.0 == my_team);
+        let width = (size * 1.1).clamp(28.0, 70.0);
+        draw_health_bar(head, width, u.health as f32 / full, u.shield as f32 / full, u.team.0 == my_team);
+        for (row, bar) in u.resources.iter().enumerate() {
+            // The game's color for the resource, or one of a few stand-ins.
+            let chosen = app.net.state.content.as_ref().and_then(|c| c.resource(&bar.id)?.color);
+            let [r, g, b] = chosen.unwrap_or([[70, 130, 230], [230, 120, 60], [240, 210, 80], [150, 220, 140]][row % 4]);
+            draw_resource_bar(head, width, row, bar.amount as f32 / bar.max.max(1) as f32, Color::from_rgba(r, g, b, 255));
+        }
         let statuses = u.statuses_at(now);
         if !statuses.is_empty() {
             text_centered(&statuses.join(" "), head.x, head.y - 8.0, 14.0, ui().gold);
@@ -322,11 +341,10 @@ pub(crate) fn draw_replay(app: &mut App, layout: &Layout) {
             Flash::Damage { target, amount, absorbed, kind, crit } => {
                 if let Some((p, _, _)) = head_of(&show.playback, *target) {
                     let alpha = (1.0 - age / 900.0).max(0.0);
-                    let mut color = match kind {
-                        autoengine::effect::DamageKind::Physical => Color::new(1.0, 0.55, 0.30, alpha),
-                        autoengine::effect::DamageKind::Magic => Color::new(0.55, 0.65, 1.0, alpha),
-                        autoengine::effect::DamageKind::True => Color::new(1.0, 1.0, 1.0, alpha),
-                    };
+                    // The game's color for this kind of damage, or white.
+                    let rgb = app.net.state.content.as_ref().and_then(|c| c.damage_type(*kind)?.color);
+                    let [r, g, b] = rgb.unwrap_or([255, 255, 255]);
+                    let mut color = Color::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, alpha);
                     let shown = amount + absorbed;
                     if *amount == 0 {
                         color = Color::new(0.8, 0.8, 0.8, alpha);

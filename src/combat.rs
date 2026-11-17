@@ -22,12 +22,15 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::effect::{
-    Amount, Anchor, Condition, DamageKind, Effect, EffectSpec, ScaleBy, Selector, StatusKind, Targeting, Trigger,
-    UnitTemplate, Who,
+    Amount, Anchor, Condition, Cost, DamageKind, Effect, EffectSpec, ScaleBy, Selector, StatusKind, Targeting,
+    Trigger, UnitTemplate, Who,
 };
+use crate::damage::DamageType;
 use crate::hex::{Hex, HexBoard};
+use crate::resource::{MANA, Pool, ResourceDef};
 use crate::rng::Rng;
 use crate::stats::{Stat, StatMod, Stats};
+use crate::tile::{Affects, TileDef, TileView};
 
 /// Identifies a unit within one combat. Ids are assigned in spawn order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -44,6 +47,8 @@ const PROGRESS_FULL: i64 = 1_000_000;
 /// Upper bound on triggered passives resolved in one go, as a guard against
 /// content that triggers itself forever.
 const MAX_TRIGGER_CHAIN: usize = 10_000;
+/// How many tiles' effects can push a unit from one tile onto the next.
+const MAX_TILE_CHAIN: u32 = 4;
 
 /// How deeply custom effects may call other custom effects.
 const MAX_HOOK_DEPTH: u32 = 16;
@@ -58,6 +63,12 @@ pub type CustomEffectFn = dyn Fn(&mut EffectContext<'_>) + Send + Sync;
 /// rules as [`CustomEffectFn`] apply.
 pub type CustomConditionFn = dyn Fn(&ConditionContext<'_>) -> bool + Send + Sync;
 
+/// A Rust hook that picks the units for [`Selector::Custom`]. It must give
+/// the same units in the same order every time for the same fight, so sort
+/// by something stable such as the unit id. Dead units it returns are
+/// skipped.
+pub type CustomSelectorFn = dyn Fn(&SelectContext<'_>) -> Vec<UnitId> + Send + Sync;
+
 /// Tunable rules of the simulation. A game sets them in
 /// [`GameRules::combat`](crate::content::GameRules).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,10 +78,15 @@ pub struct CombatConfig {
     pub tick_ms: u32,
     /// The fight ends in a draw after this long.
     pub max_duration_ms: u32,
-    /// Mana gained per point of damage taken, in permille.
-    pub mana_per_damage_permille: i64,
-    /// Most mana one instance of damage can grant.
-    pub mana_from_damage_cap: i64,
+    /// The resources units build up and spend to cast: mana, unless the
+    /// game says otherwise. See the [`resource`](crate::resource) module.
+    pub resources: Vec<ResourceDef>,
+    /// How each kind of damage is mitigated. See the
+    /// [`damage`](crate::damage) module.
+    pub damage_types: Vec<DamageType>,
+    /// The kinds of tile that can be on the board. See the
+    /// [`tile`](crate::tile) module.
+    pub tiles: Vec<TileDef>,
     /// Damage multiplier from resistance is `k / (k + resist)`.
     pub resist_constant: i64,
     /// Cap on the `DamageReduction` stat, in permille.
@@ -89,8 +105,9 @@ impl Default for CombatConfig {
         CombatConfig {
             tick_ms: 50,
             max_duration_ms: 60_000,
-            mana_per_damage_permille: 30,
-            mana_from_damage_cap: 40,
+            resources: vec![ResourceDef::mana()],
+            damage_types: DamageType::defaults(),
+            tiles: Vec::new(),
             resist_constant: 100,
             max_damage_reduction: 900,
             overtime_after_ms: 30_000,
@@ -134,12 +151,27 @@ pub struct CombatUnit {
     pos: Hex,
     stats: Stats,
     health: i64,
-    mana: i64,
+    /// The fight's resource rules, and how much of each the unit has.
+    resource_defs: Arc<[ResourceDef]>,
+    resources: Vec<i64>,
     alive: bool,
     target: Option<UnitId>,
     attack_progress: i64,
     move_progress: i64,
     cast_remaining_ms: Option<u32>,
+    /// Which ability is being cast, by position in the template.
+    casting: usize,
+    /// Time until each ability can be cast again.
+    cooldowns: Vec<u32>,
+    /// Time until the unit can gain each resource again (see
+    /// `ResourceDef::lock_after_cast_ms`).
+    resource_locks: Vec<u32>,
+    /// Time since the last once-a-second resource change.
+    second_ms: u32,
+    /// The tick the unit last died on, while it is dead.
+    died_at: Option<u32>,
+    /// The tiles whose stat changes the unit has right now.
+    on_tiles: Vec<OnTile>,
     shields: Vec<ShieldInstance>,
     statuses: Vec<StatusInstance>,
     passive_state: Vec<PassiveState>,
@@ -168,8 +200,35 @@ impl CombatUnit {
     pub fn health(&self) -> i64 {
         self.health
     }
+    /// How much mana the unit has; short for `resource("mana")`.
     pub fn mana(&self) -> i64 {
-        self.mana
+        self.resource(MANA)
+    }
+    /// How much of a resource the unit has, by resource id. Zero for a
+    /// resource the unit or the fight does not have.
+    pub fn resource(&self, id: &str) -> i64 {
+        self.pool(id).map_or(0, |p| p.amount)
+    }
+    /// One of the unit's resources, by id. `None` if it does not have it.
+    pub fn pool(&self, id: &str) -> Option<Pool<'_>> {
+        self.pools().find(|p| p.def.id == id)
+    }
+    /// Every resource the unit has, in the order the fight lists them.
+    pub fn pools(&self) -> impl Iterator<Item = Pool<'_>> {
+        self.resource_defs
+            .iter()
+            .zip(&self.resources)
+            .map(|(def, amount)| Pool { def, amount: *amount, max: self.stats.get(def.max) })
+            .filter(|p| p.max > 0)
+    }
+    /// Time until one of the unit's abilities (by position) can be cast
+    /// again.
+    pub fn cooldown_ms(&self, ability: usize) -> u32 {
+        self.cooldowns.get(ability).copied().unwrap_or(0)
+    }
+    /// The ability being cast, by position, if the unit is casting.
+    pub fn casting(&self) -> Option<usize> {
+        self.cast_remaining_ms.map(|_| self.casting)
     }
     /// Total remaining shield.
     pub fn shield(&self) -> i64 {
@@ -207,6 +266,10 @@ impl CombatUnit {
     pub fn has_tag(&self, tag: &str) -> bool {
         self.template.tags.iter().any(|t| t == tag)
     }
+    /// Whether enemies can choose it right now.
+    pub fn is_targetable(&self) -> bool {
+        self.alive && !self.has_status(|s| matches!(s, StatusKind::Untargetable))
+    }
 }
 
 /// Something that happened during combat.
@@ -236,13 +299,53 @@ pub enum EventKind {
     /// `source` is whoever did the healing (the unit itself for lifesteal).
     Healed { source: UnitId, target: UnitId, amount: i64 },
     Shielded { source: UnitId, target: UnitId, amount: i64 },
-    CastStarted { unit: UnitId },
-    CastFinished { unit: UnitId },
+    /// `ability` is the position of the ability among the unit's own.
+    CastStarted {
+        unit: UnitId,
+        #[serde(default)]
+        ability: usize,
+    },
+    CastFinished {
+        unit: UnitId,
+        #[serde(default)]
+        ability: usize,
+    },
     PassiveTriggered { unit: UnitId, passive: usize },
     StatusApplied { source: UnitId, target: UnitId, status: StatusKind, duration_ms: u32 },
     StatusExpired { target: UnitId, status: StatusKind },
     StacksChanged { unit: UnitId, stack: String, count: u32 },
+    /// A unit now has `amount` of the resource with this id, out of `max`.
+    /// Sent when either number changes, and for each resource a unit has
+    /// when it enters the fight.
+    ResourceChanged { unit: UnitId, resource: String, amount: i64, max: i64 },
     Died { unit: UnitId, killer: UnitId },
+    /// A tile is on a hex, newly laid or laid again. `team` is the side of
+    /// whoever laid it, and `duration_ms` how long it has left (`None` is
+    /// the rest of the fight).
+    TilePlaced {
+        tile: String,
+        pos: Hex,
+        team: Option<Team>,
+        duration_ms: Option<u32>,
+    },
+    /// A tile is gone from a hex.
+    TileRemoved {
+        tile: String,
+        pos: Hex,
+    },
+    /// A dead unit is back, at `pos` with `health`.
+    Revived { unit: UnitId, source: UnitId, pos: Hex, health: i64 },
+    /// The player whose unit this is earned something to keep after the
+    /// fight (see [`Effect::reward`]).
+    Rewarded { unit: UnitId, team: Team, grant: crate::game::Grant },
+    /// A unit's stats changed for good (see [`Effect::grow`]).
+    Grew { unit: UnitId, mods: Vec<StatMod> },
+    /// A unit turned into another one: `into` is the new unit's id and
+    /// `name` what it is called now.
+    Transformed { unit: UnitId, into: String, name: String },
+    /// A unit's health and most health were set outright: a copy that
+    /// starts hurt, a new form.
+    HealthSet { unit: UnitId, health: i64, max_health: i64 },
     Ended { winner: Option<Team>, timed_out: bool },
 }
 
@@ -268,6 +371,8 @@ pub struct Outcome {
 pub enum SpawnError {
     OffBoard(Hex),
     Occupied(Hex),
+    /// A tile nobody can stand on is there.
+    Blocked(Hex),
 }
 
 impl std::fmt::Display for SpawnError {
@@ -275,6 +380,7 @@ impl std::fmt::Display for SpawnError {
         match self {
             SpawnError::OffBoard(h) => write!(f, "hex {:?} is off the board", h.to_offset()),
             SpawnError::Occupied(h) => write!(f, "hex {:?} is occupied", h.to_offset()),
+            SpawnError::Blocked(h) => write!(f, "hex {:?} is blocked by a tile", h.to_offset()),
         }
     }
 }
@@ -287,11 +393,48 @@ struct PendingTrigger {
     other: Option<UnitId>,
 }
 
+/// A tile on the board.
+#[derive(Clone, Debug)]
+struct TileInstance {
+    /// Tells this tile from every other laid in the fight.
+    uid: u32,
+    /// Which [`TileDef`], by position in the config.
+    def: usize,
+    pos: Hex,
+    owner: Option<UnitId>,
+    team: Option<Team>,
+    remaining_ms: Option<u32>,
+    /// Time since its last once-a-second effect.
+    second_ms: u32,
+}
+
+/// A tile a unit is standing on and affected by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OnTile {
+    uid: u32,
+    def: usize,
+    owner: Option<UnitId>,
+}
+
+/// An effect on its way: it lands on `target` at `at_tick`.
+struct Delayed {
+    at_tick: u32,
+    source: UnitId,
+    target: UnitId,
+    other: Option<UnitId>,
+    effect: Effect,
+    direct: bool,
+    /// Landings still to come after this one, and the ticks between them.
+    more: u32,
+    every_ticks: u32,
+}
+
 /// One fight, from setup to outcome.
 pub struct Combat {
     board: HexBoard,
     config: CombatConfig,
     rng: Rng,
+    resources: Arc<[ResourceDef]>,
     units: Vec<CombatUnit>,
     library: HashMap<String, Arc<UnitTemplate>>,
     occupancy: Vec<Option<UnitId>>,
@@ -299,9 +442,21 @@ pub struct Combat {
     started: bool,
     events: Vec<Event>,
     pending: VecDeque<PendingTrigger>,
+    delayed: Vec<Delayed>,
+    tile_defs: Arc<[TileDef]>,
+    tiles: Vec<TileInstance>,
+    next_tile: u32,
+    /// How many blocking tiles are on each hex.
+    blocked: Vec<u16>,
+    tile_depth: u32,
+    /// What players have earned in this fight, by the side that earned it.
+    rewards: Vec<(Team, crate::game::Grant)>,
+    /// Stat changes units have earned for good.
+    growth: Vec<(UnitId, Vec<StatMod>)>,
     outcome: Option<Outcome>,
     custom_effects: HashMap<String, Arc<CustomEffectFn>>,
     custom_conditions: HashMap<String, Arc<CustomConditionFn>>,
+    custom_selectors: HashMap<String, Arc<CustomSelectorFn>>,
     hook_depth: u32,
 }
 
@@ -313,8 +468,10 @@ impl Combat {
     pub fn with_config(board: HexBoard, seed: u64, config: CombatConfig) -> Self {
         assert!(config.tick_ms > 0, "tick_ms must be positive");
         let cells = board.len();
+        let tile_defs: Arc<[TileDef]> = config.tiles.clone().into();
         Combat {
             board,
+            resources: config.resources.clone().into(),
             config,
             rng: Rng::new(seed),
             units: Vec::new(),
@@ -324,9 +481,18 @@ impl Combat {
             started: false,
             events: Vec::new(),
             pending: VecDeque::new(),
+            delayed: Vec::new(),
+            tile_defs,
+            tiles: Vec::new(),
+            next_tile: 0,
+            blocked: vec![0; cells],
+            tile_depth: 0,
+            rewards: Vec::new(),
+            growth: Vec::new(),
             outcome: None,
             custom_effects: HashMap::new(),
             custom_conditions: HashMap::new(),
+            custom_selectors: HashMap::new(),
             hook_depth: 0,
         }
     }
@@ -358,6 +524,20 @@ impl Combat {
     /// tests and front ends that want to preview an ability.
     pub fn targets(&self, source: UnitId, selector: &Selector) -> Vec<UnitId> {
         self.select(selector, source, None)
+    }
+
+    /// What each side has earned so far, in the order it was earned (see
+    /// [`Effect::reward`]). The game hands these to the players after the
+    /// fight.
+    pub fn rewards(&self) -> &[(Team, crate::game::Grant)] {
+        &self.rewards
+    }
+
+    /// The stat changes units have earned for good so far (see
+    /// [`Effect::grow`]), in order. The game writes these onto the
+    /// players' units after the fight.
+    pub fn growth(&self) -> &[(UnitId, Vec<StatMod>)] {
+        &self.growth
     }
 
     pub fn outcome(&self) -> Option<&Outcome> {
@@ -400,6 +580,16 @@ impl Combat {
         self.custom_conditions.insert(name.into(), Arc::new(predicate));
     }
 
+    /// Registers the hook behind `Selector::Custom(name)`. Unregistered
+    /// custom selectors pick nobody.
+    pub fn register_custom_selector(
+        &mut self,
+        name: impl Into<String>,
+        hook: impl Fn(&SelectContext<'_>) -> Vec<UnitId> + Send + Sync + 'static,
+    ) {
+        self.custom_selectors.insert(name.into(), Arc::new(hook));
+    }
+
     /// Places a unit on the board.
     pub fn spawn(
         &mut self,
@@ -411,12 +601,15 @@ impl Combat {
         if self.occupancy[idx].is_some() {
             return Err(SpawnError::Occupied(pos));
         }
+        if self.blocked[idx] > 0 {
+            return Err(SpawnError::Blocked(pos));
+        }
         let template = template.into();
         let id = UnitId(self.units.len() as u32);
         let stats = Stats::new(template.stats.clone());
         let health = stats.get(Stat::MaxHealth).max(1);
-        let mana = stats.get(Stat::StartingMana).min(stats.get(Stat::MaxMana));
         let passive_state = vec![PassiveState::default(); template.passives.len()];
+        let cooldowns = vec![0; template.abilities.len()];
         self.units.push(CombatUnit {
             id,
             team,
@@ -424,12 +617,19 @@ impl Combat {
             pos,
             stats,
             health,
-            mana,
+            resource_defs: self.resources.clone(),
+            resources: vec![0; self.resources.len()],
+            resource_locks: vec![0; self.resources.len()],
             alive: true,
             target: None,
             attack_progress: 0,
             move_progress: 0,
             cast_remaining_ms: None,
+            casting: 0,
+            cooldowns,
+            second_ms: 0,
+            died_at: None,
+            on_tiles: Vec::new(),
             shields: Vec::new(),
             statuses: Vec::new(),
             passive_state,
@@ -438,7 +638,16 @@ impl Combat {
         self.occupancy[idx] = Some(id);
         let name = self.u(id).template.name.clone();
         self.emit(EventKind::Spawned { unit: id, team, pos, name, max_health: health });
+        let defs = self.resources.clone();
+        for (index, def) in defs.iter().enumerate() {
+            let max = self.u(id).stat(def.max);
+            if max > 0 {
+                let start = self.eval(&def.start, id, id).clamp(0, max);
+                self.set_resource(id, index, start, true);
+            }
+        }
         if self.started {
+            self.sync_tiles(id);
             self.fire(id, None, |t| matches!(t, Trigger::CombatStart));
         }
         Ok(id)
@@ -451,6 +660,10 @@ impl Combat {
         }
         if !self.started {
             self.started = true;
+            // Units standing on a tile the fight starts with step onto it now.
+            for i in 0..self.units.len() {
+                self.sync_tiles(UnitId(i as u32));
+            }
             for i in 0..self.units.len() {
                 self.fire(UnitId(i as u32), None, |t| matches!(t, Trigger::CombatStart));
             }
@@ -461,6 +674,8 @@ impl Combat {
         if overtime > 0 && self.time_ms() > overtime && self.time_ms() - self.config.tick_ms <= overtime {
             self.emit(EventKind::Overtime);
         }
+        self.land_delayed();
+        self.tick_tiles();
         let acting = self.units.len();
         for i in 0..acting {
             if self.units[i].alive {
@@ -512,13 +727,25 @@ impl Combat {
             return;
         }
 
-        // Start a cast when mana is full.
-        let max_mana = self.u(id).stat(Stat::MaxMana);
+        // Start a cast as soon as the unit can pay for an ability: the
+        // first one it can afford, in the order they are listed.
         let silenced = self.u(id).has_status(|s| matches!(s, StatusKind::Silence));
-        if max_mana > 0 && self.u(id).mana >= max_mana && self.u(id).template.ability.is_some() && !silenced {
-            let cast_time = self.u(id).template.ability.as_ref().unwrap().cast_time_ms;
-            self.u_mut(id).mana = 0;
-            self.emit(EventKind::CastStarted { unit: id });
+        let castable = (0..self.u(id).template.abilities.len()).find_map(|i| Some((i, self.payment(id, i)?)));
+        if !silenced && let Some((which, payment)) = castable {
+            let ability = &self.u(id).template.abilities[which];
+            let (cast_time, cooldown) = (ability.cast_time_ms, ability.cooldown_ms);
+            if let Some((index, amount)) = payment {
+                let left = self.u(id).resources[index] - amount;
+                self.set_resource(id, index, left, false);
+                let lock = self.resources[index].lock_after_cast_ms;
+                if lock > 0 {
+                    self.u_mut(id).resource_locks[index] = cast_time + lock;
+                }
+            }
+            let unit = self.u_mut(id);
+            unit.cooldowns[which] = cooldown;
+            unit.casting = which;
+            self.emit(EventKind::CastStarted { unit: id, ability: which });
             if cast_time == 0 {
                 self.finish_cast(id);
             } else {
@@ -557,13 +784,9 @@ impl Combat {
             self.u_mut(id).move_progress += speed * tick_ms as i64;
             if self.u(id).move_progress >= PROGRESS_FULL {
                 let board = &self.board;
-                let occupancy = &self.occupancy;
-                let free = |h: Hex| board.index(h).is_some_and(|i| occupancy[i].is_none());
-                let path = board.find_path(
-                    pos,
-                    |h| h.distance(target_pos) <= range && free(h),
-                    free,
-                );
+                let (occupancy, blocked) = (&self.occupancy, &self.blocked);
+                let free = |h: Hex| board.index(h).is_some_and(|i| occupancy[i].is_none() && blocked[i] == 0);
+                let path = board.find_path(pos, |h| h.distance(target_pos) <= range && free(h), free);
                 match path.and_then(|p| p.first().copied()) {
                     Some(next) => {
                         self.u_mut(id).move_progress -= PROGRESS_FULL;
@@ -576,9 +799,75 @@ impl Combat {
         }
     }
 
-    /// Advances shields, statuses and periodic passives by one tick.
+    /// What casting one of its abilities would cost a unit right now:
+    /// `None` if it cannot cast it, `Some(None)` if the cast is free, or the
+    /// resource (by position) and amount to take.
+    fn payment(&self, id: UnitId, ability: usize) -> Option<Option<(usize, i64)>> {
+        let unit = self.u(id);
+        if unit.cooldowns[ability] > 0 {
+            return None;
+        }
+        let ability = &unit.template.abilities[ability];
+        let (resource, amount) = match &ability.cost {
+            Cost::Free => return Some(None),
+            Cost::Full(resource) => (resource, None),
+            Cost::Amount { resource, amount } => (resource, Some((*amount).max(0))),
+        };
+        let index = self.resources.iter().position(|d| d.id == *resource)?;
+        let max = unit.stat(self.resources[index].max);
+        let amount = amount.unwrap_or(max);
+        (max > 0 && unit.resources[index] >= amount).then_some(Some((index, amount)))
+    }
+
+    /// Sets how much of a resource a unit has, and reports it if that is
+    /// news (or `always`).
+    fn set_resource(&mut self, id: UnitId, index: usize, amount: i64, always: bool) {
+        let max = self.u(id).stat(self.resources[index].max).max(0);
+        let amount = amount.clamp(0, max);
+        if std::mem::replace(&mut self.u_mut(id).resources[index], amount) != amount || always {
+            let resource = self.resources[index].id.clone();
+            self.emit(EventKind::ResourceChanged { unit: id, resource, amount, max });
+        }
+    }
+
+    /// Gives a unit some of a resource (or takes it, when negative), within
+    /// the resource's rules.
+    fn add_resource(&mut self, id: UnitId, index: usize, amount: i64) {
+        let def = &self.resources[index];
+        let unit = self.u(id);
+        let locked = (unit.cast_remaining_ms.is_some() && !def.changes_while_casting) || (amount > 0 && unit.resource_locks[index] > 0);
+        if amount == 0 || !unit.alive || locked || unit.stat(def.max) <= 0 {
+            return;
+        }
+        self.set_resource(id, index, unit.resources[index] + amount, false);
+    }
+
+    /// Gives a unit what each resource's rules say an occasion is worth.
+    fn gain_resources(&mut self, id: UnitId, worth: impl Fn(&Combat, &ResourceDef) -> i64) {
+        for index in 0..self.resources.len() {
+            let amount = worth(self, &self.resources[index]);
+            self.add_resource(id, index, amount);
+        }
+    }
+
+    /// Advances shields, statuses, resources and periodic passives by one
+    /// tick.
     fn tick_timers(&mut self, id: UnitId) {
         let tick_ms = self.config.tick_ms;
+
+        // Cooldown, and what resources gain or lose every second.
+        let unit = self.u_mut(id);
+        for cooldown in &mut unit.cooldowns {
+            *cooldown = cooldown.saturating_sub(tick_ms);
+        }
+        for lock in &mut unit.resource_locks {
+            *lock = lock.saturating_sub(tick_ms);
+        }
+        unit.second_ms += tick_ms;
+        if unit.second_ms >= 1000 {
+            unit.second_ms -= 1000;
+            self.gain_resources(id, |c, def| if def.per_second.is_zero() { 0 } else { c.eval(&def.per_second, id, id) });
+        }
 
         // Shields.
         self.u_mut(id).shields.retain_mut(|s| match &mut s.remaining_ms {
@@ -650,12 +939,12 @@ impl Combat {
             return Some(t);
         }
         if let Some(t) = self.u(id).target
-            && self.u(t).alive
+            && self.u(t).is_targetable()
         {
             return Some(t);
         }
         let me = self.u(id);
-        let enemies = self.units.iter().filter(|o| o.alive && o.team != me.team);
+        let enemies = self.units.iter().filter(|o| o.is_targetable() && o.team != me.team);
         // Ties go to the nearest, then the lowest id.
         let near = |o: &CombatUnit| (me.pos.distance(o.pos), o.id);
         let target = match me.template.targeting {
@@ -664,6 +953,19 @@ impl Combat {
             Targeting::LowestHealth => enemies.min_by_key(|o| (o.health, near(o))),
             Targeting::HighestDamage => enemies.min_by_key(|o| (std::cmp::Reverse(o.stat(Stat::AttackDamage)), near(o))),
             Targeting::LowestArmor => enemies.min_by_key(|o| (o.stat(Stat::Armor), near(o))),
+            Targeting::HighestStat(stat) => enemies.min_by_key(|o| (std::cmp::Reverse(o.stat(stat)), near(o))),
+            Targeting::LowestStat(stat) => enemies.min_by_key(|o| (o.stat(stat), near(o))),
+            Targeting::Custom(name) => {
+                let picked = self.custom_selectors.get(name.as_str()).and_then(|hook| {
+                    hook(&SelectContext { combat: self, source: id, other: None })
+                        .into_iter()
+                        .find(|t| self.units.get(t.0 as usize).is_some_and(|o| o.is_targetable() && o.team != me.team))
+                });
+                match picked {
+                    Some(t) => Some(self.u(t)),
+                    None => enemies.min_by_key(|o| near(o)),
+                }
+            }
         }
         .map(|o| o.id);
         self.u_mut(id).target = target;
@@ -685,17 +987,226 @@ impl Combat {
     fn move_unit(&mut self, id: UnitId, to: Hex) {
         let from = self.place(id, to);
         self.emit(EventKind::Moved { unit: id, from, to });
+        self.sync_tiles(id);
     }
 
     fn displace(&mut self, id: UnitId, to: Hex) {
         if self.u(id).pos != to {
             let from = self.place(id, to);
             self.emit(EventKind::Displaced { unit: id, from, to });
+            self.sync_tiles(id);
         }
     }
 
+    /// Whether a unit could stand on a hex: on the board, empty and not
+    /// blocked by a tile.
     fn is_free(&self, hex: Hex) -> bool {
-        self.board.index(hex).is_some_and(|i| self.occupancy[i].is_none())
+        self.board.index(hex).is_some_and(|i| self.occupancy[i].is_none() && self.blocked[i] == 0)
+    }
+
+    // ----- tiles ----------------------------------------------------------
+
+    /// Lays a tile on a hex, for `duration_ms` or for the rest of the fight.
+    /// `owner` is the unit that laid it: its side decides whom the tile
+    /// affects, and it is the source of the tile's effects. Laying a tile
+    /// where the same kind already lies keeps the longer time and hands it
+    /// to the new owner.
+    ///
+    /// Returns `false` if nothing was laid: an unknown tile, a hex off the
+    /// board, or a blocking tile on a hex a unit is standing on.
+    pub fn place_tile(&mut self, tile: &str, pos: Hex, owner: Option<UnitId>, duration_ms: Option<u32>) -> bool {
+        let Some(def) = self.tile_defs.iter().position(|d| d.id == tile) else {
+            return false;
+        };
+        let Some(idx) = self.board.index(pos) else {
+            return false;
+        };
+        let team = owner.map(|o| self.u(o).team);
+        let remaining_ms = match self.tiles.iter_mut().find(|t| t.def == def && t.pos == pos) {
+            Some(existing) => {
+                existing.remaining_ms = match (existing.remaining_ms, duration_ms) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    _ => None,
+                };
+                existing.owner = owner;
+                existing.team = team;
+                existing.remaining_ms
+            }
+            None => {
+                let blocks = self.tile_defs[def].blocks;
+                if blocks && self.occupancy[idx].is_some() {
+                    return false;
+                }
+                let uid = self.next_tile;
+                self.next_tile += 1;
+                self.tiles.push(TileInstance { uid, def, pos, owner, team, remaining_ms: duration_ms, second_ms: 0 });
+                if blocks {
+                    self.blocked[idx] += 1;
+                }
+                duration_ms
+            }
+        };
+        self.emit(EventKind::TilePlaced { tile: tile.to_string(), pos, team, duration_ms: remaining_ms });
+        if let Some(unit) = self.occupancy[idx] {
+            self.sync_tiles(unit);
+        }
+        true
+    }
+
+    /// Takes a kind of tile off a hex. Returns whether one was there.
+    pub fn clear_tile(&mut self, tile: &str, pos: Hex) -> bool {
+        match self.tiles.iter().find(|t| t.pos == pos && self.tile_defs[t.def].id == tile).map(|t| t.uid) {
+            Some(uid) => {
+                self.remove_tile(uid);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The tiles on the board right now, in the order they were laid.
+    pub fn tiles(&self) -> Vec<TileView<'_>> {
+        self.tiles
+            .iter()
+            .map(|t| TileView { def: &self.tile_defs[t.def], pos: t.pos, team: t.team, remaining_ms: t.remaining_ms })
+            .collect()
+    }
+
+    /// Whether a hex has a tile of this kind on it.
+    pub fn has_tile(&self, pos: Hex, tile: &str) -> bool {
+        self.tiles.iter().any(|t| t.pos == pos && self.tile_defs[t.def].id == tile)
+    }
+
+    /// Whether a unit could stand on a hex right now.
+    pub fn can_stand(&self, hex: Hex) -> bool {
+        self.is_free(hex)
+    }
+
+    fn remove_tile(&mut self, uid: u32) {
+        let Some(at) = self.tiles.iter().position(|t| t.uid == uid) else {
+            return;
+        };
+        let tile = self.tiles.remove(at);
+        let idx = self.board.index(tile.pos).expect("tiles are on the board");
+        if self.tile_defs[tile.def].blocks {
+            self.blocked[idx] -= 1;
+        }
+        self.emit(EventKind::TileRemoved { tile: self.tile_defs[tile.def].id.clone(), pos: tile.pos });
+        if let Some(unit) = self.occupancy[idx] {
+            self.sync_tiles(unit);
+        }
+    }
+
+    fn tile_affects(&self, def: usize, tile_team: Option<Team>, unit_team: Team) -> bool {
+        match (self.tile_defs[def].affects, tile_team) {
+            (Affects::Everyone, _) | (_, None) => true,
+            (Affects::Allies, Some(team)) => team == unit_team,
+            (Affects::Enemies, Some(team)) => team != unit_team,
+        }
+    }
+
+    /// Brings a unit in line with the tiles under it after anything that
+    /// could change them: it moved, died or came back, or a tile appeared,
+    /// changed hands or went away. Stat changes follow the tiles exactly;
+    /// enter effects run for tiles that are new to it, and leave effects
+    /// for tiles it walked off (not ones that ran out, and not on death).
+    fn sync_tiles(&mut self, id: UnitId) {
+        if !self.started || (self.tiles.is_empty() && self.u(id).on_tiles.is_empty()) {
+            return;
+        }
+        let unit = self.u(id);
+        let now: Vec<OnTile> = if unit.alive {
+            self.tiles
+                .iter()
+                .filter(|t| t.pos == unit.pos && self.tile_affects(t.def, t.team, unit.team))
+                .map(|t| OnTile { uid: t.uid, def: t.def, owner: t.owner })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let before = unit.on_tiles.clone();
+        let left: Vec<OnTile> = before.iter().filter(|b| !now.iter().any(|n| n.uid == b.uid)).copied().collect();
+        let entered: Vec<OnTile> = now.iter().filter(|n| !before.iter().any(|b| b.uid == n.uid)).copied().collect();
+        if left.is_empty() && entered.is_empty() {
+            return;
+        }
+        self.u_mut(id).on_tiles = now;
+        let defs = self.tile_defs.clone();
+        // Effects of one tile can push a unit onto the next; that has to
+        // stop somewhere.
+        let run_effects = self.tile_depth < MAX_TILE_CHAIN;
+        self.tile_depth += 1;
+        for tile in left {
+            self.change_stats(id, &defs[tile.def].mods, false);
+            let still_there = self.tiles.iter().any(|t| t.uid == tile.uid);
+            if run_effects && still_there && self.u(id).alive {
+                for effect in &defs[tile.def].on_leave {
+                    self.apply_effect(tile.owner.unwrap_or(id), id, None, effect, false);
+                }
+            }
+        }
+        for tile in entered {
+            self.change_stats(id, &defs[tile.def].mods, true);
+            if run_effects {
+                for effect in &defs[tile.def].on_enter {
+                    self.apply_effect(tile.owner.unwrap_or(id), id, None, effect, false);
+                }
+            }
+        }
+        self.tile_depth -= 1;
+    }
+
+    /// Runs out the tiles that were laid for a time, and once a second
+    /// does what each tile does to the unit standing on it.
+    fn tick_tiles(&mut self) {
+        if self.tiles.is_empty() {
+            return;
+        }
+        let tick_ms = self.config.tick_ms;
+        let defs = self.tile_defs.clone();
+        let due: Vec<u32> = self
+            .tiles
+            .iter_mut()
+            .filter_map(|tile| {
+                tile.second_ms += tick_ms;
+                (tile.second_ms >= 1000).then(|| {
+                    tile.second_ms -= 1000;
+                    tile.uid
+                })
+            })
+            .collect();
+        for uid in due {
+            // An earlier tile's effects may have changed who stands where.
+            let Some(tile) = self.tiles.iter().find(|t| t.uid == uid).cloned() else {
+                continue;
+            };
+            if defs[tile.def].per_second.is_empty() {
+                continue;
+            }
+            let Some(unit) = self.unit_at(tile.pos) else {
+                continue;
+            };
+            if !self.tile_affects(tile.def, tile.team, self.u(unit).team) {
+                continue;
+            }
+            for effect in &defs[tile.def].per_second {
+                self.apply_effect(tile.owner.unwrap_or(unit), unit, None, effect, false);
+            }
+            self.drain_triggers();
+        }
+        // A tile laid for two seconds gets its second pulse before it goes.
+        let mut expired = Vec::new();
+        for tile in &mut self.tiles {
+            if let Some(remaining) = &mut tile.remaining_ms {
+                *remaining = remaining.saturating_sub(tick_ms);
+                if *remaining == 0 {
+                    expired.push(tile.uid);
+                }
+            }
+        }
+        for uid in expired {
+            self.remove_tile(uid);
+        }
     }
 
     /// Living units on `id`'s team (itself included) that carry `tag`.
@@ -707,25 +1218,34 @@ impl Combat {
     fn basic_attack(&mut self, id: UnitId, target: UnitId) {
         self.emit(EventKind::Attacked { source: id, target });
         let damage = self.u(id).stat(Stat::AttackDamage);
-        let mana = self.u(id).stat(Stat::ManaPerAttack);
-        self.add_mana(id, mana);
+        self.gain_resources(id, |c, def| if def.per_attack.is_zero() { 0 } else { c.eval(&def.per_attack, id, id) });
         let dodge = self.u(target).stat(Stat::Dodge);
         if dodge > 0 && self.rng.chance(dodge.min(1000) as u64, 1000) {
             self.emit(EventKind::Dodged { source: id, target });
+            self.fire(target, Some(id), |t| matches!(t, Trigger::OnDodge));
             return;
         }
-        self.deal_damage(id, target, damage, DamageKind::Physical, true, true);
+        let kind = self.u(id).template.attack_kind;
+        self.deal_damage(id, target, damage, kind, true, true);
         self.fire(id, Some(target), |t| matches!(t, Trigger::OnAttack));
     }
 
     fn finish_cast(&mut self, id: UnitId) {
         self.u_mut(id).cast_remaining_ms = None;
-        self.emit(EventKind::CastFinished { unit: id });
+        let which = self.u(id).casting;
+        self.emit(EventKind::CastFinished { unit: id, ability: which });
         let template = self.u(id).template.clone();
-        if let Some(ability) = &template.ability {
+        if let Some(ability) = template.abilities.get(which) {
             self.resolve(id, None, &ability.effects, true);
         }
         self.fire(id, None, |t| matches!(t, Trigger::OnCast));
+        let team = self.u(id).team;
+        for i in 0..self.units.len() {
+            let ally = &self.units[i];
+            if ally.alive && ally.team == team && ally.id != id {
+                self.fire(ally.id, Some(id), |t| matches!(t, Trigger::OnAllyCast));
+            }
+        }
     }
 
     // ----- triggers -------------------------------------------------------
@@ -778,6 +1298,10 @@ impl Combat {
     // ----- effect resolution ----------------------------------------------
 
     fn resolve(&mut self, source: UnitId, other: Option<UnitId>, effects: &[EffectSpec], direct: bool) {
+        let tick_ms = self.config.tick_ms;
+        // A wait is at least one tick, so a delayed effect never lands in
+        // the middle of the tick that started it.
+        let ticks = |ms: u32| ms.div_ceil(tick_ms).max(1);
         for spec in effects {
             for target in self.select(&spec.target, source, other) {
                 if let Some(condition) = &spec.condition
@@ -785,7 +1309,56 @@ impl Combat {
                 {
                     continue;
                 }
-                self.apply_effect(source, target, other, &spec.effect, direct);
+                let (times, every_ticks) = spec.repeat.map_or((1, 0), |r| (r.times.max(1), ticks(r.every_ms)));
+                // Something that flies takes longer to reach the far ones.
+                let flight = spec.travel_ms_per_hex * self.u(source).pos.distance(self.u(target).pos);
+                let delay_ms = spec.delay_ms + flight;
+                if delay_ms == 0 {
+                    self.apply_effect(source, target, other, &spec.effect, direct);
+                    if times > 1 {
+                        self.delayed.push(Delayed {
+                            at_tick: self.tick + every_ticks,
+                            source,
+                            target,
+                            other,
+                            effect: spec.effect.clone(),
+                            direct,
+                            more: times - 2,
+                            every_ticks,
+                        });
+                    }
+                } else {
+                    self.delayed.push(Delayed {
+                        at_tick: self.tick + ticks(delay_ms),
+                        source,
+                        target,
+                        other,
+                        effect: spec.effect.clone(),
+                        direct,
+                        more: times - 1,
+                        every_ticks,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Lands the delayed effects that are due, in the order they were
+    /// started, and queues the next landing of the ones that repeat.
+    fn land_delayed(&mut self) {
+        if self.delayed.is_empty() {
+            return;
+        }
+        let tick = self.tick;
+        let (due, waiting): (Vec<Delayed>, Vec<Delayed>) = std::mem::take(&mut self.delayed).into_iter().partition(|d| d.at_tick <= tick);
+        self.delayed = waiting;
+        for mut d in due {
+            self.apply_effect(d.source, d.target, d.other, &d.effect, d.direct);
+            self.drain_triggers();
+            if d.more > 0 {
+                d.more -= 1;
+                d.at_tick = tick + d.every_ticks;
+                self.delayed.push(d);
             }
         }
     }
@@ -813,6 +1386,21 @@ impl Combat {
                 who(w).is_some_and(|id| self.u(id).stacks(stack) >= *count)
             }
             Condition::AlliesWithTagAtLeast { tag, count } => self.allies_with_tag(source, tag) >= *count,
+            Condition::ResourceAtLeast { who: w, resource, permille } => who(w)
+                .and_then(|id| self.u(id).pool(resource))
+                .is_some_and(|p| p.amount * 1000 >= p.max * *permille as i64),
+            Condition::OnTile { who: w, tile } => who(w).is_some_and(|id| self.u(id).alive && self.has_tile(self.u(id).pos, tile)),
+            Condition::InFrontRows { who: w, rows } => who(w).is_some_and(|id| {
+                // The first side holds the lower half of the rows (as its
+                // player sees the board), the second side the upper half.
+                let middle = self.board.rows() as i32 / 2;
+                let row = self.u(id).pos.to_offset().1;
+                let depth = if self.u(id).team.0 % 2 == 0 { row - middle } else { middle - 1 - row };
+                depth < *rows as i32
+            }),
+            Condition::HasStatus { who: w, status } => {
+                who(w).is_some_and(|id| self.u(id).has_status(|s| s.name() == status))
+            }
             Condition::Chance { permille } => self.rng.chance(*permille as u64, 1000),
             Condition::Not(c) => !self.check(c, source, target),
             Condition::All(cs) => cs.iter().all(|c| self.check(c, source, target)),
@@ -826,13 +1414,13 @@ impl Combat {
 
     fn select(&self, selector: &Selector, source: UnitId, other: Option<UnitId>) -> Vec<UnitId> {
         let me = self.u(source);
-        let enemies = || self.units.iter().filter(|o| o.alive && o.team != me.team);
+        let enemies = || self.units.iter().filter(|o| o.is_targetable() && o.team != me.team);
         let allies = || self.units.iter().filter(|o| o.alive && o.team == me.team);
         let nearest_enemy = || enemies().min_by_key(|o| (me.pos.distance(o.pos), o.id));
         let current_target = || {
             me.target
                 .map(|t| self.u(t))
-                .filter(|t| t.alive)
+                .filter(|t| t.is_targetable() || (t.alive && t.team == me.team))
                 .or_else(nearest_enemy)
         };
         let anchor_pos = |anchor: &Anchor| match anchor {
@@ -887,6 +1475,87 @@ impl Combat {
             Selector::HighestStatAllies { stat, n } => {
                 take_sorted(allies(), *n, |o| std::cmp::Reverse(o.stat(*stat)))
             }
+            Selector::LowestStatEnemies { stat, n } => take_sorted(enemies(), *n, |o| o.stat(*stat)),
+            Selector::LowestStatAllies { stat, n } => take_sorted(allies(), *n, |o| o.stat(*stat)),
+            Selector::RandomAllies(n) => {
+                let mut dice = self.rng.clone().fork((self.tick as u64) << 16 | source.0 as u64);
+                let mut pool = ids(&mut allies());
+                dice.shuffle(&mut pool);
+                pool.truncate(*n as usize);
+                pool
+            }
+            Selector::OtherAllies => ids(&mut allies().filter(|o| o.id != source)),
+            Selector::FallenAllies(n) => {
+                // The most recently fallen first.
+                let fallen = self.units.iter().filter(|o| !o.alive && o.team == me.team && o.id != source);
+                take_sorted(fallen, *n, |o| std::cmp::Reverse(o.died_at.unwrap_or(0)))
+            }
+            Selector::EnemiesInLine { length } => {
+                let Some(aim) = current_target().map(|t| t.pos).filter(|p| *p != me.pos) else { return Vec::new() };
+                // The line from the source through its target, carried on.
+                let dist = me.pos.distance(aim);
+                let reach = length.div_ceil(dist).max(1) as i32;
+                let line = me.pos.line_to(me.pos.add(aim.sub(me.pos).scale(reach)));
+                let mut hit = Vec::new();
+                for hex in line.into_iter().skip(1).take(*length as usize) {
+                    if let Some(o) = self.unit_at(hex).map(|id| self.u(id)).filter(|o| o.is_targetable() && o.team != me.team) {
+                        hit.push(o.id);
+                    }
+                }
+                hit
+            }
+            Selector::EnemiesInCone { length } => {
+                let Some(aim) = current_target().map(|t| t.pos).filter(|p| *p != me.pos) else { return Vec::new() };
+                // Hex steps as flat vectors, scaled so the numbers stay whole:
+                // x = 2q + r, y = r * sqrt(3). The cone is 30 degrees to each
+                // side of the aim, so cos^2 >= 3/4.
+                let flat = |h: Hex| ((2 * h.q + h.r) as i64, h.r as i64);
+                let dot = |a: (i64, i64), b: (i64, i64)| a.0 * b.0 + 3 * a.1 * b.1;
+                let to_aim = flat(aim.sub(me.pos));
+                take_sorted(
+                    enemies().filter(|o| {
+                        let to = flat(o.pos.sub(me.pos));
+                        let d = dot(to, to_aim);
+                        me.pos.distance(o.pos) <= *length && d > 0 && 4 * d * d >= 3 * dot(to, to) * dot(to_aim, to_aim)
+                    }),
+                    u32::MAX,
+                    |o| me.pos.distance(o.pos),
+                )
+            }
+            Selector::AlliesInRow => {
+                let row = me.pos.to_offset().1;
+                ids(&mut allies().filter(|o| o.pos.to_offset().1 == row))
+            }
+            Selector::EnemyCluster { radius } => {
+                let around = |c: &CombatUnit| enemies().filter(|o| c.pos.distance(o.pos) <= *radius).count();
+                let center = enemies().min_by_key(|c| (std::cmp::Reverse(around(c)), me.pos.distance(c.pos), c.id));
+                match center {
+                    Some(c) => ids(&mut enemies().filter(|o| c.pos.distance(o.pos) <= *radius)),
+                    None => Vec::new(),
+                }
+            }
+            Selector::Chain { count, range } => {
+                let mut chain: Vec<UnitId> = Vec::new();
+                let mut last = current_target().filter(|t| t.team != me.team);
+                while let Some(at) = last {
+                    if chain.len() as u32 >= *count {
+                        break;
+                    }
+                    chain.push(at.id);
+                    last = enemies()
+                        .filter(|o| !chain.contains(&o.id) && at.pos.distance(o.pos) <= *range)
+                        .min_by_key(|o| (at.pos.distance(o.pos), o.id));
+                }
+                chain
+            }
+            Selector::Custom(name) => match self.custom_selectors.get(name) {
+                Some(hook) => {
+                    let mut picked = hook(&SelectContext { combat: self, source, other });
+                    picked.retain(|id| self.units.get(id.0 as usize).is_some_and(|u| u.alive));
+                    picked
+                }
+                None => Vec::new(),
+            },
         }
     }
 
@@ -903,6 +1572,7 @@ impl Combat {
                 ScaleBy::MissingHealth => (unit.stat(Stat::MaxHealth) - unit.health).max(0),
                 ScaleBy::Stacks(stack) => unit.stacks(stack) as i64,
                 ScaleBy::AlliesWithTag(tag) => self.allies_with_tag(unit.id, tag) as i64,
+                ScaleBy::Resource(resource) => unit.resource(resource),
             };
             total += value * s.permille / 1000;
         }
@@ -915,17 +1585,137 @@ impl Combat {
     fn apply_effect(&mut self, source: UnitId, target: UnitId, other: Option<UnitId>, effect: &Effect, direct: bool) {
         // Summons may be anchored on a unit that just died, and custom hooks
         // decide for themselves; everything else needs a living target.
-        if !self.u(target).alive && !matches!(effect, Effect::Summon { .. } | Effect::Custom { .. }) {
+        if !self.u(target).alive
+            && !matches!(
+                effect,
+                Effect::Summon { .. } | Effect::Custom { .. } | Effect::Revive { .. } | Effect::PlaceTile { .. } | Effect::Reward { .. }
+            )
+        {
             return;
         }
         match effect {
+            Effect::Reward { grant } => {
+                let team = self.u(target).team;
+                self.rewards.push((team, (**grant).clone()));
+                self.emit(EventKind::Rewarded { unit: target, team, grant: (**grant).clone() });
+            }
+            Effect::Grow { mods } => {
+                self.change_stats(target, mods, true);
+                self.growth.push((target, mods.clone()));
+                self.emit(EventKind::Grew { unit: target, mods: mods.clone() });
+            }
+            Effect::Transform { unit } => {
+                let Some(form) = self.library.get(unit).cloned() else {
+                    return;
+                };
+                let old = self.u(target).template.clone();
+                if old.id == *unit {
+                    return;
+                }
+                // What the unit was before items and traits, to tell what
+                // they added.
+                let plain = self.library.get(&old.id).cloned();
+                let plain_stats = plain.as_ref().map_or(&old.stats, |p| &p.stats);
+                let own_passives = plain.as_ref().map_or(old.passives.len(), |p| p.passives.len().min(old.passives.len()));
+                let mut mods: Vec<StatMod> = Stat::ALL
+                    .iter()
+                    .copied()
+                    .chain(form.stats.custom().map(|(s, _)| s))
+                    .chain(plain_stats.custom().map(|(s, _)| s))
+                    .map(|s| StatMod::flat(s, form.stats.get(s) - plain_stats.get(s)))
+                    .filter(|m| m.flat != 0)
+                    .collect();
+                mods.sort_by_key(|m| m.stat);
+                mods.dedup_by_key(|m| m.stat);
+                let mut template = (*form).clone();
+                template.id = unit.clone();
+                template.passives.extend(old.passives[own_passives..].iter().cloned());
+                template.tags = old.tags.clone();
+                let (health, most) = (self.u(target).health, self.u(target).stat(Stat::MaxHealth).max(1));
+                let changing = self.u_mut(target);
+                changing.passive_state = vec![PassiveState::default(); template.passives.len()];
+                changing.cooldowns = vec![0; template.abilities.len()];
+                changing.cast_remaining_ms = None;
+                changing.casting = 0;
+                changing.template = Arc::new(template);
+                self.change_stats(target, &mods, true);
+                // The same share of health in the new form.
+                let now_most = self.u(target).stat(Stat::MaxHealth).max(1);
+                let now = (health * now_most / most).clamp(1, now_most);
+                self.u_mut(target).health = now;
+                self.emit(EventKind::Transformed { unit: target, into: unit.clone(), name: form.name.clone() });
+                self.emit(EventKind::HealthSet { unit: target, health: now, max_health: now_most });
+            }
+            Effect::Copy { health_permille } => {
+                let template = self.u(target).template.clone();
+                let team = self.u(source).team;
+                let center = self.u(target).pos;
+                let reach = self.board.cols() + self.board.rows();
+                let Some(hex) = center.spiral(reach).into_iter().find(|hex| self.is_free(*hex)) else {
+                    return;
+                };
+                if let Ok(copy) = self.spawn(template, team, hex) {
+                    let most = self.u(copy).stat(Stat::MaxHealth).max(1);
+                    let health = (most * *health_permille as i64 / 1000).clamp(1, most);
+                    self.u_mut(copy).health = health;
+                    self.emit(EventKind::HealthSet { unit: copy, health, max_health: most });
+                }
+            }
+            Effect::Swap => {
+                if source == target || !self.u(source).alive {
+                    return;
+                }
+                let (a, b) = (self.u(source).pos, self.u(target).pos);
+                let (ia, ib) = (self.board.index(a).unwrap(), self.board.index(b).unwrap());
+                self.occupancy[ia] = Some(target);
+                self.occupancy[ib] = Some(source);
+                self.u_mut(source).pos = b;
+                self.u_mut(target).pos = a;
+                self.emit(EventKind::Displaced { unit: source, from: a, to: b });
+                self.emit(EventKind::Displaced { unit: target, from: b, to: a });
+                self.sync_tiles(source);
+                self.sync_tiles(target);
+            }
+            Effect::PlaceTile { tile, radius, duration_ms } => {
+                let center = self.u(target).pos;
+                for hex in center.spiral(*radius) {
+                    self.place_tile(tile, hex, Some(source), *duration_ms);
+                }
+            }
+            Effect::Revive { health } => {
+                if self.u(target).alive {
+                    return;
+                }
+                // Where it fell, or as close to there as there is room.
+                let fell = self.u(target).pos;
+                let reach = self.board.cols() + self.board.rows();
+                let Some(pos) = fell.spiral(reach).into_iter().find(|hex| self.is_free(*hex)) else {
+                    return;
+                };
+                let health = self.eval(health, source, target).clamp(1, self.u(target).stat(Stat::MaxHealth).max(1));
+                let idx = self.board.index(pos).unwrap();
+                self.occupancy[idx] = Some(target);
+                let unit = self.u_mut(target);
+                unit.alive = true;
+                unit.died_at = None;
+                unit.health = health;
+                unit.pos = pos;
+                unit.target = None;
+                self.emit(EventKind::Revived { unit: target, source, pos, health });
+                self.sync_tiles(target);
+            }
             Effect::Damage { amount, kind, can_crit } => {
                 let raw = self.eval(amount, source, target);
                 self.deal_damage(source, target, raw, *kind, *can_crit, direct);
             }
             Effect::Heal { amount } => {
                 let raw = self.eval(amount, source, target);
-                self.heal(source, target, raw);
+                if self.heal(source, target, raw) > 0 && direct {
+                    self.fire(target, Some(source), |t| matches!(t, Trigger::OnHealed));
+                }
+            }
+            Effect::Signal { name } => {
+                self.fire(target, Some(source), |t| matches!(t, Trigger::Signal(n) if n == name));
             }
             Effect::Shield { amount, duration_ms } => {
                 let value = self.eval(amount, source, target);
@@ -936,7 +1726,12 @@ impl Combat {
                     self.emit(EventKind::Shielded { source, target, amount: value });
                 }
             }
-            Effect::GainMana { amount } => self.add_mana(target, *amount),
+            Effect::GainResource { resource, amount } => {
+                if let Some(index) = self.resources.iter().position(|d| d.id == *resource) {
+                    let amount = self.eval(amount, source, target);
+                    self.add_resource(target, index, amount);
+                }
+            }
             Effect::ApplyStatus { status, duration_ms } => {
                 let t = self.u(target);
                 if status.is_debuff() && t.has_status(|s| matches!(s, StatusKind::Unstoppable)) {
@@ -1024,7 +1819,7 @@ impl Combat {
                     if remaining == 0 {
                         break;
                     }
-                    if self.board.contains(hex) && self.unit_at(hex).is_none() {
+                    if self.is_free(hex) {
                         let _ = self.spawn(template.clone(), team, hex);
                         remaining -= 1;
                     }
@@ -1123,22 +1918,20 @@ impl Combat {
             unit.health += after - before;
         }
         unit.health = unit.health.min(after);
-        unit.mana = unit.mana.min(unit.stats.get(Stat::MaxMana).max(0));
-    }
-
-    fn add_mana(&mut self, id: UnitId, amount: i64) {
-        let unit = self.u_mut(id);
-        let max = unit.stats.get(Stat::MaxMana);
-        if !unit.alive || max <= 0 || unit.cast_remaining_ms.is_some() {
-            return;
+        // A change of capacity is news for whoever draws the bar.
+        for index in 0..self.resources.len() {
+            if mods.iter().any(|m| m.stat == self.resources[index].max) {
+                let amount = self.u(id).resources[index];
+                self.set_resource(id, index, amount, true);
+            }
         }
-        unit.mana = (unit.mana + amount).clamp(0, max);
     }
 
-    fn heal(&mut self, source: UnitId, id: UnitId, amount: i64) {
+    /// Heals a unit and returns how much health it got back.
+    fn heal(&mut self, source: UnitId, id: UnitId, amount: i64) -> i64 {
         let unit = self.u_mut(id);
         if !unit.alive || amount <= 0 {
-            return;
+            return 0;
         }
         let wound = unit
             .statuses
@@ -1156,6 +1949,7 @@ impl Combat {
         if healed > 0 {
             self.emit(EventKind::Healed { source, target: id, amount: healed });
         }
+        healed
     }
 
     /// Runs the full damage pipeline: crit, amplification, resistance,
@@ -1176,12 +1970,16 @@ impl Combat {
         if self.u(target).has_status(|s| matches!(s, StatusKind::Invulnerable)) {
             return;
         }
+        // A kind with no rules behaves like true damage that shields soak.
+        let rules = self.config.damage_types.iter().find(|t| t.kind == kind);
+        let (resist, amp, reducible, shieldable) =
+            rules.map_or((None, None, false, true), |t| (t.resist, t.amp, t.reducible, t.shieldable));
         let (crit_chance, crit_damage, amp, lifesteal) = {
             let s = self.u(source);
             (
                 s.stat(Stat::CritChance),
                 s.stat(Stat::CritDamage),
-                s.stat(Stat::DamageAmp),
+                s.stat(Stat::DamageAmp) + amp.map_or(0, |stat| s.stat(stat)),
                 s.stat(Stat::Lifesteal),
             )
         };
@@ -1199,13 +1997,9 @@ impl Combat {
 
         let k = self.config.resist_constant.max(1);
         let t = self.u(target);
-        let resist = match kind {
-            DamageKind::Physical => t.stat(Stat::Armor),
-            DamageKind::Magic => t.stat(Stat::MagicResist),
-            DamageKind::True => 0,
-        };
+        let resist = resist.map_or(0, |stat| t.stat(stat));
         amount = amount * k / (k + resist);
-        if kind != DamageKind::True {
+        if reducible {
             let reduction = t.stat(Stat::DamageReduction).min(self.config.max_damage_reduction);
             amount = amount * (1000 - reduction) / 1000;
         }
@@ -1216,7 +2010,7 @@ impl Combat {
         // Shields soak damage first, oldest first.
         let unit = self.u_mut(target);
         let mut left = amount;
-        for shield in unit.shields.iter_mut() {
+        for shield in unit.shields.iter_mut().filter(|_| shieldable) {
             let soak = shield.amount.min(left);
             shield.amount -= soak;
             left -= soak;
@@ -1242,15 +2036,16 @@ impl Combat {
         if lifesteal > 0 && source != target {
             self.heal(source, source, amount * lifesteal / 1000);
         }
+        if source != target {
+            self.gain_resources(source, |_, def| def.from_damage_dealt.of(amount));
+        }
 
         if health <= 0 {
             self.kill(target, source);
             return;
         }
 
-        let mana = (amount * self.config.mana_per_damage_permille / 1000)
-            .min(self.config.mana_from_damage_cap);
-        self.add_mana(target, mana);
+        self.gain_resources(target, |_, def| def.from_damage_taken.of(amount));
         if direct {
             self.fire(target, Some(source), |t| matches!(t, Trigger::OnDamaged));
         }
@@ -1263,22 +2058,28 @@ impl Combat {
     fn kill(&mut self, id: UnitId, killer: UnitId) {
         let idx = self.board.index(self.u(id).pos).unwrap();
         self.occupancy[idx] = None;
+        let tick = self.tick;
         let unit = self.u_mut(id);
         unit.alive = false;
         unit.health = 0;
+        unit.died_at = Some(tick);
         unit.shields.clear();
         unit.statuses.clear();
         unit.cast_remaining_ms = None;
         let team = unit.team;
+        self.sync_tiles(id);
         self.emit(EventKind::Died { unit: id, killer });
         self.fire(id, Some(killer), |t| matches!(t, Trigger::OnDeath));
         if killer != id {
+            self.gain_resources(killer, |c, def| if def.per_kill.is_zero() { 0 } else { c.eval(&def.per_kill, killer, id) });
             self.fire(killer, Some(id), |t| matches!(t, Trigger::OnKill));
         }
         for i in 0..self.units.len() {
-            let ally = &self.units[i];
-            if ally.alive && ally.team == team {
-                self.fire(ally.id, Some(id), |t| matches!(t, Trigger::OnAllyDeath));
+            let other = &self.units[i];
+            if other.alive && other.team == team {
+                self.fire(other.id, Some(id), |t| matches!(t, Trigger::OnAllyDeath));
+            } else if other.alive {
+                self.fire(other.id, Some(id), |t| matches!(t, Trigger::OnEnemyDeath));
             }
         }
     }
@@ -1376,6 +2177,32 @@ impl EffectContext<'_> {
         }
         self.combat.displace(unit, to);
         true
+    }
+}
+
+/// What a [`CustomSelectorFn`] can see.
+pub struct SelectContext<'a> {
+    combat: &'a Combat,
+    source: UnitId,
+    other: Option<UnitId>,
+}
+
+impl SelectContext<'_> {
+    /// The unit producing the effect.
+    pub fn source(&self) -> UnitId {
+        self.source
+    }
+    /// The other unit in the triggering event, if any.
+    pub fn other(&self) -> Option<UnitId> {
+        self.other
+    }
+    pub fn combat(&self) -> &Combat {
+        self.combat
+    }
+    /// The fight's dice as they stand, to roll without moving them: the
+    /// same call gives the same rolls until the fight rolls again.
+    pub fn rng(&self) -> Rng {
+        self.combat.rng.clone().fork((self.combat.tick as u64) << 16 | self.source.0 as u64)
     }
 }
 

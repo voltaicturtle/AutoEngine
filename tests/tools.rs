@@ -25,6 +25,7 @@ fn the_checker_points_out_likely_mistakes() {
         name: "odd".into(),
         stage: 1,
         kind: RoundKindDef::Custom { kind: "nobody_wrote_this".into(), params: Default::default() },
+        tiles: Vec::new(),
     };
     let content = sample().with_schedule(Schedule { rounds: vec![custom], repeat_from: 0 }).unwrap();
     // An assets folder with no models in it.

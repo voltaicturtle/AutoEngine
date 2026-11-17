@@ -62,8 +62,8 @@ pub trait RoundType: Send {
 pub(crate) fn builtin(def: &RoundKindDef) -> Box<dyn RoundType> {
     match def {
         RoundKindDef::Pvp => Box::new(PvpRound),
-        RoundKindDef::Pve { enemies, gold, items } => {
-            Box::new(PveRound { enemies: enemies.clone(), gold: *gold, items: *items })
+        RoundKindDef::Pve { enemies, gold, items, rewards } => {
+            Box::new(PveRound { enemies: enemies.clone(), gold: *gold, items: *items, rewards: rewards.clone() })
         }
         RoundKindDef::Draft { extra, max_cost } => Box::new(DraftRound {
             extra: *extra,
@@ -73,7 +73,7 @@ pub(crate) fn builtin(def: &RoundKindDef) -> Box<dyn RoundType> {
             turn: 0,
         }),
         RoundKindDef::Choice { options, offer } => {
-            Box::new(ChoiceRound { count: *options, offer: *offer, offers: BTreeMap::new(), rerolled: BTreeMap::new() })
+            Box::new(ChoiceRound { count: *options, offer: offer.clone(), offers: BTreeMap::new(), rerolled: BTreeMap::new() })
         }
         RoundKindDef::Custom { .. } => unreachable!("custom rounds are built by their factory"),
     }
@@ -85,7 +85,8 @@ pub(crate) fn builtin(def: &RoundKindDef) -> Box<dyn RoundType> {
 /// left over. Lobbies of more than twelve are paired greedily instead.
 pub fn pair_up(game: &Game, players: &[PlayerId]) -> (Vec<(PlayerId, PlayerId)>, Option<PlayerId>) {
     type Pairs = Vec<(PlayerId, PlayerId)>;
-    let cost = |a: PlayerId, b: PlayerId| game.rematch_cost(a, b) + game.rematch_cost(b, a);
+    // Teammates fight each other only when there is nobody else.
+    let cost = |a: PlayerId, b: PlayerId| game.rematch_cost(a, b) + game.rematch_cost(b, a) + if game.teammates(a, b) { 1_000_000 } else { 0 };
 
     /// Every pairing of `left` (one may sit out if the count is odd).
     fn search(
@@ -165,7 +166,7 @@ impl RoundType for PvpRound {
         // With an odd number of players, the one left over fights a copy of
         // someone else's board.
         if let Some(odd) = &odd {
-            let others: Vec<PlayerId> = players.iter().copied().filter(|p| p != odd).collect();
+            let others: Vec<PlayerId> = players.iter().copied().filter(|p| p != odd && !game.teammates(*p, *odd)).collect();
             if others.is_empty() {
                 return;
             }
@@ -186,6 +187,7 @@ pub struct PveRound {
     enemies: Vec<BoardUnit>,
     gold: i64,
     items: u32,
+    rewards: Vec<crate::game::Grant>,
 }
 
 impl RoundType for PveRound {
@@ -200,6 +202,10 @@ impl RoundType for PveRound {
                 game.add_gold(player, self.gold);
                 for _ in 0..self.items {
                     game.give_random_component(player);
+                }
+                for reward in &self.rewards {
+                    // Checked when the content was built, so this cannot fail.
+                    let _ = game.give(player, reward);
                 }
             } else {
                 let damage = game.loss_damage(result.survivors);
@@ -317,23 +323,14 @@ pub struct ChoiceRound {
 impl ChoiceRound {
     /// Everything that could be offered to a player, before shuffling.
     fn candidates(&self, game: &Game, player: PlayerId) -> Vec<String> {
-        match self.offer {
-            ChoiceOffer::Augments => {
-                let owned = &game.player(player).augments;
-                game.content().augments().map(|a| a.id.clone()).filter(|a| !owned.contains(a)).collect()
-            }
-            ChoiceOffer::Items => game.content().items().map(|i| i.id.clone()).collect(),
-        }
+        game.choice_candidates(player, &self.offer)
     }
 
     fn grant(&mut self, game: &mut Game, player: PlayerId, option: usize) {
         let options = self.offers.remove(&player).expect("player has an offer");
         let choice = options[option].clone();
         game.emit(GameEvent::ChoiceMade { player, option, choice: choice.clone() });
-        match self.offer {
-            ChoiceOffer::Augments => game.give_augment(player, &choice),
-            ChoiceOffer::Items => game.give_item(player, &choice),
-        }
+        game.give_choice(player, &self.offer, &choice);
     }
 }
 
@@ -343,6 +340,8 @@ impl RoundType for ChoiceRound {
     }
 
     fn begin(&mut self, game: &mut Game) {
+        // One tier for everyone, where the round rolls for it.
+        self.offer = game.settle_offer(&self.offer);
         for player in game.alive() {
             let mut candidates = self.candidates(game, player);
             game.rng().shuffle(&mut candidates);
