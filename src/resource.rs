@@ -94,6 +94,10 @@ pub struct ResourceDef {
     /// so a long cast cannot fill the bar for the next one.
     #[serde(default)]
     pub changes_while_casting: bool,
+    /// How long after an ability paid with it goes off the unit gains none
+    /// of it, in milliseconds.
+    #[serde(default)]
+    pub lock_after_cast_ms: u32,
     /// The color of its bar, as red, green and blue. Front ends pick their
     /// own when there is none.
     #[serde(default)]
@@ -114,6 +118,7 @@ impl ResourceDef {
             per_kill: Amount::default(),
             per_second: Amount::default(),
             changes_while_casting: false,
+            lock_after_cast_ms: 0,
             color: None,
         }
     }
@@ -163,6 +168,13 @@ impl ResourceDef {
     /// A gain every second, or a drain when negative.
     pub fn per_second(mut self, amount: impl Into<Amount>) -> Self {
         self.per_second = amount.into();
+        self
+    }
+
+    /// Stops the unit gaining any of it for `ms` after an ability paid with
+    /// it goes off: a pause before the bar starts filling again.
+    pub fn lock_after_cast(mut self, ms: u32) -> Self {
+        self.lock_after_cast_ms = ms;
         self
     }
 

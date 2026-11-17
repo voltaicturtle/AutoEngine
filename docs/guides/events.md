@@ -79,6 +79,7 @@ or `game.drain_events()` (the ones since the last call).
 | `UnitGained` | `player`, `uid`, `unit` | a player got a unit: bought, drafted, granted or duplicated. `uid` identifies this copy for the rest of the game |
 | `UnitSold` | `player`, `uid`, `unit` | a unit was sold |
 | `UnitRemoved` | `player`, `uid`, `unit` | a unit was taken away without being sold (`Game::remove_unit`) |
+| `UnitGifted` | `from`, `to`, `uid`, `unit` | a player sent a unit to a [teammate](rules.md#teams) (`Command::Gift`) |
 | `UnitUpgraded` | `player`, `uid`, `unit`, `star` | copies merged. `uid` is the unit that was kept, and `star` its new star level |
 | `UnitMoved` | `player`, `uid`, `to` | a unit moved to a bench slot or a board place |
 | `ItemGained` | `player`, `item` | an item went into a player's inventory |
@@ -126,6 +127,10 @@ they appeared. `Spawned` says which unit each one is.
 | `Revived` | `unit`, `source`, `pos`, `health` | a dead unit is back, at `pos` with `health` |
 | `TilePlaced` | `tile`, `pos`, `team`, `duration_ms` | a [tile](tiles.md) is on a hex, newly laid or laid again. `team` is the side of whoever laid it, and `duration_ms` how long it has left |
 | `TileRemoved` | `tile`, `pos` | a tile is gone from a hex |
+| `Rewarded` | `unit`, `team`, `grant` | the player who owns the unit earned a grant to keep (`Effect::reward`). The game hands it over after the fight |
+| `Grew` | `unit`, `mods` | the unit's stats changed for good (`Effect::grow`) |
+| `Transformed` | `unit`, `into`, `name` | the unit turned into another (`Effect::transform`). `name` is what it is called now |
+| `HealthSet` | `unit`, `health`, `max_health` | the unit's health and most health were set outright: a copy that starts hurt, a new form |
 | `Ended` | `winner`, `timed_out` | the fight ended. `winner` is the team left standing, or `None` for a draw |
 
 `playback::fight_stats(&record.events)` adds these up into each unit's
@@ -147,9 +152,10 @@ one place.
 | `SetShopLock { locked }` | keeps the current offers for the next round |
 | `MoveUnit { uid, to }` | moves a unit to `Slot::Bench(i)` or `Slot::Board(col, row)`. If the place is taken, the two units swap |
 | `EquipItem { item, uid }` | gives item number `item` from the player's inventory to a unit, or uses it if it is single-use |
-| `Pick { option }` | picks an option the round offers |
+| `Pick { option }` | picks an option the round offers, or answers the player's oldest [pick of their own](perks.md#picks-of-a-players-own) once the round's pick is done |
 | `RerollPick` | swaps the round's options for new ones, where the round allows it |
 | `Action { id, arg }` | uses one of the game's own [actions](rules.md#actions). `arg` is the unit's `uid` for an action on a unit |
+| `Gift { uid, to }` | sends a unit, with its items, to a [teammate](rules.md#teams)'s bench |
 | `Ready` | done planning. A hosted game ends planning early when everyone is ready |
 | `Forfeit` | gives up. The player leaves when the round ends, placed below everyone else who goes out that round. This can't be undone |
 
@@ -180,6 +186,7 @@ one place.
 | `InvalidOption` | that option doesn't exist or is taken |
 | `NoRerollsLeft` | no rerolls of the options are left |
 | `UnknownRoundKind(kind)` | the schedule names a round kind nothing registered (from `begin_round`) |
+| `NotATeammate` | a gift to someone who is not a teammate still in the game |
 
 ## Grants
 
@@ -199,6 +206,15 @@ directly, because they run again on replay.
 | `Augment(id)` | an augment |
 | `Damage(n)` | takes health |
 | `Heal(n)` | gives health back, up to what players start with |
+| `Component` | a random component item |
+| `ItemTagged(tag)` | a random item with this [tag](items.md#itemdef-calls) |
+| `UnitOfCost(cost)` | a random unit of this cost, taken out of the pool |
+| `Rerolls(n)` | free rerolls |
+| `Loot(table)` | one roll on a [loot table](perks.md#loot-tables) |
+| `Choice { options, offer }` | a [pick of the player's own](perks.md#picks-of-a-players-own) of one out of `options` |
+
+The same grants are what [perks](perks.md), loot tables, PvE rewards,
+single-use items, actions and `Effect::reward` hand out.
 
 Every input that moves a game along (`Input::BeginRound`, `FinishRound`,
 accepted commands and grants) is recorded in `game.inputs()`.

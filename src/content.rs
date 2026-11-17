@@ -51,6 +51,7 @@ use crate::effect::{
 use crate::resource::ResourceDef;
 use crate::hex::{Hex, HexBoard};
 use crate::stats::{Stat, StatBlock, StatMod};
+use crate::perk::{LootTable, Perk, RuleMod};
 use crate::tile::{TileDef, TilePlacement};
 
 fn default_true() -> bool {
@@ -95,6 +96,13 @@ pub struct UnitDef {
     /// `GameRules::pool_sizes` gives units of its cost.
     #[serde(default)]
     pub pool_size: Option<u32>,
+    /// How many of the board's team slots it takes. Most units take 1.
+    #[serde(default = "one")]
+    pub team_slots: u32,
+}
+
+fn one() -> u32 {
+    1
 }
 
 fn physical() -> DamageKind {
@@ -137,6 +145,7 @@ impl UnitDef {
             targeting: crate::effect::Targeting::Nearest,
             attack_kind: DamageKind::Physical,
             pool_size: None,
+            team_slots: 1,
         }
     }
 
@@ -200,6 +209,13 @@ impl UnitDef {
     /// Keeps the unit out of shops, e.g. for units that are only summoned.
     pub fn summon_only(mut self) -> Self {
         self.in_shop = false;
+        self
+    }
+
+    /// Makes the unit take this many of the board's team slots: a huge
+    /// unit that counts as two.
+    pub fn team_slots(mut self, slots: u32) -> Self {
+        self.team_slots = slots;
         self
     }
 
@@ -274,10 +290,29 @@ impl Bonus {
 
 /// One tier of a trait: active when at least `count` distinct members are on
 /// the board. Only the highest tier reached applies.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Breakpoint {
     pub count: u32,
     pub bonuses: Vec<Bonus>,
+    /// Active only with exactly `count` members, not with more: a trait
+    /// that rewards fielding a single member.
+    #[serde(default)]
+    pub exactly: bool,
+    /// Things the player gets on occasions while the tier is active; see
+    /// [`crate::perk`].
+    #[serde(default)]
+    pub perks: Vec<Perk>,
+    /// Rules that change for the player while the tier is active.
+    #[serde(default)]
+    pub rules: Vec<RuleMod>,
+}
+
+impl Breakpoint {
+    /// Whether this tier is the one a board with `count` members has, given
+    /// the trait's tiers in order.
+    fn reached(&self, count: u32) -> bool {
+        if self.exactly { self.count == count } else { self.count <= count }
+    }
 }
 
 /// A trait (synergy) definition.
@@ -303,8 +338,34 @@ impl TraitDef {
     /// Adds a tier that is active from `count` distinct members. Tiers must
     /// be added in increasing order.
     pub fn breakpoint(mut self, count: u32, bonuses: impl IntoIterator<Item = Bonus>) -> Self {
-        self.breakpoints.push(Breakpoint { count, bonuses: bonuses.into_iter().collect() });
+        self.breakpoints.push(Breakpoint { count, bonuses: bonuses.into_iter().collect(), ..Breakpoint::default() });
         self
+    }
+
+    /// Adds a tier that is active with exactly `count` members and no
+    /// more.
+    pub fn breakpoint_exactly(mut self, count: u32, bonuses: impl IntoIterator<Item = Bonus>) -> Self {
+        self.breakpoints.push(Breakpoint { count, bonuses: bonuses.into_iter().collect(), exactly: true, ..Breakpoint::default() });
+        self
+    }
+
+    /// Adds a [perk](crate::perk) to the tier added last: something the
+    /// player gets on an occasion while that tier is active.
+    pub fn perk(mut self, perk: Perk) -> Self {
+        self.breakpoints.last_mut().expect("add a breakpoint before its perks").perks.push(perk);
+        self
+    }
+
+    /// Changes a rule for the player while the tier added last is active.
+    pub fn rule(mut self, rule: RuleMod) -> Self {
+        self.breakpoints.last_mut().expect("add a breakpoint before its rules").rules.push(rule);
+        self
+    }
+
+    /// The tier a board with `count` members has, if any: the last one
+    /// reached.
+    pub fn tier(&self, count: u32) -> Option<usize> {
+        self.breakpoints.iter().rposition(|b| b.reached(count))
     }
 }
 
@@ -333,6 +394,21 @@ pub struct ItemDef {
     /// A unit can hold only one of it.
     #[serde(default)]
     pub unique: bool,
+    /// Labels a game sorts its items by: `"artifact"`, `"emblem"`. Choices
+    /// and grants can ask for items with a tag.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Things the player gets on occasions while a unit on the board holds
+    /// the item; see [`crate::perk`].
+    #[serde(default)]
+    pub perks: Vec<Perk>,
+    /// Rules that change for the player while a unit on the board holds
+    /// the item.
+    #[serde(default)]
+    pub rules: Vec<RuleMod>,
+    /// The item a [`Consumable::Upgrade`] turns this one into.
+    #[serde(default)]
+    pub upgrades_to: Option<String>,
 }
 
 /// What a single-use item does when it is given to a unit.
@@ -350,6 +426,9 @@ pub enum Consumable {
     /// Anything a [`Grant`] can hand the player: a currency, experience,
     /// health, an item, an augment. The unit does not matter.
     Give(Grant),
+    /// Turns one item the unit holds into its better version
+    /// ([`ItemDef::upgrades_to`]): the first one that has one.
+    Upgrade,
 }
 
 impl ItemDef {
@@ -364,6 +443,10 @@ impl ItemDef {
             recipe: None,
             consumable: None,
             unique: false,
+            tags: Vec::new(),
+            perks: Vec::new(),
+            rules: Vec::new(),
+            upgrades_to: None,
         }
     }
 
@@ -376,6 +459,33 @@ impl ItemDef {
     /// Lets a unit hold only one of this item.
     pub fn unique(mut self) -> Self {
         self.unique = true;
+        self
+    }
+
+    /// Adds a label choices and grants can ask for.
+    pub fn tag(mut self, tag: impl Into<String>) -> Self {
+        self.tags.push(tag.into());
+        self
+    }
+
+    /// Adds a [perk](crate::perk) the player has while a unit on the board
+    /// holds the item.
+    pub fn perk(mut self, perk: Perk) -> Self {
+        self.perks.push(perk);
+        self
+    }
+
+    /// Changes a rule for the player while a unit on the board holds the
+    /// item.
+    pub fn rule(mut self, rule: RuleMod) -> Self {
+        self.rules.push(rule);
+        self
+    }
+
+    /// Names the better version a [`Consumable::Upgrade`] turns this item
+    /// into.
+    pub fn upgrades_to(mut self, id: impl Into<String>) -> Self {
+        self.upgrades_to = Some(id.into());
         self
     }
 
@@ -686,6 +796,57 @@ pub struct GameRules {
     pub sell_refund_permille: u32,
     /// Things players can do during planning besides the built-in commands.
     pub actions: Vec<ActionDef>,
+    /// Weighted lists of things to hand out; see [`crate::perk::LootTable`].
+    pub loot: Vec<LootTable>,
+    /// Players per team. With more than 1, seats are split into teams in
+    /// order (seats 0 and 1 together, then 2 and 3, and so on): teammates
+    /// share their health, never fight each other, can send each other
+    /// units with `Command::Gift`, and place together.
+    pub team_size: u32,
+    /// Shop offers that come with something extra; see [`ShopSpecial`].
+    pub shop_specials: Vec<ShopSpecial>,
+}
+
+/// A chance for a shop offer to come with something extra: a higher star
+/// level, or a trait the unit does not have. It costs what the copies it
+/// stands for cost, and takes them out of the pool.
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShopSpecial {
+    /// How often an offer becomes this special, out of 1000.
+    pub chance_permille: u32,
+    /// The player's lowest level for it to show up.
+    pub min_level: u32,
+    /// The star level of the offer. 0 and 1 leave it at 1 star.
+    pub star: u8,
+    /// Ids of traits one of which the offer gets, picked at random among
+    /// those the unit does not already have. Empty for none.
+    pub traits: Vec<String>,
+}
+
+impl ShopSpecial {
+    /// A special that shows up `chance_permille` times out of 1000.
+    pub fn new(chance_permille: u32) -> Self {
+        ShopSpecial { chance_permille, ..ShopSpecial::default() }
+    }
+
+    /// Only from this player level on.
+    pub fn from_level(mut self, level: u32) -> Self {
+        self.min_level = level;
+        self
+    }
+
+    /// Offers the unit at a higher star level.
+    pub fn star(mut self, star: u8) -> Self {
+        self.star = star;
+        self
+    }
+
+    /// Gives the offer one of these traits.
+    pub fn with_trait_from<S: Into<String>>(mut self, traits: impl IntoIterator<Item = S>) -> Self {
+        self.traits.extend(traits.into_iter().map(Into::into));
+        self
+    }
 }
 
 impl Default for GameRules {
@@ -740,6 +901,9 @@ impl Default for GameRules {
             currencies: Vec::new(),
             sell_refund_permille: 1000,
             actions: Vec::new(),
+            loot: Vec::new(),
+            team_size: 1,
+            shop_specials: Vec::new(),
         }
     }
 }
@@ -778,6 +942,16 @@ pub struct AugmentDef {
     /// Given to the holder at the start of every round after it is picked.
     #[serde(default)]
     pub per_round: RoundGrant,
+    /// How strong it is, for choices that offer one tier at a time. 0 for
+    /// games that do not sort their augments.
+    #[serde(default)]
+    pub tier: u32,
+    /// Things the holder gets on occasions; see [`crate::perk`].
+    #[serde(default)]
+    pub perks: Vec<Perk>,
+    /// Rules that change for the holder.
+    #[serde(default)]
+    pub rules: Vec<RuleMod>,
 }
 
 /// Things an augment hands out every round.
@@ -806,11 +980,25 @@ impl RoundGrant {
 }
 
 /// What a choice round offers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ChoiceOffer {
+    /// Augments the player does not have yet, of any tier.
     #[default]
     Augments,
+    /// Any item.
     Items,
+    /// Augments of one [tier](AugmentDef::tier).
+    AugmentsOfTier(u32),
+    /// Augments of one tier, rolled once for everyone: `(tier, weight)`
+    /// pairs. Every player of a round is offered the same tier.
+    AugmentTiers(Vec<(u32, u32)>),
+    /// Items with a [tag](ItemDef::tag).
+    ItemsTagged(String),
+    /// Component items: the ones not made from others and not used up.
+    Components,
+    /// Units of one cost that the shared pool still has. The pick comes
+    /// out of the pool.
+    Units { cost: u32 },
 }
 
 /// The kind of a round and its settings. The built-in kinds cover fights and
@@ -914,6 +1102,9 @@ impl AugmentDef {
             bonuses: Vec::new(),
             gold: 0,
             per_round: RoundGrant::default(),
+            tier: 0,
+            perks: Vec::new(),
+            rules: Vec::new(),
         }
     }
 
@@ -937,6 +1128,25 @@ impl AugmentDef {
     /// `RoundGrant { gold: 2, ..Default::default() }`.
     pub fn per_round(mut self, grant: RoundGrant) -> Self {
         self.per_round = grant;
+        self
+    }
+
+    /// Sorts it into a tier, for [`ChoiceOffer::AugmentsOfTier`].
+    pub fn tier(mut self, tier: u32) -> Self {
+        self.tier = tier;
+        self
+    }
+
+    /// Adds a [perk](crate::perk): something the holder gets on an
+    /// occasion. `Perk::on(When::Gained)` happens once, when it is picked.
+    pub fn perk(mut self, perk: Perk) -> Self {
+        self.perks.push(perk);
+        self
+    }
+
+    /// Changes a rule for the holder: `Rule::TeamSize.add(1)`.
+    pub fn rule(mut self, rule: RuleMod) -> Self {
+        self.rules.push(rule);
         self
     }
 }
@@ -1057,12 +1267,31 @@ pub struct BoardUnit {
     pub items: Vec<String>,
     /// `(column, row)` on the board, from the owning player's point of view.
     pub pos: (i32, i32),
+    /// Stat changes this one unit has earned for good (see
+    /// [`Effect::grow`](crate::effect::Effect::grow)).
+    #[serde(default)]
+    pub growth: Vec<StatMod>,
+    /// Traits this one unit counts as having besides its own.
+    #[serde(default)]
+    pub traits: Vec<String>,
 }
 
 impl BoardUnit {
     /// A one-star unit with no items at `(column, row)`.
     pub fn new(unit: impl Into<String>, pos: (i32, i32)) -> Self {
-        BoardUnit { unit: unit.into(), star: 1, items: Vec::new(), pos }
+        BoardUnit { unit: unit.into(), star: 1, items: Vec::new(), pos, growth: Vec::new(), traits: Vec::new() }
+    }
+
+    /// Adds stat changes the unit has earned for good.
+    pub fn growth(mut self, mods: impl IntoIterator<Item = StatMod>) -> Self {
+        self.growth.extend(mods);
+        self
+    }
+
+    /// Makes this one unit count as having another trait.
+    pub fn with_trait(mut self, id: impl Into<String>) -> Self {
+        self.traits.push(id.into());
+        self
     }
 
     pub fn star(mut self, star: u8) -> Self {
@@ -1320,6 +1549,20 @@ impl GameBuilder {
         self
     }
 
+    /// Adds a chance for shop offers to come with something extra (see
+    /// [`ShopSpecial`]).
+    pub fn shop_special(mut self, special: ShopSpecial) -> Self {
+        self.rules.shop_specials.push(special);
+        self
+    }
+
+    /// Splits players into teams of this many (see
+    /// [`GameRules::team_size`]).
+    pub fn team_size(mut self, players: u32) -> Self {
+        self.rules.team_size = players;
+        self
+    }
+
     /// Stat modifiers for each star level, starting at one star.
     pub fn star_levels<L: IntoIterator<Item = StatMod>>(mut self, levels: impl IntoIterator<Item = L>) -> Self {
         self.rules = self.rules.star_levels(levels);
@@ -1400,6 +1643,17 @@ impl GameBuilder {
     pub fn tiles(mut self, defs: impl IntoIterator<Item = TileDef>) -> Self {
         for def in defs {
             self = self.tile(def);
+        }
+        self
+    }
+
+    /// Adds a [loot table](LootTable), or replaces the one with the same
+    /// id.
+    pub fn loot(mut self, table: LootTable) -> Self {
+        let tables = &mut self.rules.loot;
+        match tables.iter_mut().find(|t| t.id == table.id) {
+            Some(existing) => *existing = table,
+            None => tables.push(table),
         }
         self
     }
@@ -1928,6 +2182,28 @@ impl ContentSet {
             }
         }
         let currency_ids = || -> Vec<String> { std::iter::once("gold".to_string()).chain(r.currencies.iter().map(|c| c.id.clone())).collect() };
+        // A pick has to have something it could offer.
+        let check_offer = |owner: &str, offer: &ChoiceOffer| {
+            let has_tier = |tier: u32| self.augments.values().any(|a| a.tier == tier);
+            match offer {
+                ChoiceOffer::AugmentsOfTier(tier) if !has_tier(*tier) => invalid(format!("{owner} offers augments of tier {tier}, but no augment has that tier")),
+                ChoiceOffer::AugmentTiers(tiers) if tiers.iter().map(|(_, w)| *w as u64).sum::<u64>() == 0 => {
+                    invalid(format!("{owner} rolls for an augment tier, but no tier has a weight above 0"))
+                }
+                ChoiceOffer::AugmentTiers(tiers) => match tiers.iter().find(|(tier, weight)| *weight > 0 && !has_tier(*tier)) {
+                    Some((tier, _)) => invalid(format!("{owner} can roll augment tier {tier}, but no augment has that tier")),
+                    None => Ok(()),
+                },
+                ChoiceOffer::ItemsTagged(tag) if !self.items.values().any(|i| i.tags.contains(tag)) => {
+                    let known: BTreeSet<&String> = self.items.values().flat_map(|i| &i.tags).collect();
+                    invalid(format!("{owner} offers items tagged `{tag}`, but no item has that tag{}", suggestion(tag, known.into_iter())))
+                }
+                ChoiceOffer::Units { cost } if !self.units.values().any(|u| u.in_shop && u.cost == *cost) => {
+                    invalid(format!("{owner} offers units of cost {cost}, but no shop unit costs that"))
+                }
+                _ => Ok(()),
+            }
+        };
         // Whatever hands out a grant must name things that exist.
         let check_grant = |owner: &str, grant: &Grant| {
             match grant {
@@ -1944,10 +2220,80 @@ impl ContentSet {
                     let known = currency_ids();
                     return invalid(format!("{owner} gives unknown currency `{currency}`{}", suggestion(currency, known.iter())));
                 }
+                Grant::Loot(id) if self.loot(id).is_none() => {
+                    let known: Vec<&String> = r.loot.iter().map(|t| &t.id).collect();
+                    return invalid(format!("{owner} rolls on unknown loot table `{id}`{}", suggestion(id, known.into_iter())));
+                }
+                Grant::ItemTagged(tag) if !self.items.values().any(|i| i.tags.contains(tag)) => {
+                    let known: BTreeSet<&String> = self.items.values().flat_map(|i| &i.tags).collect();
+                    return invalid(format!("{owner} gives an item tagged `{tag}`, but no item has that tag{}", suggestion(tag, known.into_iter())));
+                }
+                Grant::Choice { options: 0, .. } => return invalid(format!("{owner} opens a pick with no options")),
+                Grant::Choice { offer, .. } => check_offer(owner, offer)?,
                 _ => {}
             }
             Ok(())
         };
+        if r.team_size == 0 {
+            return invalid("rules have a team size of 0; it must be at least 1".into());
+        }
+        for special in &r.shop_specials {
+            if special.star as usize > r.star_levels.len() {
+                return invalid(format!("a shop special offers {} star units, but rules define levels 1 to {}", special.star, r.star_levels.len()));
+            }
+            for t in &special.traits {
+                if !self.traits.contains_key(t) {
+                    return invalid(format!("a shop special gives unknown trait `{t}`{}", suggestion(t, self.traits.keys())));
+                }
+            }
+        }
+        for (i, table) in r.loot.iter().enumerate() {
+            if table.id.is_empty() {
+                return invalid("a loot table needs an id".into());
+            }
+            if r.loot[..i].iter().any(|t| t.id == table.id) {
+                return invalid(format!("duplicate loot table id `{}`", table.id));
+            }
+            if table.entries.iter().map(|e| e.weight as u64).sum::<u64>() == 0 {
+                return invalid(format!("loot table `{}` has nothing with a weight above 0, so it never gives anything", table.id));
+            }
+            for grant in table.entries.iter().flat_map(|e| &e.gives) {
+                check_grant(&format!("loot table `{}`", table.id), grant)?;
+            }
+        }
+        // Perks hand out grants too, wherever they sit.
+        let check_perks = |owner: &str, perks: &[Perk]| {
+            for grant in perks.iter().flat_map(|p| &p.gives) {
+                check_grant(owner, grant)?;
+            }
+            Ok(())
+        };
+        for augment in self.augments.values() {
+            check_perks(&format!("augment `{}`", augment.id), &augment.perks)?;
+        }
+        for def in self.traits.values() {
+            for tier in &def.breakpoints {
+                check_perks(&format!("trait `{}`", def.id), &tier.perks)?;
+            }
+        }
+        for item in self.items.values() {
+            check_perks(&format!("item `{}`", item.id), &item.perks)?;
+            if let Some(better) = &item.upgrades_to {
+                if !self.items.contains_key(better) {
+                    return invalid(format!("item `{}` upgrades to unknown item `{better}`{}", item.id, suggestion(better, self.items.keys())));
+                }
+            }
+        }
+        for unit in self.units.values() {
+            if unit.team_slots == 0 {
+                return invalid(format!("unit `{}` takes 0 team slots; every unit takes at least 1", unit.id));
+            }
+        }
+        for round in &self.schedule.rounds {
+            if let RoundKindDef::Choice { offer, .. } = &round.kind {
+                check_offer(&format!("round `{}`", round.name), offer)?;
+            }
+        }
         for round in &self.schedule.rounds {
             if let RoundKindDef::Pve { rewards, .. } = &round.kind {
                 for grant in rewards {
@@ -2109,6 +2455,13 @@ impl ContentSet {
                         return invalid(format!("{owner} uses unregistered custom effect `{name}`"));
                     }
                     Effect::PlaceTile { tile, .. } => check_tile(owner, tile)?,
+                    Effect::Transform { unit } if !self.units.contains_key(unit) => {
+                        return invalid(format!("{owner} transforms into unknown unit `{unit}`{}", suggestion(unit, self.units.keys())));
+                    }
+                    Effect::Reward { grant } => check_grant(owner, grant)?,
+                    Effect::Grow { mods } if mods.is_empty() => {
+                        return invalid(format!("{owner} grows a unit by nothing: give `Effect::grow` some stat changes"));
+                    }
                     _ => {}
                 }
             }
@@ -2272,6 +2625,15 @@ impl ContentSet {
         self.tiles().iter().find(|t| t.id == id)
     }
 
+    /// The game's [loot tables](LootTable).
+    pub fn loot_tables(&self) -> &[LootTable] {
+        &self.rules.loot
+    }
+
+    pub fn loot(&self, id: &str) -> Option<&LootTable> {
+        self.loot_tables().iter().find(|t| t.id == id)
+    }
+
     /// What players can do during planning besides the built-in commands.
     pub fn actions(&self) -> &[ActionDef] {
         &self.rules.actions
@@ -2375,6 +2737,42 @@ impl ContentSet {
         out
     }
 
+    /// Every [grant](Grant) the content hands out, with what hands it out:
+    /// round rewards, single-use items, actions, perks, loot tables and
+    /// `Effect::reward`. For tools; picks a grant opens are not followed.
+    pub fn grants(&self) -> Vec<(String, &Grant)> {
+        let mut out: Vec<(String, &Grant)> = Vec::new();
+        for round in &self.schedule.rounds {
+            if let RoundKindDef::Pve { rewards, .. } = &round.kind {
+                out.extend(rewards.iter().map(|g| (format!("round {}", round.name), g)));
+            }
+        }
+        for item in self.items.values() {
+            if let Some(Consumable::Give(g)) = &item.consumable {
+                out.push((format!("item {}", item.id), g));
+            }
+            out.extend(item.perks.iter().flat_map(|p| &p.gives).map(|g| (format!("item {}", item.id), g)));
+        }
+        for action in &self.rules.actions {
+            out.extend(action.gives.iter().map(|g| (format!("action {}", action.id), g)));
+        }
+        for augment in self.augments.values() {
+            out.extend(augment.perks.iter().flat_map(|p| &p.gives).map(|g| (format!("augment {}", augment.id), g)));
+        }
+        for t in self.traits.values() {
+            out.extend(t.breakpoints.iter().flat_map(|b| &b.perks).flat_map(|p| &p.gives).map(|g| (format!("trait {}", t.id), g)));
+        }
+        for table in &self.rules.loot {
+            out.extend(table.entries.iter().flat_map(|e| &e.gives).map(|g| (format!("loot table {}", table.id), g)));
+        }
+        for (owner, spec) in self.effects() {
+            if let Effect::Reward { grant } = &spec.effect {
+                out.push((owner, grant));
+            }
+        }
+        out
+    }
+
     // ----- building teams -------------------------------------------------
 
     fn unit_def(&self, id: &str) -> Result<&UnitDef, ContentError> {
@@ -2391,6 +2789,15 @@ impl ContentSet {
         let mut out: BTreeSet<&str> = self.unit_def(&unit.unit)?.traits.iter().map(String::as_str).collect();
         for item in &unit.items {
             out.extend(self.item_def(item)?.grants_traits.iter().map(String::as_str));
+        }
+        for extra in &unit.traits {
+            // The set borrows the trait's own id, not the board unit's copy.
+            match self.traits.get_key_value(extra) {
+                Some((id, _)) => out.insert(id.as_str()),
+                None => {
+                    return invalid(format!("unit `{}` is given unknown trait `{extra}`{}", unit.unit, suggestion(extra, self.traits.keys())));
+                }
+            };
         }
         Ok(out)
     }
@@ -2410,7 +2817,7 @@ impl ContentSet {
             .map(|(id, who)| {
                 let count = who.len() as u32;
                 let breakpoints = &self.traits[id].breakpoints;
-                let tier = breakpoints.iter().rposition(|b| b.count <= count);
+                let tier = self.traits[id].tier(count);
                 let next_at = breakpoints.iter().map(|b| b.count).find(|c| *c > count);
                 ActiveTrait { id: id.to_string(), count, tier, next_at }
             })
@@ -2485,7 +2892,7 @@ impl ContentSet {
             }
             let mut template = self.base_template(&unit.unit, unit.star)?;
             let traits = self.traits_of(unit)?;
-            let mut mods: Vec<StatMod> = Vec::new();
+            let mut mods: Vec<StatMod> = unit.growth.clone();
             for item in &unit.items {
                 let item = self.item_def(item)?;
                 mods.extend(&item.mods);

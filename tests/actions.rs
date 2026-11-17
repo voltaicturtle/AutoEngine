@@ -222,7 +222,15 @@ fn bots_spend_currencies_that_have_no_other_use() {
         used += g.drain_events().iter().filter(|e| matches!(e, GameEvent::ActionUsed { action, .. } if action == "petition")).count();
     }
     assert!(used > 0, "favor should have been spent on petitions");
-    assert!(g.players().iter().all(|p| p.wallet["favor"] < 3 || !p.alive));
+    // Fights hand out favor too (lost fights with two tide units, loot
+    // from monsters), so check right after the bots' own turns.
+    if !g.is_over() {
+        g.begin_round().unwrap();
+        for id in g.alive() {
+            bot::play_turn_as(&mut g, id, &mut rng, Difficulty::Hard);
+        }
+        assert!(g.players().iter().all(|p| p.wallet["favor"] < 3 || !p.alive));
+    }
 }
 
 #[test]

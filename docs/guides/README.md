@@ -11,6 +11,7 @@ changes.
 | [Effects](effects.md) | what abilities, passives, traits and items can do: effects, amounts, selectors, triggers, conditions, statuses, stacks, Rust hooks |
 | [Resources](resources.md) | mana and resources of your own (rage, energy and so on), ability costs and cooldowns, custom stats |
 | [Damage types](damage.md) | physical, magic and true damage, and damage types of your own with their own resistances |
+| [Perks and loot](perks.md) | what augments, traits and items hand out and when, rules they bend, loot tables, picks of a player's own, what units earn in fights, teams and special shop offers |
 | [Tiles](tiles.md) | effects that belong to a hex: burning ground, shrines, blocked hexes, laid by abilities or by rounds |
 | [Traits](traits.md) | `TraitDef`: breakpoints and bonuses |
 | [Items](items.md) | `ItemDef`: stats, passives, recipes, granted traits, single-use items |

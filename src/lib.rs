@@ -13,7 +13,7 @@
 //! use autoengine::prelude::*;
 //!
 //! let content = autoengine::sample::content();
-//! let unit = |id: &str, pos| BoardUnit { unit: id.into(), star: 1, items: vec![], pos };
+//! let unit = |id: &str, pos| BoardUnit::new(id, pos);
 //! let home = TeamSetup { units: vec![unit("ironbark_warden", (3, 4))], bonuses: vec![] };
 //! let away = TeamSetup { units: vec![unit("ashen_hound", (3, 4))], bonuses: vec![] };
 //!
@@ -77,6 +77,7 @@ pub mod matchlog;
 pub mod name;
 pub mod net;
 pub mod playback;
+pub mod perk;
 pub mod protocol;
 pub mod replay;
 pub mod resource;
@@ -121,6 +122,8 @@ mod guides {
     struct Damage;
     #[doc = include_str!("../docs/guides/tiles.md")]
     struct Tiles;
+    #[doc = include_str!("../docs/guides/perks.md")]
+    struct Perks;
     #[doc = include_str!("../docs/guides/traits.md")]
     struct Traits;
     #[doc = include_str!("../docs/guides/items.md")]

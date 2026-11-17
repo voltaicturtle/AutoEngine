@@ -301,8 +301,19 @@ impl Playback {
                     u.resources.retain(|r| r.max > 0);
                 }
             }
+            EventKind::Transformed { unit, name, .. } => {
+                if let Some(u) = self.units.get_mut(&unit) {
+                    u.name = name;
+                }
+            }
+            EventKind::HealthSet { unit, health, max_health } => {
+                if let Some(u) = self.units.get_mut(&unit) {
+                    u.health = health;
+                    u.max_health = max_health;
+                }
+            }
             EventKind::Ended { .. } => self.ended = true,
-            EventKind::PassiveTriggered { .. } => {}
+            EventKind::PassiveTriggered { .. } | EventKind::Rewarded { .. } | EventKind::Grew { .. } => {}
         }
     }
 

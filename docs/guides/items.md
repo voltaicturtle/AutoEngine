@@ -48,6 +48,10 @@ assert_eq!(content.combine_items("ember_core", "whetstone").unwrap().id, "cinder
 | `.recipe(a, b)` | the two items that combine into this one. Order doesn't matter, and `a` and `b` may be the same item |
 | `.unique()` | a unit can hold only one of it |
 | `.consumable(Consumable)` | makes the item single-use (see below) |
+| `.tag(name)` | a tag of your own, such as `"emblem"` or `"radiant"`. `Grant::ItemTagged` and `ChoiceOffer::ItemsTagged` hand out items by tag |
+| `.upgrades_to(id)` | the stronger item `Consumable::Upgrade` turns this one into |
+| `.perk(Perk)` | grants the player gets, when something happens, while a unit on the board holds it. See [Perks](perks.md#perks) |
+| `.rule(RuleMod)` | changes a rule for the player while a unit on the board holds it, such as `Rule::TeamSize.add(1)`. See [Rules a player can bend](perks.md#rules-a-player-can-bend) |
 
 ## Components and recipes
 
@@ -76,6 +80,7 @@ Giving a single-use item to a unit uses it up instead of equipping it:
 | `Duplicate` | gives the player another one-star copy of the unit, from the pool |
 | `Reforge` | swaps each of the unit's items for a random other item of the same kind: components for components, finished items for finished items |
 | `Gold(n)` | gives `n` gold. Which unit it is given to doesn't matter |
+| `Upgrade` | turns the unit's first item that has an `upgrades_to` into that item |
 | `Give(Grant)` | hands the player anything a [grant](events.md#grants) can: a currency, experience, health, an item, an augment. Which unit it is given to doesn't matter |
 
 If it can't do anything, the item is kept and the command fails with

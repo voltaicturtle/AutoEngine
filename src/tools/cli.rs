@@ -634,6 +634,13 @@ fn print_log(combat: &Combat) {
             EventKind::Revived { unit, health, .. } => {
                 format!("{} gets back up with {health} health", label(*unit))
             }
+            EventKind::Rewarded { unit, grant, .. } => format!("{} earns its player {grant}", label(*unit)),
+            EventKind::Grew { unit, mods } => {
+                let what: Vec<String> = mods.iter().map(|m| format!("{:+} {}", if m.flat != 0 { m.flat } else { m.permille / 10 }, m.stat.name())).collect();
+                format!("{} grows for good: {}", label(*unit), what.join(", "))
+            }
+            EventKind::Transformed { unit, name, .. } => format!("{} turns into {name}", label(*unit)),
+            EventKind::HealthSet { unit, health, max_health } => format!("{} is at {health} of {max_health} health", label(*unit)),
             EventKind::Ended { winner, timed_out } => match (winner, timed_out) {
                 (Some(team), _) => format!("Team {} wins", team.0),
                 (None, true) => "Time ran out: draw".to_string(),

@@ -103,16 +103,20 @@ impl Hex {
         if n == 0 {
             return vec![self];
         }
-        // Work in cube coordinates scaled by 2n, nudged by a tiny fixed
-        // epsilon (1 unit in the scaled space) to break ties consistently.
+        // Work in cube coordinates scaled by n * SCALE, nudged by a tiny
+        // fixed epsilon (1 unit in the scaled space, a millionth of a hex)
+        // to break ties consistently. The epsilon has to stay small next to
+        // a hex at every length: scaled by 2n alone it was half a hex on a
+        // line one hex long, which put the end on the wrong hex.
+        const SCALE: i64 = 1_000_000;
         let (aq, ar, as_) = (self.q as i64, self.r as i64, self.s() as i64);
         let (bq, br, bs) = (other.q as i64, other.r as i64, other.s() as i64);
-        let denom = 2 * n;
+        let denom = n * SCALE;
         (0..=n)
             .map(|i| {
-                let q = (aq * (n - i) + bq * i) * 2 + 1;
-                let r = (ar * (n - i) + br * i) * 2 + 1;
-                let s = (as_ * (n - i) + bs * i) * 2 - 2;
+                let q = (aq * (n - i) + bq * i) * SCALE + 1;
+                let r = (ar * (n - i) + br * i) * SCALE + 1;
+                let s = (as_ * (n - i) + bs * i) * SCALE - 2;
                 cube_round_scaled(q, r, s, denom)
             })
             .collect()
@@ -287,6 +291,20 @@ mod tests {
         assert_eq!(*line.last().unwrap(), b);
         for w in line.windows(2) {
             assert_eq!(w[0].distance(w[1]), 1);
+        }
+    }
+
+    #[test]
+    fn every_line_starts_and_ends_where_it_should() {
+        // Short lines too: a line to a neighbor once ended a hex too far.
+        let center = Hex::new(0, 0);
+        for a in center.spiral(3) {
+            for b in center.spiral(3) {
+                let line = a.line_to(b);
+                assert_eq!((line[0], *line.last().unwrap()), (a, b), "{a:?} to {b:?}");
+                assert_eq!(line.len(), a.distance(b) as usize + 1);
+                assert!(line.windows(2).all(|w| w[0].distance(w[1]) == 1), "{a:?} to {b:?}");
+            }
         }
     }
 

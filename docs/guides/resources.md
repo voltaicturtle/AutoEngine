@@ -66,6 +66,7 @@ units without a resource are never given any.
 | `.per_kill(amount)` | gained when the unit kills an enemy |
 | `.per_second(amount)` | gained once a second. Negative drains it |
 | `.changes_while_casting()` | keeps it changing while the unit casts. Without this it is frozen for the length of the cast, as mana is |
+| `.lock_after_cast(ms)` | the unit gains none of it for `ms` after an ability paid with it goes off: a pause before the bar starts filling again |
 | `.color([r, g, b])` | the color of its bar in clients |
 
 Amounts are worked out for the unit that owns the resource. They can be

@@ -50,6 +50,9 @@ check the rules.
 | `planning_ms_by_kind` | empty | planning time for rounds of a kind, such as `("draft", 15000)`. Other rounds use the time the server is set to |
 | `choice_rerolls` | 1 | times each player may reroll a choice round's options |
 | `lobby_modifiers` | empty | augment ids. Each game, one picked at random goes to every player |
+| `team_size` | 1 | players per team, set with `.team_size(n)`; see [Teams](#teams) |
+| `loot` | empty | [loot tables](perks.md#loot-tables), added with `.loot(LootTable)` |
+| `shop_specials` | empty | chances for a shop offer to come with a higher star or an extra trait, added with `.shop_special(ShopSpecial)`; see [special shop offers](perks.md#special-shop-offers) |
 
 **Star levels.** The default is three levels. One star has no change. Two
 stars gives +80% `MaxHealth` and +50% `AttackDamage` and `AbilityPower`.
@@ -272,6 +275,29 @@ and clients show how many copies are left on each card.
 
 These travel with the content, so clients replay fights with the same
 rules. [Fights](fights.md) explains how they are used.
+
+## Teams
+
+With `.team_size(2)` players play in pairs: seats 0 and 1, then 2 and 3,
+and so on. Teammates share one health total, are never paired against each
+other while anyone else is left, can send each other units with
+`Command::Gift { uid, to }` (the unit keeps its items and merges if it
+makes three), and go out and win together with the same placement. The
+game ends when one team is left. Each teammate still has a board, a bench,
+gold and a shop of their own, and fights on their own.
+
+```rust
+use std::sync::Arc;
+use autoengine::content::{ContentSet, UnitDef};
+use autoengine::game::{Game, PlayerId};
+
+let content = ContentSet::builder().team_size(2).unit(UnitDef::new("grunt", "Grunt").cost(1)).build().unwrap();
+let mut game = Game::new(Arc::new(content), 1, &["a", "b", "c", "d"]);
+game.begin_round().unwrap();
+assert!(game.teammates(PlayerId(0), PlayerId(1)));
+game.damage_player(PlayerId(1), 10);
+assert_eq!(game.player(PlayerId(0)).health, 90);
+```
 
 ## Translations
 

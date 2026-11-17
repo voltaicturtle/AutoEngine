@@ -391,7 +391,7 @@ fn lineup_score(game: &Game, id: PlayerId, uids: &[u32]) -> i64 {
     let board: Vec<crate::content::BoardUnit> = units
         .iter()
         .enumerate()
-        .map(|(i, u)| crate::content::BoardUnit { unit: u.unit.clone(), star: u.star, items: u.items.clone(), pos: (i as i32, 0) })
+        .map(|(i, u)| crate::content::BoardUnit { items: u.items.clone(), growth: u.growth.clone(), traits: u.traits.clone(), ..crate::content::BoardUnit::new(u.unit.clone(), (i as i32, 0)).star(u.star) })
         .collect();
     let traits: i64 = game
         .content()

@@ -163,6 +163,9 @@ pub struct CombatUnit {
     casting: usize,
     /// Time until each ability can be cast again.
     cooldowns: Vec<u32>,
+    /// Time until the unit can gain each resource again (see
+    /// `ResourceDef::lock_after_cast_ms`).
+    resource_locks: Vec<u32>,
     /// Time since the last once-a-second resource change.
     second_ms: u32,
     /// The tick the unit last died on, while it is dead.
@@ -263,6 +266,10 @@ impl CombatUnit {
     pub fn has_tag(&self, tag: &str) -> bool {
         self.template.tags.iter().any(|t| t == tag)
     }
+    /// Whether enemies can choose it right now.
+    pub fn is_targetable(&self) -> bool {
+        self.alive && !self.has_status(|s| matches!(s, StatusKind::Untargetable))
+    }
 }
 
 /// Something that happened during combat.
@@ -328,6 +335,17 @@ pub enum EventKind {
     },
     /// A dead unit is back, at `pos` with `health`.
     Revived { unit: UnitId, source: UnitId, pos: Hex, health: i64 },
+    /// The player whose unit this is earned something to keep after the
+    /// fight (see [`Effect::reward`]).
+    Rewarded { unit: UnitId, team: Team, grant: crate::game::Grant },
+    /// A unit's stats changed for good (see [`Effect::grow`]).
+    Grew { unit: UnitId, mods: Vec<StatMod> },
+    /// A unit turned into another one: `into` is the new unit's id and
+    /// `name` what it is called now.
+    Transformed { unit: UnitId, into: String, name: String },
+    /// A unit's health and most health were set outright: a copy that
+    /// starts hurt, a new form.
+    HealthSet { unit: UnitId, health: i64, max_health: i64 },
     Ended { winner: Option<Team>, timed_out: bool },
 }
 
@@ -431,6 +449,10 @@ pub struct Combat {
     /// How many blocking tiles are on each hex.
     blocked: Vec<u16>,
     tile_depth: u32,
+    /// What players have earned in this fight, by the side that earned it.
+    rewards: Vec<(Team, crate::game::Grant)>,
+    /// Stat changes units have earned for good.
+    growth: Vec<(UnitId, Vec<StatMod>)>,
     outcome: Option<Outcome>,
     custom_effects: HashMap<String, Arc<CustomEffectFn>>,
     custom_conditions: HashMap<String, Arc<CustomConditionFn>>,
@@ -465,6 +487,8 @@ impl Combat {
             next_tile: 0,
             blocked: vec![0; cells],
             tile_depth: 0,
+            rewards: Vec::new(),
+            growth: Vec::new(),
             outcome: None,
             custom_effects: HashMap::new(),
             custom_conditions: HashMap::new(),
@@ -500,6 +524,20 @@ impl Combat {
     /// tests and front ends that want to preview an ability.
     pub fn targets(&self, source: UnitId, selector: &Selector) -> Vec<UnitId> {
         self.select(selector, source, None)
+    }
+
+    /// What each side has earned so far, in the order it was earned (see
+    /// [`Effect::reward`]). The game hands these to the players after the
+    /// fight.
+    pub fn rewards(&self) -> &[(Team, crate::game::Grant)] {
+        &self.rewards
+    }
+
+    /// The stat changes units have earned for good so far (see
+    /// [`Effect::grow`]), in order. The game writes these onto the
+    /// players' units after the fight.
+    pub fn growth(&self) -> &[(UnitId, Vec<StatMod>)] {
+        &self.growth
     }
 
     pub fn outcome(&self) -> Option<&Outcome> {
@@ -581,6 +619,7 @@ impl Combat {
             health,
             resource_defs: self.resources.clone(),
             resources: vec![0; self.resources.len()],
+            resource_locks: vec![0; self.resources.len()],
             alive: true,
             target: None,
             attack_progress: 0,
@@ -698,6 +737,10 @@ impl Combat {
             if let Some((index, amount)) = payment {
                 let left = self.u(id).resources[index] - amount;
                 self.set_resource(id, index, left, false);
+                let lock = self.resources[index].lock_after_cast_ms;
+                if lock > 0 {
+                    self.u_mut(id).resource_locks[index] = cast_time + lock;
+                }
             }
             let unit = self.u_mut(id);
             unit.cooldowns[which] = cooldown;
@@ -792,7 +835,7 @@ impl Combat {
     fn add_resource(&mut self, id: UnitId, index: usize, amount: i64) {
         let def = &self.resources[index];
         let unit = self.u(id);
-        let locked = unit.cast_remaining_ms.is_some() && !def.changes_while_casting;
+        let locked = (unit.cast_remaining_ms.is_some() && !def.changes_while_casting) || (amount > 0 && unit.resource_locks[index] > 0);
         if amount == 0 || !unit.alive || locked || unit.stat(def.max) <= 0 {
             return;
         }
@@ -816,6 +859,9 @@ impl Combat {
         let unit = self.u_mut(id);
         for cooldown in &mut unit.cooldowns {
             *cooldown = cooldown.saturating_sub(tick_ms);
+        }
+        for lock in &mut unit.resource_locks {
+            *lock = lock.saturating_sub(tick_ms);
         }
         unit.second_ms += tick_ms;
         if unit.second_ms >= 1000 {
@@ -893,12 +939,12 @@ impl Combat {
             return Some(t);
         }
         if let Some(t) = self.u(id).target
-            && self.u(t).alive
+            && self.u(t).is_targetable()
         {
             return Some(t);
         }
         let me = self.u(id);
-        let enemies = self.units.iter().filter(|o| o.alive && o.team != me.team);
+        let enemies = self.units.iter().filter(|o| o.is_targetable() && o.team != me.team);
         // Ties go to the nearest, then the lowest id.
         let near = |o: &CombatUnit| (me.pos.distance(o.pos), o.id);
         let target = match me.template.targeting {
@@ -913,7 +959,7 @@ impl Combat {
                 let picked = self.custom_selectors.get(name.as_str()).and_then(|hook| {
                     hook(&SelectContext { combat: self, source: id, other: None })
                         .into_iter()
-                        .find(|t| self.units.get(t.0 as usize).is_some_and(|o| o.alive && o.team != me.team))
+                        .find(|t| self.units.get(t.0 as usize).is_some_and(|o| o.is_targetable() && o.team != me.team))
                 });
                 match picked {
                     Some(t) => Some(self.u(t)),
@@ -1264,7 +1310,10 @@ impl Combat {
                     continue;
                 }
                 let (times, every_ticks) = spec.repeat.map_or((1, 0), |r| (r.times.max(1), ticks(r.every_ms)));
-                if spec.delay_ms == 0 {
+                // Something that flies takes longer to reach the far ones.
+                let flight = spec.travel_ms_per_hex * self.u(source).pos.distance(self.u(target).pos);
+                let delay_ms = spec.delay_ms + flight;
+                if delay_ms == 0 {
                     self.apply_effect(source, target, other, &spec.effect, direct);
                     if times > 1 {
                         self.delayed.push(Delayed {
@@ -1280,7 +1329,7 @@ impl Combat {
                     }
                 } else {
                     self.delayed.push(Delayed {
-                        at_tick: self.tick + ticks(spec.delay_ms),
+                        at_tick: self.tick + ticks(delay_ms),
                         source,
                         target,
                         other,
@@ -1341,6 +1390,14 @@ impl Combat {
                 .and_then(|id| self.u(id).pool(resource))
                 .is_some_and(|p| p.amount * 1000 >= p.max * *permille as i64),
             Condition::OnTile { who: w, tile } => who(w).is_some_and(|id| self.u(id).alive && self.has_tile(self.u(id).pos, tile)),
+            Condition::InFrontRows { who: w, rows } => who(w).is_some_and(|id| {
+                // The first side holds the lower half of the rows (as its
+                // player sees the board), the second side the upper half.
+                let middle = self.board.rows() as i32 / 2;
+                let row = self.u(id).pos.to_offset().1;
+                let depth = if self.u(id).team.0 % 2 == 0 { row - middle } else { middle - 1 - row };
+                depth < *rows as i32
+            }),
             Condition::HasStatus { who: w, status } => {
                 who(w).is_some_and(|id| self.u(id).has_status(|s| s.name() == status))
             }
@@ -1357,13 +1414,13 @@ impl Combat {
 
     fn select(&self, selector: &Selector, source: UnitId, other: Option<UnitId>) -> Vec<UnitId> {
         let me = self.u(source);
-        let enemies = || self.units.iter().filter(|o| o.alive && o.team != me.team);
+        let enemies = || self.units.iter().filter(|o| o.is_targetable() && o.team != me.team);
         let allies = || self.units.iter().filter(|o| o.alive && o.team == me.team);
         let nearest_enemy = || enemies().min_by_key(|o| (me.pos.distance(o.pos), o.id));
         let current_target = || {
             me.target
                 .map(|t| self.u(t))
-                .filter(|t| t.alive)
+                .filter(|t| t.is_targetable() || (t.alive && t.team == me.team))
                 .or_else(nearest_enemy)
         };
         let anchor_pos = |anchor: &Anchor| match anchor {
@@ -1433,6 +1490,64 @@ impl Combat {
                 let fallen = self.units.iter().filter(|o| !o.alive && o.team == me.team && o.id != source);
                 take_sorted(fallen, *n, |o| std::cmp::Reverse(o.died_at.unwrap_or(0)))
             }
+            Selector::EnemiesInLine { length } => {
+                let Some(aim) = current_target().map(|t| t.pos).filter(|p| *p != me.pos) else { return Vec::new() };
+                // The line from the source through its target, carried on.
+                let dist = me.pos.distance(aim);
+                let reach = length.div_ceil(dist).max(1) as i32;
+                let line = me.pos.line_to(me.pos.add(aim.sub(me.pos).scale(reach)));
+                let mut hit = Vec::new();
+                for hex in line.into_iter().skip(1).take(*length as usize) {
+                    if let Some(o) = self.unit_at(hex).map(|id| self.u(id)).filter(|o| o.is_targetable() && o.team != me.team) {
+                        hit.push(o.id);
+                    }
+                }
+                hit
+            }
+            Selector::EnemiesInCone { length } => {
+                let Some(aim) = current_target().map(|t| t.pos).filter(|p| *p != me.pos) else { return Vec::new() };
+                // Hex steps as flat vectors, scaled so the numbers stay whole:
+                // x = 2q + r, y = r * sqrt(3). The cone is 30 degrees to each
+                // side of the aim, so cos^2 >= 3/4.
+                let flat = |h: Hex| ((2 * h.q + h.r) as i64, h.r as i64);
+                let dot = |a: (i64, i64), b: (i64, i64)| a.0 * b.0 + 3 * a.1 * b.1;
+                let to_aim = flat(aim.sub(me.pos));
+                take_sorted(
+                    enemies().filter(|o| {
+                        let to = flat(o.pos.sub(me.pos));
+                        let d = dot(to, to_aim);
+                        me.pos.distance(o.pos) <= *length && d > 0 && 4 * d * d >= 3 * dot(to, to) * dot(to_aim, to_aim)
+                    }),
+                    u32::MAX,
+                    |o| me.pos.distance(o.pos),
+                )
+            }
+            Selector::AlliesInRow => {
+                let row = me.pos.to_offset().1;
+                ids(&mut allies().filter(|o| o.pos.to_offset().1 == row))
+            }
+            Selector::EnemyCluster { radius } => {
+                let around = |c: &CombatUnit| enemies().filter(|o| c.pos.distance(o.pos) <= *radius).count();
+                let center = enemies().min_by_key(|c| (std::cmp::Reverse(around(c)), me.pos.distance(c.pos), c.id));
+                match center {
+                    Some(c) => ids(&mut enemies().filter(|o| c.pos.distance(o.pos) <= *radius)),
+                    None => Vec::new(),
+                }
+            }
+            Selector::Chain { count, range } => {
+                let mut chain: Vec<UnitId> = Vec::new();
+                let mut last = current_target().filter(|t| t.team != me.team);
+                while let Some(at) = last {
+                    if chain.len() as u32 >= *count {
+                        break;
+                    }
+                    chain.push(at.id);
+                    last = enemies()
+                        .filter(|o| !chain.contains(&o.id) && at.pos.distance(o.pos) <= *range)
+                        .min_by_key(|o| (at.pos.distance(o.pos), o.id));
+                }
+                chain
+            }
             Selector::Custom(name) => match self.custom_selectors.get(name) {
                 Some(hook) => {
                     let mut picked = hook(&SelectContext { combat: self, source, other });
@@ -1471,11 +1586,96 @@ impl Combat {
         // Summons may be anchored on a unit that just died, and custom hooks
         // decide for themselves; everything else needs a living target.
         if !self.u(target).alive
-            && !matches!(effect, Effect::Summon { .. } | Effect::Custom { .. } | Effect::Revive { .. } | Effect::PlaceTile { .. })
+            && !matches!(
+                effect,
+                Effect::Summon { .. } | Effect::Custom { .. } | Effect::Revive { .. } | Effect::PlaceTile { .. } | Effect::Reward { .. }
+            )
         {
             return;
         }
         match effect {
+            Effect::Reward { grant } => {
+                let team = self.u(target).team;
+                self.rewards.push((team, (**grant).clone()));
+                self.emit(EventKind::Rewarded { unit: target, team, grant: (**grant).clone() });
+            }
+            Effect::Grow { mods } => {
+                self.change_stats(target, mods, true);
+                self.growth.push((target, mods.clone()));
+                self.emit(EventKind::Grew { unit: target, mods: mods.clone() });
+            }
+            Effect::Transform { unit } => {
+                let Some(form) = self.library.get(unit).cloned() else {
+                    return;
+                };
+                let old = self.u(target).template.clone();
+                if old.id == *unit {
+                    return;
+                }
+                // What the unit was before items and traits, to tell what
+                // they added.
+                let plain = self.library.get(&old.id).cloned();
+                let plain_stats = plain.as_ref().map_or(&old.stats, |p| &p.stats);
+                let own_passives = plain.as_ref().map_or(old.passives.len(), |p| p.passives.len().min(old.passives.len()));
+                let mut mods: Vec<StatMod> = Stat::ALL
+                    .iter()
+                    .copied()
+                    .chain(form.stats.custom().map(|(s, _)| s))
+                    .chain(plain_stats.custom().map(|(s, _)| s))
+                    .map(|s| StatMod::flat(s, form.stats.get(s) - plain_stats.get(s)))
+                    .filter(|m| m.flat != 0)
+                    .collect();
+                mods.sort_by_key(|m| m.stat);
+                mods.dedup_by_key(|m| m.stat);
+                let mut template = (*form).clone();
+                template.id = unit.clone();
+                template.passives.extend(old.passives[own_passives..].iter().cloned());
+                template.tags = old.tags.clone();
+                let (health, most) = (self.u(target).health, self.u(target).stat(Stat::MaxHealth).max(1));
+                let changing = self.u_mut(target);
+                changing.passive_state = vec![PassiveState::default(); template.passives.len()];
+                changing.cooldowns = vec![0; template.abilities.len()];
+                changing.cast_remaining_ms = None;
+                changing.casting = 0;
+                changing.template = Arc::new(template);
+                self.change_stats(target, &mods, true);
+                // The same share of health in the new form.
+                let now_most = self.u(target).stat(Stat::MaxHealth).max(1);
+                let now = (health * now_most / most).clamp(1, now_most);
+                self.u_mut(target).health = now;
+                self.emit(EventKind::Transformed { unit: target, into: unit.clone(), name: form.name.clone() });
+                self.emit(EventKind::HealthSet { unit: target, health: now, max_health: now_most });
+            }
+            Effect::Copy { health_permille } => {
+                let template = self.u(target).template.clone();
+                let team = self.u(source).team;
+                let center = self.u(target).pos;
+                let reach = self.board.cols() + self.board.rows();
+                let Some(hex) = center.spiral(reach).into_iter().find(|hex| self.is_free(*hex)) else {
+                    return;
+                };
+                if let Ok(copy) = self.spawn(template, team, hex) {
+                    let most = self.u(copy).stat(Stat::MaxHealth).max(1);
+                    let health = (most * *health_permille as i64 / 1000).clamp(1, most);
+                    self.u_mut(copy).health = health;
+                    self.emit(EventKind::HealthSet { unit: copy, health, max_health: most });
+                }
+            }
+            Effect::Swap => {
+                if source == target || !self.u(source).alive {
+                    return;
+                }
+                let (a, b) = (self.u(source).pos, self.u(target).pos);
+                let (ia, ib) = (self.board.index(a).unwrap(), self.board.index(b).unwrap());
+                self.occupancy[ia] = Some(target);
+                self.occupancy[ib] = Some(source);
+                self.u_mut(source).pos = b;
+                self.u_mut(target).pos = a;
+                self.emit(EventKind::Displaced { unit: source, from: a, to: b });
+                self.emit(EventKind::Displaced { unit: target, from: b, to: a });
+                self.sync_tiles(source);
+                self.sync_tiles(target);
+            }
             Effect::PlaceTile { tile, radius, duration_ms } => {
                 let center = self.u(target).pos;
                 for hex in center.spiral(*radius) {

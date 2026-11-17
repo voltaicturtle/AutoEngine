@@ -304,7 +304,12 @@ pub(crate) fn draw_shop(app: &mut App, layout: &Layout, player: &Player) {
             panel(r.x, r.y, r.w, r.h, Color::new(0.10, 0.11, 0.15, 1.0));
             continue;
         };
-        let affordable = player.gold >= def.cost as i64;
+        // A special offer: a higher star level costs every copy it stands
+        // for, and an extra trait is listed with the unit's own.
+        let special = player.shop_specials.get(i).cloned().flatten();
+        let star = special.as_ref().map_or(1, |s| s.star.max(1));
+        let price = def.cost as i64 * content.rules().copies_to_upgrade.pow(star as u32 - 1) as i64;
+        let affordable = player.gold >= price;
         let hover = r.contains(vec2(mx, my)) && app.drag.is_none();
         panel(r.x, r.y, r.w, r.h, if hover { ui().panel_light } else { ui().panel });
         draw_rectangle(r.x, r.y, r.w, 5.0, unit_color(&def.name));
@@ -312,12 +317,18 @@ pub(crate) fn draw_shop(app: &mut App, layout: &Layout, player: &Player) {
             let params = DrawTextureParams { dest_size: Some(vec2(44.0, 44.0)), ..Default::default() };
             draw_texture_ex(&icon, r.x + 6.0, r.y + 16.0, WHITE, params);
         } else {
-            draw_unit_token(vec2(r.x + 28.0, r.y + 38.0), 18.0, &def.name, 1, 0, true, None);
+            draw_unit_token(vec2(r.x + 28.0, r.y + 38.0), 18.0, &def.name, star, 0, true, None);
         }
         label(&app.net.state.display_name(&def.id), r.x + 8.0, r.y + 76.0, 16.0, if affordable { ui().text } else { ui().muted });
-        let traits: Vec<String> = def.traits.iter().map(|t| app.net.state.display_name(t)).collect();
-        label(&traits.join(", "), r.x + 8.0, r.y + 94.0, 14.0, ui().muted);
-        label(&format!("{}g", def.cost), r.x + r.w - 30.0, r.y + 42.0, 20.0, ui().gold);
+        let mut traits: Vec<String> = def.traits.iter().map(|t| app.net.state.display_name(t)).collect();
+        if let Some(extra) = special.as_ref().and_then(|s| s.extra_trait.as_ref()) {
+            traits.push(format!("+{}", app.net.state.display_name(extra)));
+        }
+        label(&traits.join(", "), r.x + 8.0, r.y + 94.0, 14.0, if special.is_some() { ui().gold } else { ui().muted });
+        if star > 1 {
+            label(&"*".repeat(star as usize), r.x + 8.0, r.y + 14.0, 16.0, ui().gold);
+        }
+        label(&format!("{price}g"), r.x + r.w - 30.0 - if price >= 10 { 10.0 } else { 0.0 }, r.y + 42.0, 20.0, ui().gold);
         // Copies still in the pool, besides this one.
         if let Some(left) = app.net.state.view.as_ref().and_then(|v| v.pool.get(&def.id)) {
             label(&format!("{left} left"), r.x + r.w - 50.0, r.y + 62.0, 13.0, ui().muted);

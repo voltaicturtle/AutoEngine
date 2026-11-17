@@ -14,7 +14,7 @@ fn sample_match() -> MatchSetup {
 }
 
 fn unit(id: &str, pos: (i32, i32)) -> BoardUnit {
-    BoardUnit { unit: id.into(), star: 1, items: vec![], pos }
+    BoardUnit::new(id, pos)
 }
 
 /// A game with one trait, `a`, and nothing else.
@@ -79,7 +79,7 @@ fn build_team_folds_in_stars_items_traits_and_team_bonuses() {
     let c = sample();
     let team = TeamSetup {
         units: vec![
-            BoardUnit { unit: "ironbark_warden".into(), star: 2, items: vec!["barkplate".into()], pos: (3, 4) },
+            BoardUnit::new("ironbark_warden", (3, 4)).star(2).item("barkplate"),
             unit("dawnpetal_mender", (4, 6)),
             unit("tidewater_stormcaller", (1, 7)),
         ],

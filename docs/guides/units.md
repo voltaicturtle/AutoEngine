@@ -46,6 +46,7 @@ assert_eq!(duelist.cost, 3);
 | `.targeting(Targeting)` | which enemy it goes after (see below) |
 | `.attack_kind(DamageKind)` | the [type of damage](damage.md) its basic attacks deal, instead of physical |
 | `.pool_size(n)` | how many copies the shared pool holds, instead of the number its cost gives. `.pool_size(1)` makes a unit only one player can own |
+| `.team_slots(n)` | how many board slots it takes against the level's limit. The default is 1, and 2 makes a big unit that costs two places |
 | `.summon_only()` | keeps it out of shops and the pool, for summons and neutral monsters |
 | `.model(file, scale_percent)` | the 3D model clients draw, relative to the assets folder, and its height as a percentage of a standard unit. The engine itself never reads it |
 

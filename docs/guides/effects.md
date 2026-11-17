@@ -44,6 +44,7 @@ the condition for each unit it would hit.
 | `Effect::wound(permille, ms)` | healing received is cut by `permille`. Only the strongest wound counts |
 | `Effect::invulnerable(ms)` | takes no damage and can't be executed |
 | `Effect::unstoppable(ms)` | new debuffs don't take hold |
+| `Effect::untargetable(ms)` | enemies can't choose it: selectors and attacks pass it over, and whoever was aiming at it looks for someone else. Effects already on their way still land |
 | `Effect::stat_status(mods, ms)` | stat changes that are undone after `ms` |
 | `Effect::damage_over_time(per_second, DamageKind, ms)` | damage every tick, given per second |
 | `Effect::modify_stats(mods)` | stat changes for the rest of the fight |
@@ -54,6 +55,11 @@ the condition for each unit it would hit.
 | `Effect::leap()` | the *source* jumps to the free hex closest to the selected unit, and targets it if it is an enemy |
 | `Effect::revive(amount)` | brings a dead unit back with that much health (see [Bringing units back](#bringing-units-back)) |
 | `Effect::tile(id)`, `Effect::tile_for(id, ms)` | lays a [tile](tiles.md) under the unit, for the whole fight or for `ms`. `.spread(radius)` covers the hexes around it too |
+| `Effect::transform(unit_id)` | turns it into another unit: it takes that unit's base stats, abilities and passives, and keeps its place, share of health, statuses, traits and what its items and traits gave it |
+| `Effect::copy(permille)` | puts a copy of it on the source's side, next to it, with `permille` of its health |
+| `Effect::Swap` | the source and the selected unit trade places |
+| `Effect::grow(mods)` | stat changes for good: for the rest of this fight and every later one, for as long as the player keeps the unit (see [Perks and loot](perks.md#what-units-earn-in-fights)) |
+| `Effect::reward(grant)` | hands the player who owns the unit a [grant](events.md#grants) after the fight: gold for a kill, a monster's drop (see [Perks and loot](perks.md#what-units-earn-in-fights)) |
 | `Effect::summon(unit_id, count)` | puts `count` copies of a unit on the selected unit's team, on the free hexes closest to it |
 | `Effect::add_stacks(name, count)` | adds to a named counter on the unit (see [Stacks](#stacks)) |
 | `.capped_at(max)` | added to `add_stacks`, caps the counter |
@@ -64,18 +70,19 @@ the condition for each unit it would hit.
 | `Effect::custom(name)` | runs a Rust hook (see [Rust hooks](#rust-hooks)) |
 | `Effect::custom_with(name, [args])` | runs a Rust hook with numbers passed to it |
 
-Effects skip units that are already dead, except `summon`, `revive`, `tile`
-and custom effects. Stun, silence, disarm, root and taunt last shorter on units
+Effects skip units that are already dead, except `summon`, `revive`, `tile`,
+`reward` and custom effects. Stun, silence, disarm, root and taunt last shorter on units
 with `Tenacity`. A status applied twice runs twice, each with its own timer.
 
 ### Later, and more than once
 
-`.to(selector)` gives an `EffectSpec`, and two calls on it set when the
+`.to(selector)` gives an `EffectSpec`, and three calls on it set when the
 effect lands:
 
 | Call | Meaning |
 | --- | --- |
 | `.after(ms)` | the effect lands `ms` later: a fuse, a wind-up, a shot in flight |
+| `.travel(ms_per_hex)` | the effect flies to each receiver, taking `ms_per_hex` for every hex in between, so the far ones are reached later. Adds to `after` |
 | `.repeat(times, every_ms)` | the effect lands `times` times in all, `every_ms` apart: a channel, a burst, a pulse |
 
 ```rust
@@ -212,7 +219,14 @@ so fights stay repeatable.
 | `EnemiesWithin { anchor, radius }` | enemies within `radius` hexes of the anchor |
 | `AlliesWithin { anchor, radius }` | allies within `radius` hexes of the anchor |
 | `AlliesWithTag(tag)` | allies carrying a tag, such as a trait id |
+| `EnemiesInLine { length }` | enemies on the straight line from the source through its target, up to `length` hexes out, nearest first: a bolt that goes through everyone |
+| `EnemiesInCone { length }` | enemies within `length` hexes in a cone a sixth of a circle wide, pointed at the source's target, nearest first |
+| `AlliesInRow` | the source and its allies in the same row |
+| `EnemyCluster { radius }` | the biggest group of enemies that fits within `radius` hexes of one of them; between equal groups, the nearest |
+| `Chain { count, range }` | the source's target, then the nearest enemy within `range` hexes of the last one that it has not reached yet, and so on, for `count` units: a bolt that bounces |
 | `Custom(name)` | whatever a Rust hook returns (see [Rust hooks](#rust-hooks)) |
+
+Selectors that pick enemies pass over untargetable ones.
 
 `anchor` is `Anchor::Source` or `Anchor::CurrentTarget`. Radius 1 means the
 anchor and the six hexes next to it.
@@ -284,6 +298,7 @@ the target. A condition about a target that doesn't exist is false.
 | `StacksAtLeast { who, stack, count }` | the unit has at least `count` of a stack |
 | `AlliesWithTagAtLeast { tag, count }` | at least `count` living units on the source's team carry a tag |
 | `OnTile { who, tile }` | the unit stands on a [tile](tiles.md) of this kind |
+| `InFrontRows { who, rows }` | the unit stands within `rows` rows of its side's front line (1 is the front row only). In a `CombatStart` passive this gives front-row and back-row units different effects |
 | `HasStatus { who, status }` | the unit has a status with this name: `"stunned"`, `"rooted"` and so on, or the name of a [mark](#statuses) |
 | `ResourceAtLeast { who, resource, permille }` | the unit's bar of a [resource](resources.md) is at least `permille` full |
 | `Condition::chance(permille)` | a random roll from the fight's seed |
@@ -329,7 +344,7 @@ assert!(finish.condition.is_some() && mark.condition.is_none());
 
 The built-in statuses are named `stunned`, `silenced`, `disarmed`, `rooted`,
 `taunted`, `wounded`, `afflicted` (damage over time), `stat-modified`,
-`invulnerable` and `unstoppable`.
+`invulnerable`, `unstoppable` and `untargetable`.
 
 ## Stacks
 

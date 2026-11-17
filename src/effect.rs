@@ -167,6 +167,10 @@ pub enum StatusKind {
     Invulnerable,
     /// New debuffs do not take hold (see [`StatusKind::is_debuff`]).
     Unstoppable,
+    /// Enemies cannot choose the unit: selectors and basic attacks pass it
+    /// over, and anyone aiming at it looks for someone else. Effects
+    /// already on their way still land.
+    Untargetable,
     /// Does nothing by itself: a named mark for conditions to look for
     /// ([`Condition::HasStatus`]), such as "burning" or "marked". A
     /// `harmful` mark counts as a debuff.
@@ -187,7 +191,7 @@ impl StatusKind {
             | StatusKind::Wound { .. }
             | StatusKind::DamageOverTime { .. } => true,
             StatusKind::StatMods(mods) => mods.iter().any(StatMod::lowers),
-            StatusKind::Invulnerable | StatusKind::Unstoppable => false,
+            StatusKind::Invulnerable | StatusKind::Unstoppable | StatusKind::Untargetable => false,
             StatusKind::Marker { harmful, .. } => *harmful,
         }
     }
@@ -207,6 +211,7 @@ impl StatusKind {
             StatusKind::Wound { .. } => "wounded",
             StatusKind::Invulnerable => "invulnerable",
             StatusKind::Unstoppable => "unstoppable",
+            StatusKind::Untargetable => "untargetable",
         }
     }
 }
@@ -284,6 +289,17 @@ pub enum Effect {
     /// [`Selector::Source`] in an `OnDeath` passive and by
     /// [`Selector::EventOther`] in an `OnAllyDeath` one.
     Revive { health: Amount },
+    /// Hands the player whose unit receives it something to keep after the
+    /// fight; see [`Effect::reward`].
+    Reward { grant: Box<crate::game::Grant> },
+    /// Changes the receiver's stats for good; see [`Effect::grow`].
+    Grow { mods: Vec<StatMod> },
+    /// Turns the receiver into another unit; see [`Effect::transform`].
+    Transform { unit: String },
+    /// Makes a copy of the receiver; see [`Effect::copy`].
+    Copy { health_permille: u32 },
+    /// The source and the receiver trade places.
+    Swap,
     /// Fires the selected unit's [`Trigger::Signal`] passives of this name,
     /// with the source as the other unit. This is how content makes
     /// occasions of its own for passives to react to.
@@ -380,6 +396,64 @@ impl Effect {
     /// );
     /// assert_eq!(second_wind.max_procs, Some(1));
     /// ```
+    /// Hands the player whose unit receives it something to keep after the
+    /// fight: gold for a kill, a drop from a monster. Aim it at one of the
+    /// player's units: `Selector::Source` in a passive of their own unit,
+    /// `Selector::EventOther` (the killer) in a monster's `OnDeath`.
+    /// Nothing is handed out for a team no player owns (a neutral board,
+    /// or a copy of another player's board).
+    ///
+    /// ```
+    /// use autoengine::effect::{Effect, Passive, Selector, Trigger};
+    /// use autoengine::game::Grant;
+    ///
+    /// // A monster that drops a roll on a loot table for whoever kills it.
+    /// let drop = Passive::new("Hoard", Trigger::OnDeath).effect(Effect::reward(Grant::Loot("orbs".into())).to(Selector::EventOther));
+    /// // A unit that earns its player a gold piece for every kill.
+    /// let bounty = Passive::new("Bounty", Trigger::OnKill).effect(Effect::reward(Grant::Gold(1)).to(Selector::Source));
+    /// assert_ne!(drop, bounty);
+    /// ```
+    pub fn reward(grant: crate::game::Grant) -> Self {
+        Effect::Reward { grant: Box::new(grant) }
+    }
+
+    /// Changes the receiver's stats for good: at once in this fight, and in
+    /// every later one, for as long as the player keeps the unit. For a
+    /// unit no player owns (a summon, a neutral monster) it lasts the
+    /// fight.
+    ///
+    /// ```
+    /// use autoengine::effect::{Effect, Passive, Selector, Trigger};
+    /// use autoengine::stats::Stat;
+    ///
+    /// // Every kill makes it a little stronger, forever.
+    /// let hunger = Passive::new("Hunger", Trigger::OnKill).effect(Effect::grow([Stat::AbilityPower.flat(2)]).to(Selector::Source));
+    /// assert_eq!(hunger.effects.len(), 1);
+    /// ```
+    pub fn grow(mods: impl IntoIterator<Item = StatMod>) -> Self {
+        Effect::Grow { mods: mods.into_iter().collect() }
+    }
+
+    /// Turns the receiver into another unit, by id: a second form. It
+    /// keeps its place, its share of health, its statuses, its traits and
+    /// what its items and traits gave it, and takes the other unit's base
+    /// stats, abilities and passives.
+    pub fn transform(unit: impl Into<String>) -> Self {
+        Effect::Transform { unit: unit.into() }
+    }
+
+    /// Makes a copy of the receiver next to it, on the source's side, with
+    /// `health_permille` of its health: 500 is a copy at half health. The
+    /// copy has the same stats, items and passives.
+    pub fn copy(health_permille: u32) -> Self {
+        Effect::Copy { health_permille }
+    }
+
+    /// Enemies cannot choose the receiver for `duration_ms`.
+    pub fn untargetable(duration_ms: u32) -> Self {
+        Effect::ApplyStatus { status: StatusKind::Untargetable, duration_ms }
+    }
+
     pub fn revive(health: impl Into<Amount>) -> Self {
         Effect::Revive { health: health.into() }
     }
@@ -585,6 +659,22 @@ pub enum Selector {
     /// Up to `n` dead allies, the most recently fallen first. Only
     /// [`Effect::Revive`] does anything to them.
     FallenAllies(u32),
+    /// Enemies standing on the straight line from the source through its
+    /// target, up to `length` hexes out, nearest first: a bolt that goes
+    /// through everything.
+    EnemiesInLine { length: u32 },
+    /// Enemies within `length` hexes in a cone a sixth of a circle wide,
+    /// pointed at the source's target.
+    EnemiesInCone { length: u32 },
+    /// The source and its allies in the same row of the board.
+    AlliesInRow,
+    /// The biggest group of enemies that fits within `radius` hexes of one
+    /// of them. Between groups of the same size, the nearest.
+    EnemyCluster { radius: u32 },
+    /// The source's target, then the nearest enemy within `range` hexes of
+    /// it not chosen yet, and so on, for `count` units in all: a bolt that
+    /// jumps from one to the next.
+    Chain { count: u32, range: u32 },
     /// Units chosen by a Rust hook registered under this name (see
     /// [`GameBuilder::custom_selector`](crate::content::GameBuilder::custom_selector)).
     Custom(String),
@@ -628,6 +718,12 @@ pub enum Condition {
         who: Who,
         tile: String,
     },
+    /// The unit stands within `rows` rows of its side's front line: 1 is
+    /// the front row only. A unit past the middle of the board counts as
+    /// in front. Placement decides it at the start of a fight, so a
+    /// `CombatStart` passive with this condition gives front-row and
+    /// back-row units different effects.
+    InFrontRows { who: Who, rows: u32 },
     /// A seeded random roll, in permille.
     Chance { permille: u32 },
     Not(Box<Condition>),
@@ -701,6 +797,10 @@ pub struct EffectSpec {
     /// Lands the effect more than once on the same receivers.
     #[serde(default)]
     pub repeat: Option<Repeat>,
+    /// Extra wait for each hex between the source and the receiver, in
+    /// milliseconds: something that flies there.
+    #[serde(default)]
+    pub travel_ms_per_hex: u32,
 }
 
 /// How an [`EffectSpec`] repeats.
@@ -714,7 +814,7 @@ pub struct Repeat {
 
 impl EffectSpec {
     pub fn new(target: Selector, effect: Effect) -> Self {
-        EffectSpec { target, effect, condition: None, delay_ms: 0, repeat: None }
+        EffectSpec { target, effect, condition: None, delay_ms: 0, repeat: None, travel_ms_per_hex: 0 }
     }
 
     /// Lands the effect `ms` milliseconds later: a fuse, a wind-up, a shot
@@ -747,6 +847,22 @@ impl EffectSpec {
     /// let volley = Effect::physical(40).to(Selector::NearestEnemies(3)).repeat(3, 500);
     /// assert_eq!(volley.repeat.unwrap().times, 3);
     /// ```
+    /// Makes the effect fly to each receiver, taking `ms_per_hex` for every
+    /// hex in between, so the far ones are reached later. Adds to
+    /// [`after`](Self::after).
+    ///
+    /// ```
+    /// use autoengine::effect::{Effect, Selector};
+    ///
+    /// // A wave that rolls outward from the caster.
+    /// let wave = Effect::magic(150).to(Selector::EnemiesInCone { length: 4 }).travel(100);
+    /// assert_eq!(wave.travel_ms_per_hex, 100);
+    /// ```
+    pub fn travel(mut self, ms_per_hex: u32) -> Self {
+        self.travel_ms_per_hex = ms_per_hex;
+        self
+    }
+
     pub fn repeat(mut self, times: u32, every_ms: u32) -> Self {
         self.repeat = Some(Repeat { times, every_ms });
         self

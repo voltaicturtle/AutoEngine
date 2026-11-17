@@ -2,7 +2,8 @@
 //!
 //! It is small and original: eight shop units, a summon and a neutral
 //! monster, a second resource next to mana, a second currency next to gold with two actions that use it, three kinds of tile, five traits, six items (three components and what they combine
-//! into), seven augments, a round schedule with every built-in round kind and
+//! into), nine augments, a loot table the monster drops from, a rare
+//! two-star shop offer, a round schedule with every built-in round kind and
 //! a scripted one, a sample fight and a few content tests. A game built on
 //! the engine defines the same things the same way, in its own crate.
 //!
@@ -11,8 +12,9 @@
 
 use crate::content::{
     ActionDef, AugmentDef, BoardUnit, Bonus, ChoiceOffer, Consumable, ContentSet, CurrencyDef, ItemDef, MatchSetup, RoundDef, RoundKindDef, Schedule,
-    TeamSetup, TraitDef, UnitDef,
+    ShopSpecial, TeamSetup, TraitDef, UnitDef,
 };
+use crate::perk::{LootTable, Perk, Rule, When};
 use crate::effect::{Ability, Amount, Anchor, Cost, DamageKind, Effect, Passive, ScaleBy, Selector, Trigger, Who};
 use crate::game::{CommandError, Grant};
 use crate::resource::ResourceDef;
@@ -35,6 +37,10 @@ pub fn content() -> ContentSet {
         .resource(fury())
         .currency(favor())
         .tiles(tiles())
+        // Moss golems drop a little favor now and then.
+        .loot(LootTable::new("moss_cache").entry(1, [Grant::Currency { currency: "favor".into(), amount: 1 }]).nothing(2))
+        // Now and then a shop at level 5 or higher offers a two-star unit.
+        .shop_special(ShopSpecial::new(20).from_level(5).star(2))
         .action(ActionDef::new("petition", "Petition").description("Trade 3 favor for 4 experience.").costs("favor", 3).gives(Grant::Xp(4)))
         .action(
             ActionDef::new("offering", "Offering")
@@ -211,13 +217,15 @@ pub fn traits() -> Vec<TraitDef> {
             .description("Cinder units attack faster.")
             .breakpoint(2, [Bonus::members().mods([AttackSpeed.percent(200)])])
             .breakpoint(3, [Bonus::members().mods([AttackSpeed.percent(450)])]),
-        TraitDef::new("tide", "Tide").description("Tide units steadily restore mana to themselves.").breakpoint(
-            2,
-            [Bonus::members().passive(
-                Passive::new("Rising Tide", Trigger::Every { interval_ms: 2000 })
-                    .effect(Effect::mana(10).to(Selector::Source)),
-            )],
-        ),
+        TraitDef::new("tide", "Tide")
+            .description("Tide units steadily restore mana to themselves, and every lost fight brings in 1 favor.")
+            .breakpoint(
+                2,
+                [Bonus::members().passive(
+                    Passive::new("Rising Tide", Trigger::Every { interval_ms: 2000 }).effect(Effect::mana(10).to(Selector::Source)),
+                )],
+            )
+            .perk(Perk::on(When::Lost).gives(Grant::Currency { currency: "favor".into(), amount: 1 })),
         TraitDef::new("hollow", "Hollow")
             .description("When a Hollow unit dies, the whole team hits harder.")
             .breakpoint(
@@ -352,6 +360,8 @@ pub fn units() -> Vec<UnitDef> {
             .model("models/ashen_hound.obj", 80)
             .cost(1)
             .traits(["cinder", "hollow"])
+            // What a hound learns in a fight it keeps.
+            .passive(Passive::new("Pack Memory", Trigger::OnKill).effect(Effect::grow([AttackDamage.flat(2)]).to(Selector::Source)))
             .stats([
                 (MaxHealth, 550),
                 (AttackDamage, 50),
@@ -402,7 +412,11 @@ pub fn units() -> Vec<UnitDef> {
         UnitDef::new("moss_golem", "Moss Golem")
             .model("models/moss_golem.obj", 125)
             .summon_only()
-            .stats([(MaxHealth, 450), (AttackDamage, 35), (Armor, 10), (MagicResist, 10), (AttackSpeed, 550)]),
+            .stats([(MaxHealth, 450), (AttackDamage, 35), (Armor, 10), (MagicResist, 10), (AttackSpeed, 550)])
+            .passive(
+                Passive::new("Moss Cache", Trigger::OnDeath)
+                    .effect(Effect::reward(Grant::Loot("moss_cache".into())).to(Selector::EventOther)),
+            ),
     ]
 }
 
@@ -473,5 +487,10 @@ pub fn augments() -> Vec<AugmentDef> {
         AugmentDef::new("opening_gambit", "Opening Gambit")
             .description("Your team starts each fight with a 150 shield for 6 seconds.")
             .bonus(at_start("Opening Gambit", 150)),
+        AugmentDef::new("wide_camp", "Wide Camp").description("Field one more unit, but rerolls cost 1 more.").rule(Rule::TeamSize.add(1)).rule(Rule::RerollCost.add(1)),
+        AugmentDef::new("scavenger", "Scavenger")
+            .description("Pick one of two components now. Each won fight has a one in three chance to give another.")
+            .perk(Perk::on(When::Gained).gives(Grant::Choice { options: 2, offer: ChoiceOffer::Components }))
+            .perk(Perk::on(When::Won).gives(Grant::Component).chance(333)),
     ]
 }

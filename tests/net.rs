@@ -50,14 +50,15 @@ fn act(client: &mut GameClient, readied: &mut Option<usize>) {
     }
 }
 
-/// Plays until round number `rounds` has begun.
+/// Plays until round number `rounds` has begun, or the game is over.
 fn play_rounds(client: &mut GameClient, rounds: usize) {
     let mut readied = None;
     let deadline = Instant::now() + WAIT;
     loop {
         client.update();
         let round = client.state.view.as_ref().map(|v| v.round_index);
-        if round.is_some_and(|r| r >= rounds) {
+        let over = client.state.view.as_ref().is_some_and(|v| matches!(v.phase, ViewPhase::Over { .. }));
+        if over || round.is_some_and(|r| r >= rounds) {
             return;
         }
         act(client, &mut readied);

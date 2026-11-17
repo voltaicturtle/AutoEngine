@@ -201,9 +201,26 @@ pub fn lint(content: &ContentSet, assets: Option<&Path>) -> Vec<Warning> {
     // should do something. Scripts and Rust hooks can do either, so these
     // only speak up when the content has neither.
     let has_code = !content.scripts().is_empty();
+    let all_grants = content.grants();
     let grants = |currency: &str| {
-        content.actions().iter().flat_map(|a| &a.gives).any(|g| matches!(g, crate::game::Grant::Currency { currency: c, amount } if c == currency && *amount > 0))
+        all_grants.iter().any(|(_, g)| matches!(g, crate::game::Grant::Currency { currency: c, amount } if c == currency && *amount > 0))
     };
+    // A loot table is only worth having if something rolls on it.
+    for table in content.loot_tables() {
+        let rolled = all_grants.iter().any(|(owner, g)| matches!(g, crate::game::Grant::Loot(id) if *id == table.id) && *owner != format!("loot table {}", table.id));
+        if !rolled && !has_code {
+            warn(format!("loot table {}", table.id), "nothing in the content rolls on it".into());
+        }
+    }
+    // `When::Gained` is the moment an augment is picked; traits and items
+    // are never picked up that way.
+    let never = |perks: &[crate::perk::Perk]| perks.iter().any(|p| p.when == crate::perk::When::Gained);
+    for t in content.traits().filter(|t| t.breakpoints.iter().any(|b| never(&b.perks))) {
+        warn(format!("trait {}", t.id), "has a perk for When::Gained, which only happens for augments".into());
+    }
+    for item in content.items().filter(|i| never(&i.perks)) {
+        warn(format!("item {}", item.id), "has a perk for When::Gained, which only happens for augments".into());
+    }
     for currency in content.currencies() {
         let subject = format!("currency {}", currency.id);
         let paid = currency.starting > 0

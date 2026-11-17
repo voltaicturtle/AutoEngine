@@ -165,6 +165,7 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("UnitGained", "player, uid, unit"),
     ("UnitSold", "player, uid, unit"),
     ("UnitRemoved", "player, uid, unit"),
+    ("UnitGifted", "from, to, uid, unit"),
     ("UnitUpgraded", "player, uid, unit, star"),
     ("UnitMoved", "player, uid, to"),
     ("ItemGained", "player, item"),

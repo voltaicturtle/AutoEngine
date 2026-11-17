@@ -247,7 +247,7 @@ fn odd_lobbies_fight_a_ghost_that_is_not_affected() {
 
 #[test]
 fn pve_round_rewards_winners_and_damages_losers() {
-    let enemies = vec![BoardUnit { unit: "moss_golem".into(), star: 1, items: vec![], pos: (3, 4) }];
+    let enemies = vec![BoardUnit::new("moss_golem", (3, 4))];
     let mut g = game(vec![RoundKindDef::Pve { enemies, gold: 7, items: 2, rewards: vec![] }], 2);
     field(&mut g, P0, "ironbark_warden", (3, 4));
     g.finish_round().unwrap();
